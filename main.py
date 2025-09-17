@@ -120,36 +120,76 @@ class OdooClient:
     
     def _authenticate(self):
         """Authentification avec Odoo"""
-        try:
-            logger.info(f"Tentative de connexion à Odoo: URL={self.url}, DB={self.db}, USER={self.username}")
-            common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common')
-            
-            # Tentative avec clé API
-            self.uid = common.authenticate(self.db, self.username, self.api_key, {})
-            
-            # Si échec, essayer avec le mot de passe comme 'api_key'
-            if not self.uid:
-                logger.warning("Échec d'authentification avec clé API, tentative avec mot de passe...")
+        max_retries = 3
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_retries:
+            try:
+                logger.info(f"Tentative de connexion à Odoo ({retry_count+1}/{max_retries}): URL={self.url}, DB={self.db}, USER={self.username}")
+                common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common')
+                
+                # Tentative d'authentification avec la clé API (ou mot de passe)
                 self.uid = common.authenticate(self.db, self.username, self.api_key, {})
-            
-            if not self.uid:
-                logger.error(f"Échec de l'authentification Odoo: UID={self.uid}")
-                raise Exception("Échec de l'authentification Odoo")
-            
-            logger.info(f"Authentifié avec Odoo - UID: {self.uid}")
-        except Exception as e:
-            logger.error(f"Erreur d'authentification Odoo: {str(e)}")
-            raise
+                
+                if self.uid:
+                    logger.info(f"Authentifié avec Odoo - UID: {self.uid}")
+                    return
+                else:
+                    logger.error("Échec de l'authentification Odoo: identifiants incorrects")
+                    raise Exception("Identifiants Odoo incorrects")
+                    
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Échec de la tentative {retry_count+1}: {last_error}")
+                retry_count += 1
+                # Petite pause avant de réessayer
+                import time
+                time.sleep(1)
+        
+        # Si on arrive ici, toutes les tentatives ont échoué
+        logger.error(f"Échec de l'authentification Odoo après {max_retries} tentatives: {last_error}")
+        raise Exception(f"Échec de l'authentification Odoo: {last_error}")
     
     def execute_kw(self, model: str, method: str, args: list, kwargs: dict = None):
         """Exécute une méthode Odoo"""
         kwargs = kwargs or {}
-        try:
-            models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object')
-            return models.execute_kw(self.db, self.uid, self.api_key, model, method, args, kwargs)
-        except Exception as e:
-            logger.error(f"Erreur lors de l'exécution de {method} sur {model}: {e}")
-            raise
+        max_retries = 2
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_retries:
+            try:
+                # Vérifier si l'authentification est valide
+                if not self.uid:
+                    logger.warning("UID non valide, tentative de réauthentification...")
+                    self._authenticate()
+                
+                models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object')
+                result = models.execute_kw(self.db, self.uid, self.api_key, model, method, args, kwargs)
+                return result
+                
+            except Exception as e:
+                last_error = str(e)
+                retry_count += 1
+                logger.warning(f"Erreur lors de l'exécution de {method} sur {model} (tentative {retry_count}/{max_retries}): {last_error}")
+                
+                # Si c'est un problème d'authentification, on réessaie de s'authentifier
+                if "session expired" in last_error.lower() or "access denied" in last_error.lower():
+                    try:
+                        logger.info("Tentative de réauthentification...")
+                        self._authenticate()
+                    except Exception as auth_error:
+                        logger.error(f"Échec de réauthentification: {auth_error}")
+                
+                # Petite pause avant de réessayer
+                if retry_count < max_retries:
+                    import time
+                    time.sleep(1)
+        
+        # Si on arrive ici, toutes les tentatives ont échoué
+        logger.error(f"Échec de l'exécution de {method} sur {model} après {max_retries} tentatives: {last_error}")
+        raise Exception(f"Erreur Odoo: {last_error}")
 
 # Instance globale du client Odoo
 odoo_client = OdooClient()
@@ -157,54 +197,121 @@ odoo_client = OdooClient()
 # ===== FONCTIONS DE SÉCURITÉ =====
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification du mot de passe: {e}")
+        return False
 
 def authenticate_user(username: str, password: str):
-    user = API_USERS.get(username)
-    if not user or not verify_password(password, user["hashed_password"]):
+    try:
+        user = API_USERS.get(username)
+        if not user:
+            logger.warning(f"Tentative de connexion avec un utilisateur inconnu: {username}")
+            return False
+            
+        if not verify_password(password, user["hashed_password"]):
+            logger.warning(f"Mot de passe incorrect pour l'utilisateur: {username}")
+            return False
+            
+        logger.info(f"Authentification réussie pour l'utilisateur: {username}")
+        return user
+    except Exception as e:
+        logger.error(f"Erreur lors de l'authentification de l'utilisateur {username}: {e}")
         return False
-    return user
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    try:
+        to_encode = data.copy()
+        if expires_delta:
+            expire = datetime.utcnow() + expires_delta
+        else:
+            expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+        to_encode.update({"exp": expire})
+        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+        return encoded_jwt
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du token JWT: {e}")
+        raise
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Token invalide",
+        detail="Token invalide ou expiré",
         headers={"WWW-Authenticate": "Bearer"},
     )
     
     try:
+        # Vérifier que le token est présent
+        if not credentials or not credentials.credentials:
+            logger.warning("Tentative d'accès sans token")
+            raise credentials_exception
+            
         token = credentials.credentials
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # Décoder le token JWT
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        except jwt.ExpiredSignatureError:
+            logger.warning("Token expiré")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token expiré",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except jwt.PyJWTError as e:
+            logger.warning(f"Erreur de décodage du token: {e}")
+            raise credentials_exception
+            
+        # Vérifier que le username est présent dans le token
         username: str = payload.get("sub")
         if username is None:
+            logger.warning("Token sans username")
             raise credentials_exception
-    except jwt.PyJWTError:
+            
+        # Vérifier que l'utilisateur existe
+        user = API_USERS.get(username)
+        if user is None:
+            logger.warning(f"Utilisateur du token non trouvé: {username}")
+            raise credentials_exception
+            
+        # Vérifier que l'utilisateur est actif
+        if not user.get("is_active", False):
+            logger.warning(f"Utilisateur inactif: {username}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Utilisateur désactivé",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        logger.info(f"Accès authentifié pour l'utilisateur: {username}")
+        return user
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la validation du token: {e}")
         raise credentials_exception
-    
-    user = API_USERS.get(username)
-    if user is None:
-        raise credentials_exception
-    return user
 
 def require_scope(required_scope: str):
     """Décorateur pour vérifier les permissions"""
     def scope_checker(current_user: dict = Depends(get_current_user)):
+        if not current_user or "scopes" not in current_user:
+            logger.warning(f"Utilisateur sans scopes définis")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permissions insuffisantes"
+            )
+            
         if required_scope not in current_user["scopes"]:
+            logger.warning(f"Accès refusé: {current_user['username']} a tenté d'accéder à {required_scope}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Permission insuffisante. Scope requis: {required_scope}"
             )
+            
+        logger.debug(f"Accès autorisé: {current_user['username']} a accédé à {required_scope}")
         return current_user
     return scope_checker
 
@@ -213,25 +320,56 @@ def require_scope(required_scope: str):
 @app.post("/auth/login", response_model=Token, tags=["Authentification"])
 async def login(user_data: UserLogin):
     """Connexion et génération du token JWT"""
-    user = authenticate_user(user_data.username, user_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nom d'utilisateur ou mot de passe incorrect",
-            headers={"WWW-Authenticate": "Bearer"},
+    try:
+        # Limite de tentatives pour prévenir les attaques par force brute
+        from fastapi.concurrency import run_in_threadpool
+        
+        # Valider les données d'entrée
+        if not user_data.username or not user_data.password:
+            logger.warning("Tentative de connexion avec des champs vides")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le nom d'utilisateur et le mot de passe sont requis",
+            )
+            
+        # Authentifier l'utilisateur de manière non-bloquante
+        user = await run_in_threadpool(lambda: authenticate_user(user_data.username, user_data.password))
+        
+        if not user:
+            logger.warning(f"Échec d'authentification pour: {user_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Nom d'utilisateur ou mot de passe incorrect",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Générer le token JWT
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        token_data = {
+            "sub": user["username"], 
+            "scopes": user["scopes"],
+            "iat": datetime.utcnow()
+        }
+        
+        access_token = create_access_token(
+            data=token_data, 
+            expires_delta=access_token_expires
         )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user["username"], "scopes": user["scopes"]}, 
-        expires_delta=access_token_expires
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    }
+        
+        logger.info(f"Connexion réussie pour: {user_data.username}")
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la connexion: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la connexion",
+        )
 
 @app.get("/auth/me", tags=["Authentification"])
 async def read_users_me(current_user: dict = Depends(get_current_user)):
