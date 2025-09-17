@@ -9,6 +9,10 @@ from datetime import datetime, timedelta
 import xmlrpc.client
 from passlib.context import CryptContext
 import logging
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement
+load_dotenv()
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -39,17 +43,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Configuration Odoo
 ODOO_CONFIG = {
-    "url": os.getenv("ODOO_URL", "http://localhost:8069"),
-    "db": os.getenv("ODOO_DB", "odoo_db"),
+    "url": os.getenv("ODOO_URL", "http://34.89.40.140"),
+    "db": os.getenv("ODOO_DB", "jnpdb"),
     "username": os.getenv("ODOO_USERNAME", "admin"),
-    "api_key": os.getenv("ODOO_API_KEY", "bb1239380101b08fefd7869bbcbdfc7bef2113cc")
+    "api_key": os.getenv("ODOO_API_KEY", "524b562f73048e5ad0f5248a29fb22584b6254d1")
 }
+
+logger.info(f"Configuration Odoo: {ODOO_CONFIG}")
 
 # Utilisateurs API (en production, utilisez une vraie base de données)
 API_USERS = {
     "admin": {
         "username": "admin",
-        "hashed_password": "$2b$12$nvDKnywMDVAyhHITWBFksOm2IW6BjLRHtsplT582g7/uAfQIV1002",  # "admin123"
+        "hashed_password": "$2b$12$vVswhtAQBoTursFoUkyKyOU2UJ9kKNZ8KZYDc4bz1MjNL86r48fiO",  # "admin123"
         "is_active": True,
         "scopes": ["read", "write", "delete"]
     },
@@ -115,13 +121,24 @@ class OdooClient:
     def _authenticate(self):
         """Authentification avec Odoo"""
         try:
+            logger.info(f"Tentative de connexion à Odoo: URL={self.url}, DB={self.db}, USER={self.username}")
             common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common')
+            
+            # Tentative avec clé API
             self.uid = common.authenticate(self.db, self.username, self.api_key, {})
+            
+            # Si échec, essayer avec le mot de passe comme 'api_key'
             if not self.uid:
+                logger.warning("Échec d'authentification avec clé API, tentative avec mot de passe...")
+                self.uid = common.authenticate(self.db, self.username, self.api_key, {})
+            
+            if not self.uid:
+                logger.error(f"Échec de l'authentification Odoo: UID={self.uid}")
                 raise Exception("Échec de l'authentification Odoo")
+            
             logger.info(f"Authentifié avec Odoo - UID: {self.uid}")
         except Exception as e:
-            logger.error(f"Erreur d'authentification Odoo: {e}")
+            logger.error(f"Erreur d'authentification Odoo: {str(e)}")
             raise
     
     def execute_kw(self, model: str, method: str, args: list, kwargs: dict = None):
