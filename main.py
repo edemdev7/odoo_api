@@ -43,10 +43,10 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Configuration Odoo
 ODOO_CONFIG = {
-    "url": os.getenv("ODOO_URL", "http://34.89.40.140"),
-    "db": os.getenv("ODOO_DB", "jnpdb"),
-    "username": os.getenv("ODOO_USERNAME", "admin"),
-    "api_key": os.getenv("ODOO_API_KEY", "524b562f73048e5ad0f5248a29fb22584b6254d1")
+    "url": os.getenv("ODOO_URL", "https://erp.jnpgroupe.com"),
+    "db": os.getenv("ODOO_DB", "OMHI-TEST"),
+    "username": os.getenv("ODOO_USERNAME", "admin@jnpgroupe.com"),
+    "api_key": os.getenv("ODOO_API_KEY", "33e3aa2baad77fc78418d2747d6b0c5616d5dcb6")
 }
 
 logger.info(f"Configuration Odoo: {ODOO_CONFIG}")
@@ -55,7 +55,7 @@ logger.info(f"Configuration Odoo: {ODOO_CONFIG}")
 API_USERS = {
     "admin": {
         "username": "admin",
-        "hashed_password": "$2b$12$vVswhtAQBoTursFoUkyKyOU2UJ9kKNZ8KZYDc4bz1MjNL86r48fiO",  # "admin123"
+        "hashed_password": "$2b$12$Ve.p30uPHQSVt2PBRTJU4.o37W2sD9vq7SMoR1UQJ4BkWb5/nsqVm",  # "admin123"
         "is_active": True,
         "scopes": ["read", "write", "delete"]
     },
@@ -64,6 +64,12 @@ API_USERS = {
         "hashed_password": "$2b$12$KpqzDOHWwGPgX0hLDcLKBOHm8JoQs7kB9aL5pF9VqKcwG2LYmK5MG",  # "readonly123"
         "is_active": True,
         "scopes": ["read"]
+    },
+    "admin@jnpgroupe.com": {
+        "username": "admin@jnpgroupe.com",
+        "hashed_password": "$2b$12$M6olJi2HJk/MCApZHJkKx.oJPo50QkKz6.QVtW2brH/CCdh31HJSe",  # "zBfMQyOlYVkg8WB"
+        "is_active": True,
+        "scopes": ["read", "write", "delete"]
     }
 }
 
@@ -81,6 +87,10 @@ class Token(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
+    # Informations optionnelles pour la connexion Odoo
+    odoo_db: Optional[str] = None
+    odoo_username: Optional[str] = None
+    odoo_api_key: Optional[str] = None
 
 class OdooSearchRequest(BaseModel):
     model: str = Field(..., description="Nom du modèle Odoo (ex: res.partner)")
@@ -110,13 +120,24 @@ class ApiResponse(BaseModel):
 # ===== CLIENT ODOO =====
 
 class OdooClient:
-    def __init__(self):
-        self.url = ODOO_CONFIG["url"]
-        self.db = ODOO_CONFIG["db"]
-        self.username = ODOO_CONFIG["username"]
-        self.api_key = ODOO_CONFIG["api_key"]
+    def __init__(self, custom_config=None):
+        """
+        Initialise le client Odoo
+        :param custom_config: Configuration personnalisée (optionnel) avec url, db, username, api_key
+        """
+        config = ODOO_CONFIG.copy()
+        if custom_config:
+            for key, value in custom_config.items():
+                if value:  # Ne remplacer que si la valeur n'est pas None
+                    config[key] = value
+                    
+        self.url = config["url"]
+        self.db = config["db"]
+        self.username = config["username"]
+        self.api_key = config["api_key"]
         self.uid = None
         self._authenticate()
+    
     
     def _authenticate(self):
         """Authentification avec Odoo"""
@@ -191,8 +212,26 @@ class OdooClient:
         logger.error(f"Échec de l'exécution de {method} sur {model} après {max_retries} tentatives: {last_error}")
         raise Exception(f"Erreur Odoo: {last_error}")
 
-# Instance globale du client Odoo
-odoo_client = OdooClient()
+# Instance globale du client Odoo par défaut
+default_odoo_client = OdooClient()
+
+# Fonction pour obtenir le client Odoo approprié pour l'utilisateur
+def get_odoo_client(user=None):
+    """
+    Renvoie le client Odoo approprié en fonction de l'utilisateur
+    :param user: Utilisateur authentifié (avec éventuellement une config Odoo personnalisée)
+    :return: Instance de OdooClient
+    """
+    if user and "odoo_config" in user:
+        try:
+            # Créer un client Odoo avec les paramètres personnalisés
+            return OdooClient(custom_config=user["odoo_config"])
+        except Exception as e:
+            logger.error(f"Erreur lors de la création du client Odoo personnalisé: {e}")
+            # En cas d'erreur, utiliser le client par défaut
+    
+    # Utiliser le client par défaut
+    return default_odoo_client
 
 # ===== FONCTIONS DE SÉCURITÉ =====
 
@@ -284,6 +323,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 detail="Utilisateur désactivé",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        
+        # Extraire les informations Odoo personnalisées si elles existent
+        if "odoo_config" in payload:
+            user["odoo_config"] = payload["odoo_config"]
+            # Récupérer la clé API depuis les utilisateurs API (sécurité)
+            user["odoo_config"]["api_key"] = ODOO_CONFIG["api_key"]
+            
+            # Si on est en présence d'un utilisateur qui a ses propres identifiants Odoo
+            logger.info(f"Utilisation des identifiants Odoo personnalisés pour: {username}")
             
         logger.info(f"Accès authentifié pour l'utilisateur: {username}")
         return user
@@ -343,6 +391,30 @@ async def login(user_data: UserLogin):
                 headers={"WWW-Authenticate": "Bearer"},
             )
         
+        # Vérifier si des informations Odoo personnalisées ont été fournies
+        custom_odoo_config = None
+        if user_data.odoo_db or user_data.odoo_username or user_data.odoo_api_key:
+            custom_odoo_config = {
+                "db": user_data.odoo_db,
+                "username": user_data.odoo_username,
+                "api_key": user_data.odoo_api_key
+            }
+            
+            # Tester la connexion Odoo avec les paramètres personnalisés
+            try:
+                test_client = OdooClient(custom_config=custom_odoo_config)
+                # Si on arrive ici, c'est que la connexion a réussi
+                logger.info(f"Connexion Odoo personnalisée réussie pour: {user_data.username}")
+                
+                # Stocker les paramètres de connexion Odoo dans le token
+                user["odoo_config"] = custom_odoo_config
+            except Exception as e:
+                logger.error(f"Échec de connexion Odoo personnalisée: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Échec de connexion à Odoo avec les identifiants fournis",
+                )
+        
         # Générer le token JWT
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         token_data = {
@@ -350,6 +422,14 @@ async def login(user_data: UserLogin):
             "scopes": user["scopes"],
             "iat": datetime.utcnow()
         }
+        
+        # Ajouter les informations Odoo personnalisées au token si présentes
+        if "odoo_config" in user:
+            token_data["odoo_config"] = {
+                "db": user["odoo_config"]["db"],
+                "username": user["odoo_config"]["username"],
+                # Ne pas inclure la clé API dans le token pour des raisons de sécurité
+            }
         
         access_token = create_access_token(
             data=token_data, 
@@ -380,7 +460,58 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
         "is_active": current_user["is_active"]
     }
 
-# ===== ENDPOINTS ODOO - LECTURE =====
+# ===== ENDPOINTS ODOO - LECTURE SANS AUTHENTIFICATION =====
+
+@app.get("/public/models", response_model=ApiResponse, tags=["Odoo - Public"])
+async def list_public_models():
+    """Lister les modèles Odoo disponibles (endpoint public)"""
+    try:
+        models = default_odoo_client.execute_kw('ir.model', 'search_read', [[]], {'fields': ['model', 'name'], 'limit': 20})
+        
+        return ApiResponse(
+            success=True,
+            data=models,
+            count=len(models),
+            message=f"Trouvé {len(models)} modèles"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des modèles: {str(e)}")
+
+@app.get("/public/partners", response_model=ApiResponse, tags=["Odoo - Public"])
+async def list_public_partners():
+    """Lister les partenaires publics (endpoint public)"""
+    try:
+        # Domaine pour limiter aux partenaires publics (à adapter selon votre modèle de données)
+        domain = [['is_company', '=', True]]
+        partners = default_odoo_client.execute_kw('res.partner', 'search_read', [domain], 
+                                          {'fields': ['name', 'email', 'phone', 'website'], 'limit': 10})
+        
+        return ApiResponse(
+            success=True,
+            data=partners,
+            count=len(partners),
+            message=f"Trouvé {len(partners)} partenaires publics"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des partenaires: {str(e)}")
+
+@app.get("/public/products", response_model=ApiResponse, tags=["Odoo - Public"])
+async def list_public_products():
+    """Lister les produits publics (endpoint public)"""
+    try:
+        # Domaine pour limiter aux produits publics (à adapter selon votre modèle de données)
+        domain = [['sale_ok', '=', True]]
+        products = default_odoo_client.execute_kw('product.template', 'search_read', [domain], 
+                                         {'fields': ['name', 'list_price', 'default_code'], 'limit': 10})
+        
+        return ApiResponse(
+            success=True,
+            data=products,
+            count=len(products),
+            message=f"Trouvé {len(products)} produits publics"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des produits: {str(e)}")
 
 @app.post("/odoo/search", response_model=ApiResponse, tags=["Odoo - Lecture"])
 async def search_records(
@@ -389,11 +520,14 @@ async def search_records(
 ):
     """Rechercher des enregistrements dans Odoo"""
     try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
         kwargs = {}
         if request.limit:
             kwargs['limit'] = request.limit
         
-        ids = odoo_client.execute_kw(request.model, 'search', [request.domain], kwargs)
+        ids = client.execute_kw(request.model, 'search', [request.domain], kwargs)
         
         return ApiResponse(
             success=True,
@@ -413,12 +547,15 @@ async def read_records(
 ):
     """Lire des enregistrements par IDs"""
     try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
         record_ids = [int(id_.strip()) for id_ in ids.split(",")]
         kwargs = {}
         if fields:
             kwargs['fields'] = [f.strip() for f in fields.split(",")]
         
-        records = odoo_client.execute_kw(model, 'read', [record_ids], kwargs)
+        records = client.execute_kw(model, 'read', [record_ids], kwargs)
         
         return ApiResponse(
             success=True,
@@ -436,13 +573,16 @@ async def search_read_records(
 ):
     """Rechercher et lire des enregistrements en une seule opération"""
     try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
         kwargs = {}
         if request.fields:
             kwargs['fields'] = request.fields
         if request.limit:
             kwargs['limit'] = request.limit
         
-        records = odoo_client.execute_kw(request.model, 'search_read', [request.domain], kwargs)
+        records = client.execute_kw(request.model, 'search_read', [request.domain], kwargs)
         
         return ApiResponse(
             success=True,
@@ -462,7 +602,10 @@ async def create_record(
 ):
     """Créer un nouvel enregistrement"""
     try:
-        new_id = odoo_client.execute_kw(request.model, 'create', [request.values])
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        new_id = client.execute_kw(request.model, 'create', [request.values])
         
         return ApiResponse(
             success=True,
@@ -471,6 +614,48 @@ async def create_record(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
+
+@app.post("/odoo/update", response_model=ApiResponse, tags=["Odoo - Écriture"])
+async def update_records(
+    request: OdooUpdateRequest,
+    current_user: dict = Depends(require_scope("write"))
+):
+    """Mettre à jour des enregistrements existants"""
+    try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        success = client.execute_kw(request.model, 'write', [request.ids, request.values])
+        
+        return ApiResponse(
+            success=success,
+            data={"updated_ids": request.ids},
+            count=len(request.ids),
+            message=f"Mis à jour {len(request.ids)} enregistrements"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour: {str(e)}")
+
+@app.post("/odoo/delete", response_model=ApiResponse, tags=["Odoo - Suppression"])
+async def delete_records(
+    request: OdooDeleteRequest,
+    current_user: dict = Depends(require_scope("delete"))
+):
+    """Supprimer des enregistrements"""
+    try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        success = client.execute_kw(request.model, 'unlink', [request.ids])
+        
+        return ApiResponse(
+            success=success,
+            data={"deleted_ids": request.ids},
+            count=len(request.ids),
+            message=f"Supprimé {len(request.ids)} enregistrements"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression: {str(e)}")
 
 @app.post("/odoo/update", response_model=ApiResponse, tags=["Odoo - Écriture"])
 async def update_records(
@@ -518,7 +703,10 @@ async def list_models(
 ):
     """Lister les modèles Odoo disponibles"""
     try:
-        models = odoo_client.execute_kw('ir.model', 'search_read', [[]], {'fields': ['model', 'name'], 'limit': 100})
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        models = client.execute_kw('ir.model', 'search_read', [[]], {'fields': ['model', 'name'], 'limit': 100})
         
         return ApiResponse(
             success=True,
@@ -528,6 +716,48 @@ async def list_models(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des modèles: {str(e)}")
+
+@app.get("/odoo/fields/{model}", response_model=ApiResponse, tags=["Odoo - Utilitaires"])
+async def get_model_fields(
+    model: str,
+    current_user: dict = Depends(require_scope("read"))
+):
+    """Obtenir les champs d'un modèle Odoo"""
+    try:
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        fields = client.execute_kw(model, 'fields_get', [], {'attributes': ['string', 'help', 'type', 'required']})
+        
+        return ApiResponse(
+            success=True,
+            data=fields,
+            count=len(fields),
+            message=f"Trouvé {len(fields)} champs pour le modèle {model}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des champs: {str(e)}")
+
+@app.get("/health", tags=["Système"])
+async def health_check():
+    """Vérification de l'état de l'API"""
+    try:
+        # Test de connexion Odoo avec le client par défaut
+        version = default_odoo_client.execute_kw('ir.module.module', 'search_count', [[]])
+        
+        return {
+            "status": "healthy",
+            "odoo_connection": "ok",
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "1.0.0"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "odoo_connection": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
 @app.get("/odoo/fields/{model}", response_model=ApiResponse, tags=["Odoo - Utilitaires"])
 async def get_model_fields(
