@@ -92,6 +92,10 @@ class UserLogin(BaseModel):
     odoo_username: Optional[str] = None
     odoo_api_key: Optional[str] = None
 
+class PinLogin(BaseModel):
+    matricule: str = Field(..., description="Matricule de l'employé")
+    pin: str = Field(..., description="Code PIN de l'employé")
+
 class OdooSearchRequest(BaseModel):
     model: str = Field(..., description="Nom du modèle Odoo (ex: res.partner)")
     domain: Optional[List] = Field(default=[], description="Critères de recherche")
@@ -309,7 +313,32 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             logger.warning("Token sans username")
             raise credentials_exception
             
-        # Vérifier que l'utilisateur existe
+        # Vérifier si c'est un employé authentifié par PIN (format employee_ID)
+        if username.startswith("employee_"):
+            # Pour les authentifications par PIN, créer un utilisateur virtuel avec les données du token
+            employee_id = payload.get("employee_id")
+            employee_name = payload.get("employee_name")
+            employee_matricule = payload.get("employee_matricule")
+            
+            if not employee_id or not employee_name:
+                logger.warning("Token employé invalide - informations manquantes")
+                raise credentials_exception
+                
+            # Créer un utilisateur virtuel avec les informations de l'employé
+            virtual_user = {
+                "username": username,
+                "is_active": True,
+                "scopes": payload.get("scopes", ["read", "pos"]),
+                "employee_id": employee_id,
+                "employee_name": employee_name,
+                "employee_matricule": employee_matricule,
+                "auth_type": "pin"  # Indiquer que c'est une authentification par PIN
+            }
+            
+            logger.info(f"Accès authentifié par PIN pour l'employé: {employee_name}")
+            return virtual_user
+            
+        # Vérifier que l'utilisateur existe pour authentification standard
         user = API_USERS.get(username)
         if user is None:
             logger.warning(f"Utilisateur du token non trouvé: {username}")
@@ -351,15 +380,22 @@ def require_scope(required_scope: str):
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Permissions insuffisantes"
             )
+        
+        # Gestion spéciale pour les utilisateurs authentifiés par PIN
+        if current_user.get("auth_type") == "pin" and required_scope == "pos":
+            logger.debug(f"Accès POS autorisé pour l'employé: {current_user.get('employee_name')}")
+            return current_user
             
         if required_scope not in current_user["scopes"]:
-            logger.warning(f"Accès refusé: {current_user['username']} a tenté d'accéder à {required_scope}")
+            user_id = current_user.get("employee_name") if current_user.get("auth_type") == "pin" else current_user["username"]
+            logger.warning(f"Accès refusé: {user_id} a tenté d'accéder à {required_scope}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Permission insuffisante. Scope requis: {required_scope}"
             )
             
-        logger.debug(f"Accès autorisé: {current_user['username']} a accédé à {required_scope}")
+        user_id = current_user.get("employee_name") if current_user.get("auth_type") == "pin" else current_user["username"]
+        logger.debug(f"Accès autorisé: {user_id} a accédé à {required_scope}")
         return current_user
     return scope_checker
 
@@ -446,6 +482,93 @@ async def login(user_data: UserLogin):
         raise
     except Exception as e:
         logger.error(f"Erreur lors de la connexion: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la connexion",
+        )
+
+@app.post("/auth/pin-login", response_model=Token, tags=["Authentification"])
+async def pin_login(login_data: PinLogin):
+    """Connexion avec matricule et PIN pour les utilisateurs de point de vente/stock"""
+    try:
+        # Valider les données d'entrée
+        if not login_data.matricule or not login_data.pin:
+            logger.warning("Tentative de connexion avec des champs vides")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le matricule et le PIN sont requis",
+            )
+        
+        # Rechercher l'employé dans Odoo en utilisant le matricule et le PIN
+        try:
+            domain = [
+                ('x_studio_matricule', '=', login_data.matricule),
+                ('pin', '=', login_data.pin),
+                ('active', '=', True)
+            ]
+            
+            # Utiliser le client Odoo par défaut pour la recherche
+            employee = default_odoo_client.execute_kw(
+                'hr.employee', 
+                'search_read', 
+                [domain], 
+                {'fields': ['id', 'name', 'work_email', 'job_id', 'department_id'], 'limit': 1}
+            )
+            
+            if not employee:
+                logger.warning(f"Aucun employé trouvé avec matricule={login_data.matricule} et PIN fourni")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Matricule ou PIN incorrect",
+                )
+            
+            employee = employee[0]
+            logger.info(f"Employé trouvé: {employee['name']}")
+            
+            # Créer un utilisateur virtuel avec des droits limités pour le POS/stock
+            virtual_user = {
+                "username": f"employee_{employee['id']}",
+                "is_active": True,
+                "scopes": ["read", "pos"],  # Limiter aux opérations POS/stock
+                "employee_id": employee['id'],
+                "employee_name": employee['name'],
+                "employee_matricule": login_data.matricule
+            }
+            
+            # Générer le token JWT
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            token_data = {
+                "sub": virtual_user["username"],
+                "scopes": virtual_user["scopes"],
+                "iat": datetime.utcnow(),
+                "employee_id": employee['id'],
+                "employee_name": employee['name'],
+                "employee_matricule": login_data.matricule
+            }
+            
+            access_token = create_access_token(
+                data=token_data,
+                expires_delta=access_token_expires
+            )
+            
+            logger.info(f"Connexion par PIN réussie pour l'employé: {employee['name']}")
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            }
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la vérification de l'employé: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erreur lors de la vérification des informations d'employé",
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la connexion par PIN: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erreur lors de la connexion",
@@ -684,7 +807,10 @@ async def delete_records(
 ):
     """Supprimer des enregistrements"""
     try:
-        success = odoo_client.execute_kw(request.model, 'unlink', [request.ids])
+        # Obtenir le client Odoo approprié pour cet utilisateur
+        client = get_odoo_client(current_user)
+        
+        success = client.execute_kw(request.model, 'unlink', [request.ids])
         
         return ApiResponse(
             success=success,
@@ -694,6 +820,150 @@ async def delete_records(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression: {str(e)}")
+
+# ===== ENDPOINTS POS/STOCK =====
+
+class PosProductSearchRequest(BaseModel):
+    barcode: Optional[str] = None
+    product_name: Optional[str] = None
+    limit: Optional[int] = Field(default=10, description="Nombre max de résultats")
+
+class PosOrderCreateRequest(BaseModel):
+    customer_id: Optional[int] = None
+    products: List[Dict[str, Any]] = Field(..., description="Liste des produits dans la commande")
+    payment_method: str = Field(default="cash", description="Méthode de paiement")
+    amount_paid: float = Field(..., description="Montant payé")
+
+@app.post("/pos/products", response_model=ApiResponse, tags=["Point de Vente"])
+async def search_pos_products(
+    request: PosProductSearchRequest,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """Rechercher des produits pour le point de vente"""
+    try:
+        # Obtenir le client Odoo
+        client = get_odoo_client(current_user)
+        
+        # Construire le domaine de recherche
+        domain = [('type', '=', 'product')]  # Produits stockables uniquement
+        
+        if request.barcode:
+            domain.append(('barcode', '=', request.barcode))
+        
+        if request.product_name:
+            domain.append(('name', 'ilike', request.product_name))
+        
+        # Récupérer les produits avec uniquement des champs standards
+        products = client.execute_kw(
+            'product.product', 
+            'search_read', 
+            [domain], 
+            {
+                'fields': ['name', 'barcode', 'lst_price', 'taxes_id', 'uom_id', 'qty_available', 'virtual_available', 'type'],
+                'limit': request.limit
+            }
+        )
+        
+        return ApiResponse(
+            success=True,
+            data=products,
+            count=len(products),
+            message=f"Trouvé {len(products)} produits"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la recherche de produits: {str(e)}")
+
+@app.post("/pos/create-order", response_model=ApiResponse, tags=["Point de Vente"])
+async def create_pos_order(
+    request: PosOrderCreateRequest,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """Créer une nouvelle commande de point de vente"""
+    try:
+        # Obtenir le client Odoo
+        client = get_odoo_client(current_user)
+        
+        # Vérifier d'abord si le module point_of_sale est installé
+        pos_module = client.execute_kw(
+            'ir.module.module',
+            'search_read',
+            [[['name', '=', 'point_of_sale'], ['state', '=', 'installed']]],
+            {'fields': ['name']}
+        )
+        
+        if not pos_module:
+            # Si POS n'est pas installé, créer une commande de vente standard
+            order_lines = []
+            for product in request.products:
+                line_vals = {
+                    'product_id': product['product_id'],
+                    'product_uom_qty': product['qty'],
+                    'price_unit': product['price_unit']
+                }
+                order_lines.append((0, 0, line_vals))
+                
+            sale_order = {
+                'partner_id': request.customer_id,
+                'order_line': order_lines
+            }
+            
+            order_id = client.execute_kw('sale.order', 'create', [sale_order])
+            
+            return ApiResponse(
+                success=True,
+                data={"order_id": order_id, "type": "sale.order"},
+                message="Commande de vente créée avec succès"
+            )
+        else:
+            # Si POS est installé, essayer de créer une commande POS
+            # Vérifier si une session POS est ouverte
+            pos_sessions = client.execute_kw(
+                'pos.session',
+                'search_read',
+                [[['state', '=', 'opened']]],
+                {'fields': ['id'], 'limit': 1}
+            )
+            
+            if not pos_sessions:
+                return ApiResponse(
+                    success=False,
+                    message="Aucune session POS ouverte. Impossible de créer une commande POS."
+                )
+                
+            session_id = pos_sessions[0]['id']
+            
+            # Préparer les lignes de commande
+            order_lines = []
+            for product in request.products:
+                line_vals = {
+                    'product_id': product['product_id'],
+                    'qty': product['qty'],
+                    'price_unit': product['price_unit']
+                }
+                order_lines.append((0, 0, line_vals))
+                
+            # Créer la commande POS
+            order_data = {
+                'partner_id': request.customer_id,
+                'user_id': current_user.get('employee_id', False),
+                'session_id': session_id,
+                'lines': order_lines,
+                'amount_total': request.amount_paid,
+                'amount_paid': request.amount_paid,
+                'amount_return': 0,
+            }
+            
+            order_id = client.execute_kw('pos.order', 'create', [order_data])
+            
+            return ApiResponse(
+                success=True,
+                data={"order_id": order_id, "type": "pos.order"},
+                message="Commande POS créée avec succès"
+            )
+            
+    except Exception as e:
+        logger.error(f"Erreur lors de la création de la commande: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la commande: {str(e)}")
 
 # ===== ENDPOINTS UTILITAIRES =====
 
@@ -738,44 +1008,6 @@ async def get_model_fields(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des champs: {str(e)}")
 
-@app.get("/health", tags=["Système"])
-async def health_check():
-    """Vérification de l'état de l'API"""
-    try:
-        # Test de connexion Odoo avec le client par défaut
-        version = default_odoo_client.execute_kw('ir.module.module', 'search_count', [[]])
-        
-        return {
-            "status": "healthy",
-            "odoo_connection": "ok",
-            "timestamp": datetime.utcnow().isoformat(),
-            "version": "1.0.0"
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "odoo_connection": "error",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-@app.get("/odoo/fields/{model}", response_model=ApiResponse, tags=["Odoo - Utilitaires"])
-async def get_model_fields(
-    model: str,
-    current_user: dict = Depends(require_scope("read"))
-):
-    """Obtenir les champs d'un modèle Odoo"""
-    try:
-        fields = odoo_client.execute_kw(model, 'fields_get', [], {'attributes': ['string', 'help', 'type', 'required']})
-        
-        return ApiResponse(
-            success=True,
-            data=fields,
-            count=len(fields),
-            message=f"Trouvé {len(fields)} champs pour le modèle {model}"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des champs: {str(e)}")
 
 # ===== ENDPOINT DE SANTÉ =====
 
@@ -783,8 +1015,8 @@ async def get_model_fields(
 async def health_check():
     """Vérification de l'état de l'API"""
     try:
-        # Test de connexion Odoo
-        version = odoo_client.execute_kw('ir.module.module', 'search_count', [[]])
+        # Test de connexion Odoo avec le client par défaut
+        version = default_odoo_client.execute_kw('ir.module.module', 'search_count', [[]])
         
         return {
             "status": "healthy",
