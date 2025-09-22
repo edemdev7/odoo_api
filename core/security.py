@@ -2,7 +2,9 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
-import jwt
+from jose import jwt
+from jose.exceptions import ExpiredSignatureError, JWTError
+
 from core.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, ODOO_CONFIG, logger, REVOKED_TOKENS
 
 # Classes de sécurité
@@ -75,14 +77,14 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         # Décoder le token JWT
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        except jwt.ExpiredSignatureError:
+        except ExpiredSignatureError:
             logger.warning("Token expiré")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Token expiré",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        except jwt.PyJWTError as e:
+        except JWTError as e:
             logger.warning(f"Erreur de décodage du token: {e}")
             raise credentials_exception
             
