@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 # Configuration de sécurité
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 heures
+
+# Liste des tokens invalidés/révoqués
+REVOKED_TOKENS = set()
 
 # Configuration Odoo
 ODOO_CONFIG = {

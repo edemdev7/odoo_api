@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
-from core.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, ODOO_CONFIG, logger
+from core.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, ODOO_CONFIG, logger, REVOKED_TOKENS
 
 # Classes de sécurité
 security = HTTPBearer()
@@ -62,6 +62,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             raise credentials_exception
             
         token = credentials.credentials
+        
+        # Vérifier si le token a été révoqué/invalidé (logout)
+        if token in REVOKED_TOKENS:
+            logger.warning("Tentative d'utilisation d'un token révoqué")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token révoqué. Veuillez vous reconnecter.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         
         # Décoder le token JWT
         try:
@@ -140,6 +149,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception as e:
         logger.error(f"Erreur lors de la validation du token: {e}")
         raise credentials_exception
+
+def invalidate_token(token: str):
+    """Invalide un token en l'ajoutant à la liste des tokens révoqués"""
+    REVOKED_TOKENS.add(token)
+    logger.info("Token invalidé avec succès")
+    return True
 
 def require_scope(required_scope: str):
     """Décorateur pour vérifier les permissions"""

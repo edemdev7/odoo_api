@@ -1,10 +1,35 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
+class PosShopUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, description="Nom du point de vente")
+    state: Optional[str] = Field(None, description="État du PDV")
+    company_id: Optional[int] = Field(None, description="ID de la société")
+    user_ids: Optional[List[int]] = Field(None, description="IDs des utilisateurs du PDV")
+    journal_id: Optional[int] = Field(None, description="ID du journal")
+    sequence_id: Optional[int] = Field(None, description="ID de la séquence")
+
+class PosShopArchiveRequest(BaseModel):
+    active: bool = Field(..., description="True pour désarchiver, False pour archiver le PDV")
+
 class Token(BaseModel):
     access_token: str
     token_type: str
     expires_in: int
+    user_data: Optional[Dict[str, Any]] = Field(None, description="Données de l'utilisateur connecté")
+
+class UserData(BaseModel):
+    username: str
+    fullname: Optional[str] = None
+    email: Optional[str] = None
+    image_url: Optional[str] = None
+    phone: Optional[str] = None
+    scopes: List[str]
+    is_active: bool
+    additional_info: Optional[Dict[str, Any]] = None
+
+class LogoutRequest(BaseModel):
+    token: str = Field(..., description="Token JWT à invalider")
 
 class UserLogin(BaseModel):
     username: str

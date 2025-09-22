@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path, Body
 from typing import List, Dict, Any
 
-from models.schemas import PosProductSearchRequest, PosOrderCreateRequest
+from models.schemas import PosProductSearchRequest, PosOrderCreateRequest, PosShopUpdateRequest, PosShopArchiveRequest
 from models.responses import ApiResponse
 from core.security import require_scope
 from core.odoo_client import get_odoo_client
@@ -9,6 +9,76 @@ from core.config import logger
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
 
+@router.get("/shops", response_model=ApiResponse)
+async def get_pos_shops(current_user: dict = Depends(require_scope("pos"))):
+    """
+    Récupérer la liste des points de vente (PDV)
+    
+    Cette route retourne la liste des PDV (modèle Odoo 'pos.config') avec leurs informations principales.
+    
+    Requires:
+    - Authentification JWT
+    - Scope "pos"
+    """
+    try:
+        client = get_odoo_client(current_user)
+        shops = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[]],
+            {'fields': ['id', 'name', 'active', 'state', 'company_id', 'user_ids', 'journal_id', 'sequence_id']}
+        )
+        return ApiResponse(success=True, data=shops, count=len(shops), message=f"{len(shops)} PDV trouvés")
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des PDV: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des PDV: {str(e)}")
+
+@router.put("/shops/{shop_id}", response_model=ApiResponse)
+async def update_pos_shop(
+    shop_id: int = Path(..., description="ID du point de vente à mettre à jour"),
+    update: PosShopUpdateRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Mettre à jour les informations d'un point de vente (PDV)
+    
+    Cette route permet de modifier les champs d'un PDV (modèle Odoo 'pos.config').
+    
+    Requires:
+    - Authentification JWT
+    - Scope "pos"
+    """
+    try:
+        client = get_odoo_client(current_user)
+        success = client.execute_kw('pos.config', 'write', [[shop_id], update.dict(exclude_unset=True)])
+        return ApiResponse(success=success, data={"shop_id": shop_id}, message="PDV mis à jour")
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour du PDV: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour du PDV: {str(e)}")
+
+@router.patch("/shops/{shop_id}/archive", response_model=ApiResponse)
+async def archive_pos_shop(
+    shop_id: int = Path(..., description="ID du point de vente à archiver/désarchiver"),
+    archive: PosShopArchiveRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Archiver ou désarchiver un point de vente (PDV)
+    
+    Cette route permet d'archiver (désactiver) ou de désarchiver (réactiver) un PDV via le champ 'active'.
+    
+    Requires:
+    - Authentification JWT
+    - Scope "pos"
+    """
+    try:
+        client = get_odoo_client(current_user)
+        success = client.execute_kw('pos.config', 'write', [[shop_id], {'active': archive.active}])
+        return ApiResponse(success=success, data={"shop_id": shop_id, "active": archive.active}, message="PDV archivé/désarchivé")
+    except Exception as e:
+        logger.error(f"Erreur lors de l'archivage du PDV: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'archivage du PDV: {str(e)}")
+    
 @router.post("/products", response_model=ApiResponse)
 async def search_pos_products(
     request: PosProductSearchRequest,
