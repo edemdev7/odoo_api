@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from datetime import datetime, timedelta
 
-from models.schemas import UserLogin, PinLogin, Token, LogoutRequest, UserData
+from models.schemas import UserLogin, PinLogin, PinResetRequest, Token, LogoutRequest, UserData
 from models.responses import ApiResponse
 from core.security import authenticate_user, create_access_token, get_current_user, require_scope, invalidate_token
 from core.config import ACCESS_TOKEN_EXPIRE_MINUTES, logger
@@ -315,6 +315,98 @@ async def pin_login(login_data: PinLogin):
         raise HTTPException(
             status_code=500,
             detail="Erreur lors de la connexion",
+        )
+
+@router.post("/reset-pin", response_model=ApiResponse, summary="Réinitialisation du code PIN")
+async def reset_pin(reset_data: PinResetRequest):
+    """
+    **Réinitialisation du code PIN d'un employé**
+    
+    Cette route permet à un employé de réinitialiser son code PIN en utilisant uniquement son matricule.
+    Utile quand l'employé a oublié son ancien PIN.
+    
+    - **matricule**: Matricule de l'employé (champ x_studio_matricule dans Odoo)
+    - **new_pin**: Nouveau code PIN (4-8 chiffres)
+    
+    **Retourne** un message de confirmation si la réinitialisation a réussi.
+    """
+    try:
+        # Valider les données d'entrée
+        if not reset_data.matricule or not reset_data.new_pin:
+            logger.warning("Tentative de reset PIN avec des champs vides")
+            raise HTTPException(
+                status_code=400,
+                detail="Le matricule et le nouveau PIN sont requis",
+            )
+            
+        # Vérifier que le nouveau PIN ne contient que des chiffres
+        if not reset_data.new_pin.isdigit():
+            raise HTTPException(
+                status_code=400,
+                detail="Le PIN doit contenir uniquement des chiffres",
+            )
+        
+        # Rechercher l'employé dans Odoo en utilisant uniquement le matricule
+        try:
+            domain = [
+                ('x_studio_matricule', '=', reset_data.matricule),
+                ('active', '=', True)
+            ]
+            
+            # Utiliser le client Odoo par défaut pour la recherche
+            employee = default_odoo_client.execute_kw(
+                'hr.employee', 
+                'search_read', 
+                [domain], 
+                {'fields': ['id', 'name', 'work_email'], 'limit': 1}
+            )
+            
+            if not employee:
+                logger.warning(f"Aucun employé actif trouvé avec matricule={reset_data.matricule}")
+                raise HTTPException(
+                    status_code=404,
+                    detail="Employé non trouvé avec ce matricule",
+                )
+            
+            employee = employee[0]
+            logger.info(f"Employé trouvé pour reset PIN: {employee['name']}")
+            
+            # Mettre à jour le PIN de l'employé
+            update_result = default_odoo_client.execute_kw(
+                'hr.employee',
+                'write',
+                [[employee['id']], {'pin': reset_data.new_pin}]
+            )
+            
+            if not update_result:
+                logger.error(f"Échec de la mise à jour du PIN pour l'employé ID {employee['id']}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Erreur lors de la mise à jour du PIN",
+                )
+            
+            logger.info(f"PIN mis à jour avec succès pour l'employé: {employee['name']} (ID: {employee['id']})")
+            return ApiResponse(
+                success=True,
+                message=f"Code PIN mis à jour avec succès pour {employee['name']}"
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Erreur lors de la recherche/mise à jour de l'employé: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Erreur lors de la mise à jour du code PIN",
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors du reset PIN: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Erreur lors de la réinitialisation du code PIN",
         )
 
 @router.get("/me", response_model=UserData, summary="Informations utilisateur")

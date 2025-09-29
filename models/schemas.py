@@ -43,6 +43,10 @@ class PinLogin(BaseModel):
     matricule: str = Field(..., description="Matricule de l'employé")
     pin: str = Field(..., description="Code PIN de l'employé")
 
+class PinResetRequest(BaseModel):
+    matricule: str = Field(..., description="Matricule de l'employé", min_length=1)
+    new_pin: str = Field(..., description="Nouveau code PIN (4-8 chiffres)", min_length=4, max_length=8)
+
 class OdooSearchRequest(BaseModel):
     model: str = Field(..., description="Nom du modèle Odoo (ex: res.partner)")
     domain: Optional[List] = Field(default=[], description="Critères de recherche")
