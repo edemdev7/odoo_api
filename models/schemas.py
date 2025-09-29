@@ -76,3 +76,46 @@ class PosOrderCreateRequest(BaseModel):
     products: List[Dict[str, Any]] = Field(..., description="Liste des produits dans la commande")
     payment_method: str = Field(default="cash", description="Méthode de paiement")
     amount_paid: float = Field(..., description="Montant payé")
+
+# Modèles pour la gestion des sessions POS
+class PosShop(BaseModel):
+    id: int
+    name: str
+    is_station: bool = Field(False, description="Indique si c'est une station service")
+    current_session_id: Optional[int] = None
+    current_session_state: Optional[str] = None
+    balance: Optional[float] = Field(None, description="Solde actuel du point de vente")
+
+class PosSessionStatus(BaseModel):
+    pos_id: int
+    has_active_session: bool
+    session_id: Optional[int] = None
+    session_state: Optional[str] = None
+    can_open_session: bool = Field(description="L'employé peut-il ouvrir une session")
+    is_manager: bool = Field(description="L'employé est-il gérant")
+
+class PosSessionInitializeRequest(BaseModel):
+    pos_id: int = Field(..., description="ID du point de vente")
+
+class PosSessionResponse(BaseModel):
+    session_id: int
+    pos_id: int
+    pos_name: str
+    is_station: bool
+    state: str
+    message: str
+
+class PosPump(BaseModel):
+    id: int
+    name: str
+    product_name: str
+    last_index: float = Field(description="Dernier index du compteur")
+    current_index: Optional[float] = Field(None, description="Index actuel à valider")
+
+class PosOpenSessionRequest(BaseModel):
+    session_id: int = Field(..., description="ID de la session à ouvrir")
+    pump_indexes: Optional[List[Dict[str, float]]] = Field(None, description="Index des pompes validés")
+
+class PosCloseSessionRequest(BaseModel):
+    ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
+    closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
