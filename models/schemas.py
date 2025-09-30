@@ -116,6 +116,84 @@ class PosOpenSessionRequest(BaseModel):
     session_id: int = Field(..., description="ID de la session à ouvrir")
     pump_indexes: Optional[List[Dict[str, float]]] = Field(None, description="Index des pompes validés")
 
+# Modèles pour les données de pompes spécifiques
+class StationPumpData(BaseModel):
+    id: str = Field(..., description="ID unique de la pompe")
+    name: str = Field(..., description="Nom de la pompe (ex: J1_E1)")
+    stationId: str = Field(..., description="ID de la station")
+    type: str = Field(..., description="Type de carburant (PETROL, FUEL, etc.)")
+    createdAt: str = Field(..., description="Date de création")
+    updatedAt: str = Field(..., description="Date de mise à jour")
+    current_index: Optional[float] = Field(None, description="Index actuel de la pompe")
+    start_index: Optional[float] = Field(None, description="Index de début de session")
+
+class PosOpenSessionWithPumpsRequest(BaseModel):
+    session_id: int = Field(..., description="ID de la session à ouvrir")
+    pump_indexes: List[StationPumpData] = Field(..., description="Données des pompes avec leurs index")
+
 class PosCloseSessionRequest(BaseModel):
     ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
     closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
+
+# Modèles pour la gestion des pompes et ventes
+class PumpDetails(BaseModel):
+    id: int
+    name: str
+    product_id: int
+    product_name: str
+    product_code: Optional[str] = None
+    unit_price: float
+    start_index: Optional[float] = Field(None, description="Index de début de session")
+    current_index: Optional[float] = Field(None, description="Index actuel")
+    is_available: bool = Field(True, description="Pompe disponible pour vente")
+
+class PumpSelection(BaseModel):
+    pump_id: int
+    product_confirmed: bool = Field(True, description="Produit confirmé par l'agent")
+
+class PumpSelectionRequest(BaseModel):
+    pos_id: int = Field(..., description="ID du point de vente")
+    selected_pumps: List[PumpSelection] = Field(..., description="Pompes sélectionnées")
+
+class PosOrderLine(BaseModel):
+    product_id: int
+    pump_id: Optional[int] = Field(None, description="ID de la pompe utilisée")
+    qty: float = Field(..., description="Quantité vendue")
+    price_unit: float = Field(..., description="Prix unitaire")
+    discount: Optional[float] = Field(0.0, description="Remise en pourcentage")
+    start_pump_index: Optional[float] = Field(None, description="Index pompe début")
+    end_pump_index: Optional[float] = Field(None, description="Index pompe fin")
+
+class PosOrderCreateFullRequest(BaseModel):
+    pos_session_id: int = Field(..., description="ID de la session POS")
+    partner_id: Optional[int] = Field(None, description="ID du client")
+    lines: List[PosOrderLine] = Field(..., description="Lignes de commande")
+    payment_method_id: int = Field(..., description="ID de la méthode de paiement")
+    amount_paid: float = Field(..., description="Montant payé")
+    amount_return: Optional[float] = Field(0.0, description="Monnaie rendue")
+    note: Optional[str] = Field(None, description="Note sur la commande")
+
+class CashRegisterCloseRequest(BaseModel):
+    ending_balance: float = Field(..., description="Solde de fermeture déclaré")
+    pump_end_indexes: List[Dict[str, Any]] = Field(..., description="Index de fin des pompes")
+    closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
+
+class PumpIndexValidation(BaseModel):
+    pump_id: int
+    start_index: float
+    end_index: float
+    calculated_qty: float = Field(description="Quantité calculée (fin - début)")
+    sold_qty: float = Field(description="Quantité vendue selon les commandes")
+    difference: float = Field(description="Différence entre calculée et vendue")
+    is_valid: bool = Field(description="Validation conforme")
+
+class CashRegisterValidation(BaseModel):
+    pos_id: int
+    session_id: int
+    total_sales: float
+    declared_balance: float
+    expected_balance: float
+    balance_difference: float
+    pump_validations: List[PumpIndexValidation]
+    is_valid: bool = Field(description="Validation globale conforme")
+    validation_errors: List[str] = Field(default=[], description="Liste des erreurs de validation")
