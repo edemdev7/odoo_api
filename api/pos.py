@@ -94,9 +94,10 @@ async def archive_pos_shop(
 @router.get("/available", response_model=List[PosShop])
 async def get_available_pos_shops(current_user: dict = Depends(require_scope("pos"))):
     """
-    Récupérer les points de vente disponibles pour l'employé connecté
+    Récupérer les points de vente affectés à l'employé connecté
     
-    Cette route retourne la liste des PDV accessibles à l'employé avec l'état des sessions.
+    Cette route retourne la liste des PDV auxquels l'employé connecté est affecté,
+    avec l'état des sessions et les soldes.
     
     Requires:
     - Authentification JWT avec scope 'pos'
@@ -104,16 +105,42 @@ async def get_available_pos_shops(current_user: dict = Depends(require_scope("po
     try:
         client = get_odoo_client(current_user)
         
-        # Récupérer tous les PDV actifs
+        # Récupérer l'ID de l'employé actuel depuis le token
+        employee_id = current_user.get("employee_id")
+        if not employee_id:
+            logger.error("ID d'employé manquant dans le token")
+            raise HTTPException(
+                status_code=400,
+                detail="Informations d'employé manquantes"
+            )
+        
+        # Récupérer les PDV où cet employé a accès
+        # Les PDV sont filtrés par les champs basic_employee_ids ou advanced_employee_ids
+        pos_search_domain = [
+            ('active', '=', True),
+            '|',
+            ('basic_employee_ids', 'in', [employee_id]),
+            ('advanced_employee_ids', 'in', [employee_id])
+        ]
+        logger.info(f"Recherche des PDV affectés à l'employé {employee_id}")
+        
+        # Récupérer les PDV selon le filtre
         pos_configs = client.execute_kw(
             'pos.config',
             'search_read',
-            [[('active', '=', True)]],
-            {'fields': ['id', 'name', 'current_session_id']}
+            [pos_search_domain],
+            {'fields': ['id', 'name', 'current_session_id', 'basic_employee_ids', 'advanced_employee_ids']}
         )
+        
+        logger.info(f"Trouvé {len(pos_configs)} PDV pour l'utilisateur")
         
         available_pos = []
         for pos_config in pos_configs:
+            # Log des employés affectés pour debug
+            basic_employees = pos_config.get('basic_employee_ids', [])
+            advanced_employees = pos_config.get('advanced_employee_ids', [])
+            logger.debug(f"PDV {pos_config['name']} (ID: {pos_config['id']}) - Employés basiques: {basic_employees}, Employés avancés: {advanced_employees}")
+            
             # Vérifier s'il y a une session active
             session_info = None
             balance = 0.0
@@ -782,16 +809,32 @@ async def close_pos_session(
     """
     Fermer la session POS active (gérants uniquement)
     
-    Cette route ferme la session POS active sur un point de vente.
-    Seuls les gérants peuvent fermer une session.
+    Cette route ferme la session POS active sur un point de vente avec deux modes :
     
+    **Mode Simple** (sans pump_end_indexes):
+    - Fermeture standard pour PDV classiques
+    - Validation basique du solde
+    
+    **Mode Station-Service** (avec pump_end_indexes):
+    - Fermeture avec validation des pompes
+    - Contrôle de cohérence index vs ventes
+    - Tolérance de 1% ou 1L pour les différences
+    
+    **Paramètres:**
     - **ending_balance**: Solde de fermeture déclaré (optionnel)
-    - **closing_notes**: Notes de fermeture (optionnel)
+    - **closing_notes**: Notes de fermeture (optionnel)  
+    - **pump_end_indexes**: Index de fin des pompes (optionnel, active le mode station)
+    
+    **Requires:** Authentification JWT avec scope 'pos' + Profil gérant
     """
     try:
         client = get_odoo_client(current_user)
         
-        # Vérifier si l'employé est gérant (même logique que pour l'initialisation)
+        # Déterminer le mode de fermeture
+        is_station_mode = request.pump_end_indexes is not None and len(request.pump_end_indexes) > 0
+        logger.info(f"Mode de fermeture: {'Station-Service' if is_station_mode else 'Standard'}")
+        
+        # Vérifier si l'employé est gérant
         is_manager = False
         
         if current_user.get("auth_type") == "pin":
@@ -800,7 +843,7 @@ async def close_pos_session(
             job_title = additional_info.get("job", "").lower() if additional_info.get("job") else ""
             
             logger.info(f"Vérification gérant pour fermeture {current_user.get('username')}: job={job_title}")
-            is_manager = 'gérant' in job_title or 'manager' in job_title or 'chef' in job_title
+            is_manager = 'gérant' in job_title or 'manager' in job_title or 'chef' in job_title or 'responsable' in job_title
             
             # Si pas trouvé dans additional_info, chercher dans Odoo
             if not is_manager and current_user.get("employee_id"):
@@ -814,7 +857,7 @@ async def close_pos_session(
                     if employee_data and employee_data[0].get('job_id'):
                         job_name = employee_data[0]['job_id'][1].lower()
                         logger.info(f"Job depuis Odoo pour fermeture: {job_name}")
-                        is_manager = 'gérant' in job_name or 'manager' in job_name or 'chef' in job_name
+                        is_manager = any(keyword in job_name for keyword in ['gérant', 'manager', 'chef', 'responsable'])
                 except Exception as e:
                     logger.warning(f"Erreur lors de la récupération du job depuis Odoo: {e}")
         
@@ -843,19 +886,46 @@ async def close_pos_session(
         
         session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
         
+        # Mode Station-Service : Validation des pompes
+        validation_result = None
+        if is_station_mode:
+            logger.info(f"Mode station activé - Validation de {len(request.pump_end_indexes)} pompe(s)")
+            
+            try:
+                validation_result = await validate_pump_indexes(
+                    client, session_id, request.pump_end_indexes, pos_id
+                )
+                
+                if not validation_result.is_valid:
+                    logger.warning(f"Validation des pompes échouée: {validation_result.validation_errors}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Validation des pompes échouée: {'; '.join(validation_result.validation_errors)}"
+                    )
+                
+                logger.info("✅ Validation des pompes réussie")
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Erreur lors de la validation des pompes: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Erreur lors de la validation des pompes: {str(e)}"
+                )
+        
         # Vérifier l'état de la session
         session_data = client.execute_kw(
             'pos.session',
             'read',
             [session_id],
-            {'fields': ['state', 'name']}
+            {'fields': ['state']}
         )
         
         if not session_data:
             raise HTTPException(status_code=404, detail="Session non trouvée")
         
         session = session_data[0]
-        logger.info(f"Session trouvée: {session['name']}, état: {session['state']}")
         
         if session['state'] not in ['opened', 'opening_control']:
             raise HTTPException(
@@ -873,8 +943,6 @@ async def close_pos_session(
         
         # Ajouter les notes de fermeture s'il y en a
         if request.closing_notes:
-            # Note: Le champ exact peut varier selon votre version d'Odoo
-            # closing_data['notes'] = request.closing_notes
             logger.info(f"Notes de fermeture: {request.closing_notes}")
         
         # Fermer la session (passer en closing_control d'abord)
@@ -896,21 +964,36 @@ async def close_pos_session(
                 logger.warning(f"Impossible de passer en état closed: {e2}")
                 final_state = 'closing_control'
         
-        return PosSessionResponse(
-            session_id=session_id,
-            pos_id=pos_id,
-            pos_name=pos_config['name'],
-            is_station=False,
-            state=final_state,
-            message=f"Session {session_id} fermée avec succès"
-        )
+        # Construire le message de réponse
+        if is_station_mode:
+            message = f"Session fermée avec succès - Mode station-service - {len(request.pump_end_indexes)} pompe(s) validée(s)"
+        else:
+            message = f"Session fermée avec succès - Mode standard"
+        
+        response_data = {
+            'session_id': session_id,
+            'pos_id': pos_id,
+            'pos_name': pos_config['name'],
+            'is_station': is_station_mode,
+            'state': final_state,
+            'message': message
+        }
+        
+        # Ajouter les résultats de validation si mode station
+        if validation_result:
+            response_data['validation_summary'] = {
+                'total_pumps': len(validation_result.pump_validations),
+                'valid_pumps': sum(1 for p in validation_result.pump_validations if p.is_valid),
+                'total_sales': validation_result.total_sales
+            }
+        
+        return PosSessionResponse(**response_data)
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Erreur lors de la fermeture de session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur lors de la fermeture: {str(e)}")
-
 # ===== GESTION DES POMPES ET VENTES =====
 
 @router.get("/{pos_id}/pumps", response_model=List[PumpDetails])
@@ -1347,121 +1430,6 @@ async def create_complete_pos_order(
     except Exception as e:
         logger.error(f"Erreur lors de la création de la commande: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
-
-@router.post("/{pos_id}/close-cash-register", response_model=ApiResponse)
-async def close_cash_register(
-    pos_id: int = Path(..., description="ID du point de vente"),
-    request: CashRegisterCloseRequest = None,
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Fermer la caisse avec validation des index des pompes (GÉRANTS SEULEMENT)
-    
-    Cette route permet aux gérants de fermer une caisse en saisissant les index
-    de fin des pompes et en effectuant un contrôle de cohérence.
-    
-    Requires:
-    - Authentification JWT avec scope 'pos'
-    - Profil gérant
-    """
-    try:
-        client = get_odoo_client(current_user)
-        
-        # Vérifier que l'utilisateur est gérant
-        is_manager = False
-        if current_user.get("auth_type") == "pin" and current_user.get("employee_id"):
-            employee_data = client.execute_kw(
-                'hr.employee',
-                'read',
-                [current_user["employee_id"]],
-                {'fields': ['job_id', 'department_id']}
-            )
-            if employee_data:
-                job_info = employee_data[0].get('job_id')
-                if job_info:
-                    job_name = job_info[1].lower() if isinstance(job_info, list) else str(job_info).lower()
-                    is_manager = any(keyword in job_name for keyword in ['gérant', 'manager', 'chef', 'responsable'])
-                
-                # Vérification dans additional_info aussi
-                additional_info = current_user.get("additional_info", {})
-                if additional_info.get("is_manager") or additional_info.get("is_pos_manager"):
-                    is_manager = True
-        
-        if not is_manager:
-            raise HTTPException(
-                status_code=403,
-                detail="Accès refusé. Seuls les gérants peuvent fermer une caisse."
-            )
-        
-        # Récupérer la session active
-        pos_config = client.execute_kw(
-            'pos.config',
-            'read',
-            [pos_id],
-            {'fields': ['name', 'current_session_id']}
-        )
-        
-        if not pos_config or not pos_config[0].get('current_session_id'):
-            raise HTTPException(
-                status_code=400,
-                detail="Aucune session active sur ce point de vente"
-            )
-        
-        session_id = pos_config[0]['current_session_id'][0]
-        
-        # Effectuer la validation des pompes
-        validation_result = await validate_pump_indexes(
-            client, session_id, request.pump_end_indexes, pos_id
-        )
-        
-        # Si la validation échoue, retourner les erreurs
-        if not validation_result.is_valid:
-            return ApiResponse(
-                success=False,
-                data=validation_result.dict(),
-                message="Validation des pompes échouée. Vérifiez les index et les quantités."
-            )
-        
-        # Mettre à jour le solde de fin de la session
-        session_update_vals = {
-            'cash_register_balance_end_real': request.ending_balance,
-            'state': 'closing_control'
-        }
-        
-        if request.closing_notes:
-            session_update_vals['closing_notes'] = request.closing_notes
-        
-        client.execute_kw('pos.session', 'write', [[session_id], session_update_vals])
-        
-        # Finaliser la fermeture
-        try:
-            client.execute_kw('pos.session', 'action_pos_session_closing_control', [[session_id]])
-            final_state = 'closed'
-        except Exception as e:
-            logger.warning(f"Impossible de finaliser automatiquement: {e}")
-            try:
-                client.execute_kw('pos.session', 'write', [[session_id], {'state': 'closed'}])
-                final_state = 'closed'
-            except:
-                final_state = 'closing_control'
-        
-        return ApiResponse(
-            success=True,
-            data={
-                'session_id': session_id,
-                'pos_id': pos_id,
-                'final_state': final_state,
-                'validation_result': validation_result.dict(),
-                'ending_balance': request.ending_balance
-            },
-            message="Caisse fermée avec succès après validation des pompes"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur lors de la fermeture de caisse: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la fermeture: {str(e)}")
 
 async def validate_pump_indexes(
     client, session_id: int, pump_end_indexes: List[Dict], pos_id: int

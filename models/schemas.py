@@ -134,6 +134,13 @@ class PosOpenSessionWithPumpsRequest(BaseModel):
 class PosCloseSessionRequest(BaseModel):
     ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
     closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
+    pump_end_indexes: Optional[List[Dict[str, Any]]] = Field(None, description="Index de fin des pompes (pour stations-service)")
+
+# Classe obsolète - utilisez PosCloseSessionRequest à la place
+class CashRegisterCloseRequest(BaseModel):
+    ending_balance: float = Field(..., description="Solde de fermeture déclaré")
+    pump_end_indexes: List[Dict[str, Any]] = Field(..., description="Index de fin des pompes")
+    closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
 
 # Modèles pour la gestion des pompes et ventes
 class PumpDetails(BaseModel):
