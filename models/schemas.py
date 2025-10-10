@@ -122,10 +122,22 @@ class StationPumpData(BaseModel):
     name: str = Field(..., description="Nom de la pompe (ex: J1_E1)")
     stationId: str = Field(..., description="ID de la station")
     type: str = Field(..., description="Type de carburant (PETROL, FUEL, etc.)")
-    createdAt: str = Field(..., description="Date de création")
-    updatedAt: str = Field(..., description="Date de mise à jour")
-    current_index: Optional[float] = Field(None, description="Index actuel de la pompe")
-    start_index: Optional[float] = Field(None, description="Index de début de session")
+    start_index: float = Field(..., description="Index de début de session")
+
+# Nouveau schéma unifié pour l'ouverture de session
+class PosUnifiedOpenSessionRequest(BaseModel):
+    # Pour ouverture normale (sans pompes)
+    starting_balance: Optional[float] = Field(None, description="Solde de départ pour ouverture normale")
+    opening_notes: Optional[str] = Field(None, description="Notes d'ouverture")
+    
+    # Pour ouverture avec pompes (stations-service)
+    session_id: Optional[int] = Field(None, description="ID de la session pour ouverture avec pompes")
+    pump_indexes: Optional[List[StationPumpData]] = Field(None, description="Données des pompes avec leurs index")
+
+# Anciens modèles (déprécié - à supprimer dans une version future)
+class PosOpenSessionRequest(BaseModel):
+    session_id: int = Field(..., description="ID de la session à ouvrir")
+    pump_indexes: Optional[List[Dict[str, float]]] = Field(None, description="Index des pompes validés")
 
 class PosOpenSessionWithPumpsRequest(BaseModel):
     session_id: int = Field(..., description="ID de la session à ouvrir")

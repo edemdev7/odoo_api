@@ -9,7 +9,7 @@ from models.schemas import (
     PosSessionResponse, PosPump, PosOpenSessionRequest, PosCloseSessionRequest,
     PumpDetails, PumpSelectionRequest, PosOrderCreateFullRequest,
     CashRegisterCloseRequest, PumpIndexValidation, CashRegisterValidation,
-    StationPumpData, PosOpenSessionWithPumpsRequest
+    StationPumpData, PosOpenSessionWithPumpsRequest, PosUnifiedOpenSessionRequest
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -17,80 +17,8 @@ from core.odoo_client import get_odoo_client
 from core.config import logger
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
-
-@router.get("/shops", response_model=ApiResponse)
-async def get_pos_shops(current_user: dict = Depends(require_scope("pos"))):
-    """
-    Récupérer la liste des points de vente (PDV)
-    
-    Cette route retourne la liste des PDV (modèle Odoo 'pos.config') avec leurs informations principales.
-    
-    Requires:
-    - Authentification JWT
-    - Scope "pos"
-    """
-    try:
-        client = get_odoo_client(current_user)
-        shops = client.execute_kw(
-            'pos.config',
-            'search_read',
-            [[]],
-            {'fields': ['id', 'name', 'active', 'state', 'company_id', 'user_ids', 'journal_id', 'sequence_id']}
-        )
-        return ApiResponse(success=True, data=shops, count=len(shops), message=f"{len(shops)} PDV trouvés")
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération des PDV: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des PDV: {str(e)}")
-
-@router.put("/shops/{shop_id}", response_model=ApiResponse)
-async def update_pos_shop(
-    shop_id: int = Path(..., description="ID du point de vente à mettre à jour"),
-    update: PosShopUpdateRequest = Body(...),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Mettre à jour les informations d'un point de vente (PDV)
-    
-    Cette route permet de modifier les champs d'un PDV (modèle Odoo 'pos.config').
-    
-    Requires:
-    - Authentification JWT
-    - Scope "pos"
-    """
-    try:
-        client = get_odoo_client(current_user)
-        success = client.execute_kw('pos.config', 'write', [[shop_id], update.dict(exclude_unset=True)])
-        return ApiResponse(success=success, data={"shop_id": shop_id}, message="PDV mis à jour")
-    except Exception as e:
-        logger.error(f"Erreur lors de la mise à jour du PDV: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour du PDV: {str(e)}")
-
-@router.patch("/shops/{shop_id}/archive", response_model=ApiResponse)
-async def archive_pos_shop(
-    shop_id: int = Path(..., description="ID du point de vente à archiver/désarchiver"),
-    archive: PosShopArchiveRequest = Body(...),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Archiver ou désarchiver un point de vente (PDV)
-    
-    Cette route permet d'archiver (désactiver) ou de désarchiver (réactiver) un PDV via le champ 'active'.
-    
-    Requires:
-    - Authentification JWT
-    - Scope "pos"
-    """
-    try:
-        client = get_odoo_client(current_user)
-        success = client.execute_kw('pos.config', 'write', [[shop_id], {'active': archive.active}])
-        return ApiResponse(success=success, data={"shop_id": shop_id, "active": archive.active}, message="PDV archivé/désarchivé")
-    except Exception as e:
-        logger.error(f"Erreur lors de l'archivage du PDV: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'archivage du PDV: {str(e)}")
-    
-
+  
 # ===== GESTION DES SESSIONS POS =====
-
 @router.get("/available", response_model=List[PosShop])
 async def get_available_pos_shops(current_user: dict = Depends(require_scope("pos"))):
     """
@@ -482,183 +410,170 @@ async def get_pos_pumps(
 @router.post("/{pos_id}/open-session", response_model=PosSessionResponse)
 async def open_pos_session(
     pos_id: int = Path(..., description="ID du point de vente"),
-    request: PosOpenSessionRequest = Body(...),
+    request: PosUnifiedOpenSessionRequest = Body(...),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Ouvrir définitivement la caisse après validation des compteurs
+    Ouvrir une session POS - Endpoint unifié
     
-    Cette route ouvre officiellement la session POS après validation des index des pompes (pour les stations).
-    """
-    try:
-        client = get_odoo_client(current_user)
-        
-        # Vérifier que la session existe et est en bon état
-        session_data = client.execute_kw(
-            'pos.session',
-            'read',
-            [request.session_id],
-            {'fields': ['config_id', 'state']}
-        )
-        
-        if not session_data:
-            raise HTTPException(status_code=404, detail="Session non trouvée")
-        
-        session = session_data[0]
-        
-        if session['config_id'][0] != pos_id:
-            raise HTTPException(status_code=400, detail="La session ne correspond pas au point de vente")
-        
-        if session['state'] != 'opening_control':
-            raise HTTPException(status_code=400, detail="La session n'est pas dans l'état d'ouverture")
-        
-        # Si des index de pompes sont fournis, les valider/enregistrer
-        if request.pump_indexes:
-            # Pour l'instant, on log les index - à adapter selon votre système
-            logger.info(f"Index de pompes reçus pour session {request.session_id}: {request.pump_indexes}")
-            # Ici vous pourriez enregistrer dans un modèle custom ou un système externe
-        
-        # Ouvrir la session
-        client.execute_kw('pos.session', 'write', [[request.session_id], {'state': 'opened'}])
-        
-        # Récupérer les informations du PDV
-        pos_config = client.execute_kw(
-            'pos.config',
-            'read',
-            [pos_id],
-            {'fields': ['name']}
-        )[0]
-        
-        return PosSessionResponse(
-            session_id=request.session_id,
-            pos_id=pos_id,
-            pos_name=pos_config['name'],
-            is_station=False,  # À déterminer selon votre logique métier
-            state='opened',
-            message=f"Caisse ouverte avec succès - Session {request.session_id}"
-        )
-        
-    except Exception as e:
-        logger.error(f"Erreur lors de l'ouverture de session: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'ouverture: {str(e)}")
-
-@router.post("/{pos_id}/open-session-with-pumps", response_model=PosSessionResponse)
-async def open_pos_session_with_pumps(
-    pos_id: int = Path(..., description="ID du point de vente"),
-    request: PosOpenSessionWithPumpsRequest = Body(...),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Ouvrir la session POS avec les données spécifiques des pompes de station
+    Cette route permet d'ouvrir une session POS avec deux modes :
     
-    Cette route ouvre la session POS en enregistrant les informations détaillées
-    des pompes de la station avec leurs index de début.
-    
-    Paramètres:
-    - session_id: ID de la session à ouvrir
-    - pump_indexes: Liste des pompes avec leurs données (id, name, type, index, etc.)
-    """
-    try:
-        client = get_odoo_client(current_user)
-        
-        # Vérifier que la session existe et est en bon état
-        session_data = client.execute_kw(
-            'pos.session',
-            'read',
-            [request.session_id],
-            {'fields': ['config_id', 'state', 'name']}
-        )
-        
-        if not session_data:
-            raise HTTPException(status_code=404, detail="Session non trouvée")
-        
-        session = session_data[0]
-        
-        if session['config_id'][0] != pos_id:
-            raise HTTPException(status_code=400, detail="La session ne correspond pas au point de vente")
-        
-        if session['state'] not in ['opening_control', 'new']:
-            logger.warning(f"Session {request.session_id} dans l'état {session['state']}, tentative d'ouverture forcée")
-        
-        # Traiter et enregistrer les données des pompes
-        pump_data_processed = []
-        for pump in request.pump_indexes:
-            pump_info = {
-                'pump_id': pump.id,
-                'pump_name': pump.name,
-                'station_id': pump.stationId,
-                'fuel_type': pump.type,
-                'start_index': pump.start_index or 0.0,
-                'current_index': pump.current_index or pump.start_index or 0.0,
-                'created_at': pump.createdAt,
-                'updated_at': pump.updatedAt
-            }
-            pump_data_processed.append(pump_info)
-            
-            logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump_info['start_index']}")
-        
-        # Ici vous pouvez enregistrer les données des pompes selon votre architecture :
-        # Option 1: Dans un modèle personnalisé Odoo pour les sessions de pompes
-        # Option 2: Dans les notes de la session POS
-        # Option 3: Dans un système externe
-        
-        # Pour cet exemple, on va stocker dans les notes de la session
-        pump_summary = f"Pompes initialisées: {len(pump_data_processed)} pompes\n"
-        for pump in pump_data_processed:
-            pump_summary += f"- {pump['pump_name']} ({pump['fuel_type']}): Index {pump['start_index']}\n"
-        
-        # Essayer de créer des enregistrements dans un modèle personnalisé (si il existe)
-        # try:
-        #     for pump in pump_data_processed:
-        #         pump_session_vals = {
-        #             'session_id': request.session_id,
-        #             'pump_external_id': pump['pump_id'],
-        #             'pump_name': pump['pump_name'],
-        #             'fuel_type': pump['fuel_type'],
-        #             'start_index': pump['start_index'],
-        #             'current_index': pump['current_index']
-        #         }
-        #         client.execute_kw('pos.pump.session', 'create', [pump_session_vals])
-        # except Exception as e:
-        #     logger.warning(f"Impossible de créer les enregistrements de pompes: {e}")
-        
-        # Mettre à jour la session avec les informations des pompes
-        session_update = {
-            'state': 'opened'
+    **Mode Station-service (avec pompes):**
+    ```json
+    {
+      "session_id": 123,
+      "pump_indexes": [
+        {
+          "id": "pump_001",
+          "name": "J1_E1", 
+          "stationId": "station_001",
+          "type": "PETROL",
+          "start_index": 1234.56
         }
+      ]
+    }
+    ```
+    
+    **Mode Standard (caisse normale):**
+    ```json
+    {
+      "starting_balance": 1000.00,
+      "opening_notes": "Ouverture matinale"
+    }
+    ```
+    
+    Le mode est détecté automatiquement selon les données fournies.
+    """
+    try:
+        client = get_odoo_client(current_user)
         
-        # Note: Le champ 'note' n'existe pas dans pos.session standard
-        # Les informations des pompes sont loggées et peuvent être stockées
-        # dans un modèle personnalisé si nécessaire
+        # Détecter le mode selon les données fournies
+        is_pump_mode = request.pump_indexes is not None and len(request.pump_indexes) > 0
+        is_standard_mode = request.starting_balance is not None or request.opening_notes is not None
         
-        # Ajouter les données de pompes dans un champ JSON si votre modèle le supporte
-        # session_update['pump_data'] = json.dumps(pump_data_processed)
+        if is_pump_mode and is_standard_mode:
+            raise HTTPException(
+                status_code=400, 
+                detail="Données ambiguës: utilisez soit les données de pompes soit les données standard, pas les deux"
+            )
         
-        client.execute_kw('pos.session', 'write', [[request.session_id], session_update])
+        if not is_pump_mode and not is_standard_mode:
+            raise HTTPException(
+                status_code=400,
+                detail="Données manquantes: fournissez soit pump_indexes soit starting_balance/opening_notes"
+            )
         
-        # Récupérer les informations du PDV pour la réponse
-        pos_config = client.execute_kw(
-            'pos.config',
-            'read',
-            [pos_id],
-            {'fields': ['name']}
-        )[0]
+        # === MODE STATION-SERVICE (avec pompes) ===
+        if is_pump_mode:
+            if not request.session_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="session_id requis pour le mode station-service"
+                )
+            
+            # Vérifier que la session existe
+            session_data = client.execute_kw(
+                'pos.session',
+                'read',
+                [request.session_id],
+                {'fields': ['config_id', 'state', 'name']}
+            )
+            
+            if not session_data:
+                raise HTTPException(status_code=404, detail="Session non trouvée")
+            
+            session = session_data[0]
+            
+            if session['config_id'][0] != pos_id:
+                raise HTTPException(status_code=400, detail="La session ne correspond pas au point de vente")
+            
+            if session['state'] not in ['opening_control', 'new']:
+                logger.warning(f"Session {request.session_id} dans l'état {session['state']}, tentative d'ouverture forcée")
+            
+            # Traiter les données des pompes
+            pump_data_processed = []
+            for pump in request.pump_indexes:
+                pump_info = {
+                    'pump_id': pump.id,
+                    'pump_name': pump.name,
+                    'station_id': pump.stationId,
+                    'fuel_type': pump.type,
+                    'start_index': pump.start_index,
+                }
+                pump_data_processed.append(pump_info)
+                logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
+            
+            # Ouvrir la session
+            client.execute_kw('pos.session', 'write', [[request.session_id], {'state': 'opened'}])
+            
+            # Récupérer les informations du PDV
+            pos_config = client.execute_kw(
+                'pos.config',
+                'read',
+                [pos_id],
+                {'fields': ['name']}
+            )[0]
+            
+            logger.info(f"Session {request.session_id} ouverte avec {len(pump_data_processed)} pompes")
+            
+            return PosSessionResponse(
+                session_id=request.session_id,
+                pos_id=pos_id,
+                pos_name=pos_config['name'],
+                is_station=True,
+                state='opened',
+                message=f"Session station-service ouverte - {len(pump_data_processed)} pompes initialisées"
+            )
         
-        logger.info(f"Session {request.session_id} ouverte avec {len(pump_data_processed)} pompes")
-        
-        return PosSessionResponse(
-            session_id=request.session_id,
-            pos_id=pos_id,
-            pos_name=pos_config['name'],
-            is_station=True,  # C'est une station service
-            state='opened',
-            message=f"Session ouverte avec succès - {len(pump_data_processed)} pompes initialisées"
-        )
+        # === MODE STANDARD (caisse normale) ===
+        else:
+            # Créer une nouvelle session pour le mode standard
+            session_vals = {
+                'config_id': pos_id,
+                'user_id': current_user.get('employee_id', 1),  # Utiliser l'ID employé ou fallback
+            }
+            
+            # Ajouter le solde de départ si fourni
+            if request.starting_balance is not None:
+                session_vals['cash_register_balance_start'] = request.starting_balance
+            
+            # Créer la session
+            new_session_id = client.execute_kw(
+                'pos.session',
+                'create',
+                [session_vals]
+            )
+            
+            # Ouvrir la session immédiatement
+            client.execute_kw('pos.session', 'write', [[new_session_id], {'state': 'opened'}])
+            
+            # Récupérer les informations du PDV
+            pos_config = client.execute_kw(
+                'pos.config',
+                'read',
+                [pos_id],
+                {'fields': ['name']}
+            )[0]
+            
+            # Log des informations d'ouverture
+            opening_info = f"Solde: {request.starting_balance or 0}"
+            if request.opening_notes:
+                opening_info += f", Notes: {request.opening_notes}"
+            logger.info(f"Session standard {new_session_id} ouverte - {opening_info}")
+            
+            return PosSessionResponse(
+                session_id=new_session_id,
+                pos_id=pos_id,
+                pos_name=pos_config['name'],
+                is_station=False,
+                state='opened',
+                message=f"Session standard ouverte - {opening_info}"
+            )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de l'ouverture de session avec pompes: {e}")
+        logger.error(f"Erreur lors de l'ouverture de session: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'ouverture: {str(e)}")
 
 @router.get("/{pos_id}/session/{session_id}/pumps", response_model=List[StationPumpData])
