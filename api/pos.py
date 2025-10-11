@@ -10,7 +10,9 @@ from models.schemas import (
     PumpDetails, PumpSelectionRequest, PosOrderCreateFullRequest,
     CashRegisterCloseRequest, PumpIndexValidation, CashRegisterValidation,
     StationPumpData, PosOpenSessionWithPumpsRequest, PosUnifiedOpenSessionRequest,
-    PosCreateRequest, PosEmployeeAssignmentRequest, PosConfigResponse
+    PosCreateRequest, PosEmployeeAssignmentRequest, PosConfigResponse,
+    ProductCreateRequest, PosProductAssignmentRequest, StockMovementRequest,
+    StockLevelRequest, ProductStockResponse
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -360,6 +362,717 @@ async def get_pos_config_details(
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
+        )
+
+# ===== GESTION DES PRODUITS ET STOCK =====
+
+@router.post("/products/create", response_model=ApiResponse)
+async def create_product(
+    product_data: ProductCreateRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Créer un nouveau produit dans Odoo
+    
+    Cette route permet de créer un produit avec toutes les informations nécessaires
+    pour une utilisation dans le POS et la gestion de stock.
+    
+    **Champs obligatoires :**
+    - **name** : Nom du produit
+    - **list_price** : Prix de vente public
+    
+    **Champs optionnels :**
+    - **default_code** : Référence interne
+    - **barcode** : Code-barres
+    - **categ_id** : Catégorie de produit
+    - **type** : Type (product/service/consu)
+    - **taxes_id** : Taxes applicables
+    - **description** : Description détaillée
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier si le produit existe déjà (par nom ou code)
+        domain = [('name', '=', product_data.name)]
+        if product_data.default_code:
+            domain = ['|', ('name', '=', product_data.name), ('default_code', '=', product_data.default_code)]
+        
+        existing_products = client.execute_kw(
+            'product.template',
+            'search',
+            [domain]
+        )
+        
+        if existing_products:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Un produit avec ce nom ou cette référence existe déjà"
+            )
+        
+        # Préparer les données du produit
+        product_vals = {
+            'name': product_data.name,
+            'list_price': product_data.list_price,
+            'standard_price': product_data.standard_price or 0.0,
+            'type': product_data.type,
+            'active': product_data.active,
+            'sale_ok': product_data.sale_ok,
+            'purchase_ok': product_data.purchase_ok,
+            'available_in_pos': product_data.available_in_pos,
+            'weight': product_data.weight or 0.0,
+            'volume': product_data.volume or 0.0,
+        }
+        
+        # Ajouter les champs optionnels
+        if product_data.default_code:
+            product_vals['default_code'] = product_data.default_code
+        
+        if product_data.barcode:
+            product_vals['barcode'] = product_data.barcode
+        
+        if product_data.description:
+            product_vals['description'] = product_data.description
+        
+        if product_data.description_sale:
+            product_vals['description_sale'] = product_data.description_sale
+        
+        # Gérer la catégorie
+        if product_data.categ_id:
+            product_vals['categ_id'] = product_data.categ_id
+        else:
+            # Récupérer la catégorie par défaut "Tous"
+            try:
+                default_categ = client.execute_kw(
+                    'product.category',
+                    'search',
+                    [['|', ('name', '=', 'All'), ('name', '=', 'Tous')]],
+                    {'limit': 1}
+                )
+                if default_categ:
+                    product_vals['categ_id'] = default_categ[0]
+            except Exception as e:
+                logger.warning(f"Impossible de récupérer la catégorie par défaut: {e}")
+        
+        # Gérer les unités de mesure
+        if product_data.uom_id:
+            product_vals['uom_id'] = product_data.uom_id
+            product_vals['uom_po_id'] = product_data.uom_po_id or product_data.uom_id
+        else:
+            # Récupérer l'unité "Unité" par défaut
+            try:
+                default_uom = client.execute_kw(
+                    'uom.uom',
+                    'search',
+                    [['|', ('name', '=', 'Unit'), ('name', '=', 'Unité')]],
+                    {'limit': 1}
+                )
+                if default_uom:
+                    product_vals['uom_id'] = default_uom[0]
+                    product_vals['uom_po_id'] = default_uom[0]
+            except Exception as e:
+                logger.warning(f"Impossible de récupérer l'unité par défaut: {e}")
+        
+        # Gérer les taxes
+        if product_data.taxes_id:
+            product_vals['taxes_id'] = [(6, 0, product_data.taxes_id)]
+        
+        if product_data.supplier_taxes_id:
+            product_vals['supplier_taxes_id'] = [(6, 0, product_data.supplier_taxes_id)]
+        
+        # Créer le produit
+        product_id = client.execute_kw('product.template', 'create', [product_vals])
+        
+        # Récupérer les informations du produit créé
+        product_info = client.execute_kw(
+            'product.template',
+            'read',
+            [product_id],
+            {'fields': ['id', 'name', 'default_code', 'list_price', 'categ_id', 'available_in_pos']}
+        )[0]
+        
+        logger.info(f"Produit créé avec succès: {product_data.name} (ID: {product_id})")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'product_id': product_id,
+                'name': product_info['name'],
+                'default_code': product_info.get('default_code'),
+                'list_price': product_info['list_price'],
+                'category': product_info.get('categ_id'),
+                'available_in_pos': product_info.get('available_in_pos'),
+                'created': True
+            },
+            message=f"Produit '{product_data.name}' créé avec succès"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du produit: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la création du produit: {str(e)}"
+        )
+
+@router.post("/{pos_id}/products/assign", response_model=ApiResponse)
+async def assign_products_to_pos(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    assignment_data: PosProductAssignmentRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Ajouter des produits à un point de vente
+    
+    Cette route permet d'ajouter ou de remplacer les produits disponibles dans un PDV.
+    Seuls les produits marqués comme 'available_in_pos' peuvent être ajoutés.
+    
+    **Paramètres :**
+    - **product_ids** : Liste des IDs de produits à ajouter
+    - **replace** : True pour remplacer tous les produits, False pour ajouter
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Vérifier que tous les produits existent et sont disponibles pour le POS
+        products_info = client.execute_kw(
+            'product.template',
+            'search_read',
+            [[('id', 'in', assignment_data.product_ids)]],
+            {'fields': ['id', 'name', 'available_in_pos', 'active']}
+        )
+        
+        if len(products_info) != len(assignment_data.product_ids):
+            found_ids = [p['id'] for p in products_info]
+            missing_ids = set(assignment_data.product_ids) - set(found_ids)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Produits introuvables: {list(missing_ids)}"
+            )
+        
+        # Vérifier que tous les produits sont disponibles pour le POS
+        unavailable_products = [p for p in products_info if not p.get('available_in_pos') or not p.get('active')]
+        if unavailable_products:
+            unavailable_names = [p['name'] for p in unavailable_products]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Produits non disponibles pour le POS: {unavailable_names}"
+            )
+        
+        # Récupérer les produits actuellement assignés au PDV
+        current_products = []
+        try:
+            # Note: Dans Odoo, les produits POS sont généralement gérés via les catégories
+            # ou via un champ many2many sur pos.config si il existe
+            # Ici on va essayer de récupérer via les catégories disponibles
+            pos_full_config = client.execute_kw(
+                'pos.config',
+                'read',
+                [pos_id],
+                {'fields': ['iface_available_categ_ids']}
+            )[0]
+            
+            if pos_full_config.get('iface_available_categ_ids'):
+                # Récupérer les produits des catégories actuelles
+                current_products_search = client.execute_kw(
+                    'product.template',
+                    'search',
+                    [[('categ_id', 'in', pos_full_config['iface_available_categ_ids']), ('available_in_pos', '=', True)]]
+                )
+                current_products = current_products_search
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer les produits actuels du PDV: {e}")
+        
+        # Pour cette implémentation, on va utiliser les catégories des produits
+        # Récupérer les catégories des produits à ajouter
+        new_categories = list(set([p.get('categ_id')[0] for p in products_info if p.get('categ_id')]))
+        
+        # Déterminer les catégories finales
+        if assignment_data.replace:
+            final_categories = new_categories
+            action_msg = "remplacés"
+        else:
+            # Récupérer les catégories actuelles
+            current_categories = pos_full_config.get('iface_available_categ_ids', []) if 'pos_full_config' in locals() else []
+            final_categories = list(set(current_categories + new_categories))
+            action_msg = "ajoutés"
+        
+        # Mettre à jour les catégories disponibles dans le PDV
+        update_vals = {
+            'iface_available_categ_ids': [(6, 0, final_categories)] if final_categories else False
+        }
+        
+        success = client.execute_kw(
+            'pos.config',
+            'write',
+            [[pos_id], update_vals]
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Erreur lors de la mise à jour des produits du PDV"
+            )
+        
+        logger.info(f"Produits {action_msg} pour PDV {pos_config['name']}: {len(assignment_data.product_ids)} produits")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'pos_name': pos_config['name'],
+                'products_assigned': [{'id': p['id'], 'name': p['name']} for p in products_info],
+                'categories_updated': final_categories,
+                'action': 'replaced' if assignment_data.replace else 'added'
+            },
+            message=f"{len(assignment_data.product_ids)} produit(s) {action_msg} au PDV '{pos_config['name']}'"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de l'affectation des produits au PDV {pos_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'affectation: {str(e)}"
+        )
+
+@router.post("/{pos_id}/stock/movement", response_model=ApiResponse)
+async def create_stock_movement(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    movement_data: StockMovementRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Créer un mouvement de stock pour un produit
+    
+    Cette route permet de faire des entrées ou sorties de stock pour un produit
+    dans l'emplacement associé au point de vente.
+    
+    **Paramètres :**
+    - **product_id** : ID du produit
+    - **quantity** : Quantité (+ pour entrée, - pour sortie)
+    - **reference** : Référence du mouvement
+    - **reason** : Raison du mouvement
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe et récupérer son entrepôt
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'picking_type_id', 'warehouse_id'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Vérifier que le produit existe
+        product_info = client.execute_kw(
+            'product.product',
+            'search_read',
+            [[('id', '=', movement_data.product_id)]],
+            {'fields': ['id', 'name', 'default_code', 'type'], 'limit': 1}
+        )
+        
+        if not product_info:
+            raise HTTPException(status_code=404, detail="Produit non trouvé")
+        
+        product_info = product_info[0]
+        
+        if product_info['type'] != 'product':
+            raise HTTPException(
+                status_code=400,
+                detail="Les mouvements de stock ne sont possibles que pour les produits stockables"
+            )
+        
+        # Déterminer les emplacements
+        if movement_data.location_id and movement_data.location_dest_id:
+            location_src = movement_data.location_id
+            location_dest = movement_data.location_dest_id
+        else:
+            # Récupérer l'emplacement de stock du PDV
+            try:
+                warehouse_id = pos_config.get('warehouse_id')
+                if warehouse_id:
+                    warehouse_id = warehouse_id[0] if isinstance(warehouse_id, list) else warehouse_id
+                    warehouse_info = client.execute_kw(
+                        'stock.warehouse',
+                        'read',
+                        [warehouse_id],
+                        {'fields': ['lot_stock_id']}
+                    )
+                    stock_location = warehouse_info[0]['lot_stock_id'][0] if warehouse_info else None
+                else:
+                    # Récupérer l'emplacement de stock par défaut
+                    stock_locations = client.execute_kw(
+                        'stock.location',
+                        'search',
+                        [[('usage', '=', 'internal')]],
+                        {'limit': 1}
+                    )
+                    stock_location = stock_locations[0] if stock_locations else None
+                
+                if not stock_location:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Impossible de déterminer l'emplacement de stock"
+                    )
+                
+                # Récupérer l'emplacement d'inventaire
+                inventory_location = client.execute_kw(
+                    'stock.location',
+                    'search',
+                    [[('usage', '=', 'inventory')]],
+                    {'limit': 1}
+                )
+                
+                if not inventory_location:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Emplacement d'inventaire non trouvé"
+                    )
+                
+                inventory_location = inventory_location[0]
+                
+                # Déterminer source et destination selon le type de mouvement
+                if movement_data.quantity > 0:
+                    # Entrée de stock : depuis inventaire vers stock
+                    location_src = inventory_location
+                    location_dest = stock_location
+                else:
+                    # Sortie de stock : depuis stock vers inventaire
+                    location_src = stock_location
+                    location_dest = inventory_location
+                    movement_data.quantity = abs(movement_data.quantity)  # Quantité positive
+                    
+            except Exception as e:
+                logger.error(f"Erreur lors de la récupération des emplacements: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Erreur lors de la configuration des emplacements"
+                )
+        
+        # Créer le mouvement de stock
+        move_vals = {
+            'name': movement_data.reference or f"Mouvement {product_info['name']}",
+            'product_id': movement_data.product_id,
+            'product_uom_qty': movement_data.quantity,
+            'location_id': location_src,
+            'location_dest_id': location_dest,
+            'origin': movement_data.reason or f"POS {pos_config['name']}"
+        }
+        
+        # Récupérer l'unité de mesure du produit
+        try:
+            product_uom = client.execute_kw(
+                'product.product',
+                'read',
+                [movement_data.product_id],
+                {'fields': ['uom_id']}
+            )[0]
+            move_vals['product_uom'] = product_uom['uom_id'][0]
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer l'UOM du produit: {e}")
+        
+        move_id = client.execute_kw('stock.move', 'create', [move_vals])
+        
+        # Confirmer et valider le mouvement
+        try:
+            # Confirmer le mouvement
+            client.execute_kw('stock.move', 'action_confirm', [[move_id]])
+            
+            # Forcer la disponibilité (pour les mouvements d'inventaire)
+            client.execute_kw('stock.move', 'action_assign', [[move_id]])
+            
+            # Valider le mouvement
+            client.execute_kw('stock.move', 'action_done', [[move_id]])
+            
+        except Exception as e:
+            logger.warning(f"Erreur lors de la validation du mouvement: {e}")
+            # Le mouvement est créé mais pas forcément validé
+        
+        # Récupérer le stock mis à jour
+        try:
+            stock_info = client.execute_kw(
+                'stock.quant',
+                'search_read',
+                [[('product_id', '=', movement_data.product_id), ('location_id', '=', location_dest if movement_data.quantity > 0 else location_src)]],
+                {'fields': ['quantity'], 'limit': 1}
+            )
+            new_stock = stock_info[0]['quantity'] if stock_info else 0
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer le stock mis à jour: {e}")
+            new_stock = "Non disponible"
+        
+        logger.info(f"Mouvement de stock créé: {product_info['name']} - Quantité: {movement_data.quantity}")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'move_id': move_id,
+                'product_id': movement_data.product_id,
+                'product_name': product_info['name'],
+                'quantity': movement_data.quantity,
+                'location_src': location_src,
+                'location_dest': location_dest,
+                'new_stock': new_stock,
+                'reference': move_vals['name']
+            },
+            message=f"Mouvement de stock créé: {movement_data.quantity} {product_info['name']}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du mouvement de stock: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du mouvement de stock: {str(e)}"
+        )
+
+@router.get("/{pos_id}/stock/{product_id}", response_model=ApiResponse)
+async def get_product_stock_level(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    product_id: int = Path(..., description="ID du produit"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer le niveau de stock d'un produit pour un PDV
+    
+    Cette route retourne le stock actuel, réservé et disponible d'un produit
+    dans l'emplacement associé au point de vente.
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV et le produit existent
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'warehouse_id'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        product_info = client.execute_kw(
+            'product.product',
+            'search_read',
+            [[('id', '=', product_id)]],
+            {'fields': ['id', 'name', 'default_code', 'type', 'uom_id'], 'limit': 1}
+        )
+        
+        if not product_info:
+            raise HTTPException(status_code=404, detail="Produit non trouvé")
+        
+        pos_config = pos_config[0]
+        product_info = product_info[0]
+        
+        if product_info['type'] != 'product':
+            # Pour les services et consommables, retourner stock infini
+            return ApiResponse(
+                success=True,
+                data=ProductStockResponse(
+                    product_id=product_id,
+                    product_name=product_info['name'],
+                    product_code=product_info.get('default_code'),
+                    current_stock=999999,
+                    available_stock=999999,
+                    unit_of_measure=product_info.get('uom_id', [None, 'Unité'])[1],
+                    location_name="Service/Consommable",
+                    last_update=datetime.now().isoformat()
+                ).dict(),
+                message="Produit de type service/consommable - Stock illimité"
+            )
+        
+        # Récupérer l'emplacement de stock du PDV
+        warehouse_id = pos_config.get('warehouse_id')
+        stock_location_id = None
+        location_name = "Stock principal"
+        
+        if warehouse_id:
+            warehouse_id = warehouse_id[0] if isinstance(warehouse_id, list) else warehouse_id
+            try:
+                warehouse_info = client.execute_kw(
+                    'stock.warehouse',
+                    'read',
+                    [warehouse_id],
+                    {'fields': ['lot_stock_id', 'name']}
+                )
+                if warehouse_info:
+                    stock_location_id = warehouse_info[0]['lot_stock_id'][0]
+                    location_name = f"Stock {warehouse_info[0]['name']}"
+            except Exception as e:
+                logger.warning(f"Erreur récupération entrepôt: {e}")
+        
+        if not stock_location_id:
+            # Récupérer l'emplacement de stock par défaut
+            stock_locations = client.execute_kw(
+                'stock.location',
+                'search_read',
+                [[('usage', '=', 'internal')]],
+                {'fields': ['id', 'name'], 'limit': 1}
+            )
+            if stock_locations:
+                stock_location_id = stock_locations[0]['id']
+                location_name = stock_locations[0]['name']
+        
+        if not stock_location_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Impossible de déterminer l'emplacement de stock du PDV"
+            )
+        
+        # Récupérer les informations de stock
+        stock_quants = client.execute_kw(
+            'stock.quant',
+            'search_read',
+            [[('product_id', '=', product_id), ('location_id', '=', stock_location_id)]],
+            {'fields': ['quantity', 'reserved_quantity']}
+        )
+        
+        current_stock = sum(q['quantity'] for q in stock_quants)
+        reserved_stock = sum(q['reserved_quantity'] for q in stock_quants)
+        available_stock = current_stock - reserved_stock
+        
+        # Récupérer l'unité de mesure
+        uom_name = product_info.get('uom_id', [None, 'Unité'])[1] if product_info.get('uom_id') else 'Unité'
+        
+        stock_response = ProductStockResponse(
+            product_id=product_id,
+            product_name=product_info['name'],
+            product_code=product_info.get('default_code'),
+            current_stock=current_stock,
+            reserved_stock=reserved_stock,
+            available_stock=available_stock,
+            unit_of_measure=uom_name,
+            location_name=location_name,
+            last_update=datetime.now().isoformat()
+        )
+        
+        return ApiResponse(
+            success=True,
+            data=stock_response.dict(),
+            message=f"Stock de {product_info['name']}: {available_stock} {uom_name} disponible(s)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du stock: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération du stock: {str(e)}"
+        )
+
+@router.post("/{pos_id}/stock/{product_id}/adjust", response_model=ApiResponse)
+async def adjust_product_stock(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    product_id: int = Path(..., description="ID du produit"),
+    adjustment_data: StockLevelRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Ajuster le niveau de stock d'un produit
+    
+    Cette route permet de définir directement la quantité en stock d'un produit
+    en créant un ajustement d'inventaire.
+    
+    **Paramètres :**
+    - **new_quantity** : Nouvelle quantité en stock
+    - **reason** : Raison de l'ajustement
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # D'abord récupérer le stock actuel
+        current_stock_response = await get_product_stock_level(pos_id, product_id, current_user)
+        current_stock_data = current_stock_response.data
+        current_stock = current_stock_data['current_stock']
+        
+        # Calculer la différence
+        quantity_diff = adjustment_data.new_quantity - current_stock
+        
+        if abs(quantity_diff) < 0.001:  # Pas de changement significatif
+            return ApiResponse(
+                success=True,
+                data=current_stock_data,
+                message="Aucun ajustement nécessaire - stock déjà à la bonne valeur"
+            )
+        
+        # Créer un mouvement d'ajustement via StockMovementRequest
+        movement_request = StockMovementRequest(
+            product_id=product_id,
+            quantity=quantity_diff,
+            reference=f"Ajustement stock - {adjustment_data.reason}",
+            reason=adjustment_data.reason
+        )
+        
+        # Utiliser l'endpoint de mouvement de stock
+        movement_response = await create_stock_movement(pos_id, movement_request, current_user)
+        
+        if not movement_response.success:
+            raise HTTPException(
+                status_code=500,
+                detail="Erreur lors de la création du mouvement d'ajustement"
+            )
+        
+        # Récupérer le nouveau stock
+        updated_stock_response = await get_product_stock_level(pos_id, product_id, current_user)
+        
+        logger.info(f"Ajustement de stock: {current_stock_data['product_name']} - {current_stock} → {adjustment_data.new_quantity}")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'adjustment': {
+                    'previous_stock': current_stock,
+                    'new_stock': adjustment_data.new_quantity,
+                    'quantity_diff': quantity_diff,
+                    'reason': adjustment_data.reason
+                },
+                'current_stock_info': updated_stock_response.data,
+                'movement_info': movement_response.data
+            },
+            message=f"Stock ajusté: {current_stock} → {adjustment_data.new_quantity} {current_stock_data['unit_of_measure']}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de l'ajustement du stock: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'ajustement: {str(e)}"
         )
   
 # ===== GESTION DES SESSIONS POS =====

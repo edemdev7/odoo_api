@@ -246,3 +246,54 @@ class PosConfigResponse(BaseModel):
     advanced_employee_ids: List[int] = []
     current_session_id: Optional[List[Any]] = None
     current_session_state: Optional[str] = None
+
+# ===== SCHEMAS POUR GESTION DES PRODUITS =====
+
+class ProductCreateRequest(BaseModel):
+    name: str = Field(..., description="Nom du produit", min_length=1, max_length=200)
+    default_code: Optional[str] = Field(None, description="Référence interne/code barre", max_length=50)
+    list_price: float = Field(..., description="Prix de vente public", ge=0)
+    standard_price: Optional[float] = Field(0.0, description="Coût du produit", ge=0)
+    type: str = Field("product", description="Type de produit (product/service/consu)", pattern="^(product|service|consu)$")
+    categ_id: Optional[int] = Field(None, description="ID de la catégorie de produit")
+    uom_id: Optional[int] = Field(None, description="ID de l'unité de mesure")
+    uom_po_id: Optional[int] = Field(None, description="ID de l'unité d'achat")
+    barcode: Optional[str] = Field(None, description="Code-barres", max_length=50)
+    weight: Optional[float] = Field(0.0, description="Poids en kg", ge=0)
+    volume: Optional[float] = Field(0.0, description="Volume en m³", ge=0)
+    description: Optional[str] = Field(None, description="Description du produit", max_length=1000)
+    description_sale: Optional[str] = Field(None, description="Description pour la vente", max_length=500)
+    active: bool = Field(True, description="Produit actif")
+    sale_ok: bool = Field(True, description="Peut être vendu")
+    purchase_ok: bool = Field(True, description="Peut être acheté")
+    available_in_pos: bool = Field(True, description="Disponible dans le POS")
+    taxes_id: Optional[List[int]] = Field(None, description="IDs des taxes")
+    supplier_taxes_id: Optional[List[int]] = Field(None, description="IDs des taxes fournisseur")
+
+class PosProductAssignmentRequest(BaseModel):
+    product_ids: List[int] = Field(..., description="Liste des IDs de produits à ajouter au POS", min_items=1)
+    replace: bool = Field(False, description="Remplacer les produits existants (True) ou ajouter (False)")
+
+class StockMovementRequest(BaseModel):
+    product_id: int = Field(..., description="ID du produit")
+    quantity: float = Field(..., description="Quantité à ajouter/retirer (+ pour entrée, - pour sortie)")
+    location_id: Optional[int] = Field(None, description="ID de l'emplacement source (optionnel)")
+    location_dest_id: Optional[int] = Field(None, description="ID de l'emplacement destination (optionnel)")
+    reference: Optional[str] = Field(None, description="Référence du mouvement", max_length=100)
+    reason: Optional[str] = Field(None, description="Raison du mouvement", max_length=200)
+
+class StockLevelRequest(BaseModel):
+    product_id: int = Field(..., description="ID du produit")
+    new_quantity: float = Field(..., description="Nouvelle quantité en stock", ge=0)
+    reason: Optional[str] = Field("Mise à jour manuelle", description="Raison de l'ajustement")
+
+class ProductStockResponse(BaseModel):
+    product_id: int
+    product_name: str
+    product_code: Optional[str] = None
+    current_stock: float
+    reserved_stock: float = 0.0
+    available_stock: float
+    unit_of_measure: str
+    location_name: str
+    last_update: Optional[str] = None
