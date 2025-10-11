@@ -15,6 +15,7 @@ from models.responses import ApiResponse
 from core.security import require_scope
 from core.odoo_client import get_odoo_client
 from core.config import logger
+from core.pump_manager import pump_manager
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
   
@@ -337,71 +338,7 @@ async def initialize_pos_session(
         logger.error(f"Erreur lors de l'initialisation de session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'initialisation: {str(e)}")
 
-@router.get("/{pos_id}/pumps", response_model=List[PosPump])
-async def get_pos_pumps(
-    pos_id: int = Path(..., description="ID du point de vente"),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Récupérer les pompes d'une station service avec leurs derniers index
-    
-    Cette route retourne la liste des pompes pour une station service avec les derniers index connus.
-    """
-    try:
-        client = get_odoo_client(current_user)
-        
-        # Vérifier le point de vente
-        pos_config = client.execute_kw(
-            'pos.config',
-            'read',
-            [pos_id],
-            {'fields': ['name']}
-        )
-        
-        if not pos_config:
-            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
-        
-        # Pour le moment, on suppose que toutes les stations ont des pompes
-        # Une logique plus sophistiquée pourrait être implémentée ici
-        # Par exemple, vérifier le nom du PDV ou une catégorie spécifique
-        
-        # Simuler les pompes pour l'instant (à adapter selon votre structure Odoo)
-        # Si vous n'avez pas de modèle de pompes, vous pouvez retourner une liste vide
-        # ou créer une logique basée sur les produits vendus par ce PDV
-        
-        pumps = []
-        # Exemple de pompes simulées - à remplacer par votre logique réelle
-        if "station" in pos_config[0]['name'].lower() or "carburant" in pos_config[0]['name'].lower():
-            # Récupérer les produits de carburant vendus dans ce PDV
-            try:
-                # Exemple avec des produits standards - adapter selon vos besoins
-                fuel_products = client.execute_kw(
-                    'product.product',
-                    'search_read',
-                    [[('categ_id.name', 'ilike', 'carburant')]],  # Chercher par catégorie carburant
-                    {'fields': ['id', 'name'], 'limit': 10}
-                )
-                
-                for i, product in enumerate(fuel_products, 1):
-                    pump = PosPump(
-                        id=i,
-                        name=f"Pompe {i}",
-                        product_name=product['name'],
-                        last_index=0.0  # À récupérer depuis votre système
-                    )
-                    pumps.append(pump)
-            except:
-                # Si pas de produits carburant, retourner des pompes génériques
-                for i in range(1, 5):  # 4 pompes par défaut
-                    pump = PosPump(
-                        id=i,
-                        name=f"Pompe {i}",
-                        product_name=f"Carburant {i}",
-                        last_index=0.0
-                    )
-                    pumps.append(pump)
-        
-        return pumps
+
         
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des pompes: {e}")
@@ -490,40 +427,55 @@ async def open_pos_session(
             if session['state'] not in ['opening_control', 'new']:
                 logger.warning(f"Session {request.session_id} dans l'état {session['state']}, tentative d'ouverture forcée")
             
-            # Traiter les données des pompes
-            pump_data_processed = []
-            for pump in request.pump_indexes:
-                pump_info = {
-                    'pump_id': pump.id,
-                    'pump_name': pump.name,
-                    'station_id': pump.stationId,
-                    'fuel_type': pump.type,
-                    'start_index': pump.start_index,
-                }
-                pump_data_processed.append(pump_info)
-                logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
-            
-            # Ouvrir la session
-            client.execute_kw('pos.session', 'write', [[request.session_id], {'state': 'opened'}])
-            
-            # Récupérer les informations du PDV
-            pos_config = client.execute_kw(
-                'pos.config',
-                'read',
-                [pos_id],
-                {'fields': ['name']}
-            )[0]
-            
-            logger.info(f"Session {request.session_id} ouverte avec {len(pump_data_processed)} pompes")
-            
-            return PosSessionResponse(
-                session_id=request.session_id,
-                pos_id=pos_id,
-                pos_name=pos_config['name'],
-                is_station=True,
-                state='opened',
-                message=f"Session station-service ouverte - {len(pump_data_processed)} pompes initialisées"
-            )
+            # Traiter et sauvegarder les données des pompes
+            try:
+                # Sauvegarder les pompes dans la base de données SQLite
+                pump_save_success = pump_manager.save_session_pumps(
+                    session_id=request.session_id,
+                    pos_id=pos_id,
+                    pumps=request.pump_indexes
+                )
+                
+                if not pump_save_success:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Erreur lors de la sauvegarde des données de pompes"
+                    )
+                
+                # Log des pompes sauvegardées
+                for pump in request.pump_indexes:
+                    logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
+                
+                # Ouvrir la session dans Odoo
+                client.execute_kw('pos.session', 'write', [[request.session_id], {'state': 'opened'}])
+                
+                # Récupérer les informations du PDV
+                pos_config = client.execute_kw(
+                    'pos.config',
+                    'read',
+                    [pos_id],
+                    {'fields': ['name']}
+                )[0]
+                
+                logger.info(f"Session {request.session_id} ouverte avec {len(request.pump_indexes)} pompes sauvegardées")
+                
+                return PosSessionResponse(
+                    session_id=request.session_id,
+                    pos_id=pos_id,
+                    pos_name=pos_config['name'],
+                    is_station=True,
+                    state='opened',
+                    message=f"Session station-service ouverte - {len(request.pump_indexes)} pompes initialisées et sauvegardées"
+                )
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Erreur lors du traitement des pompes: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Erreur lors de la sauvegarde des pompes: {str(e)}"
+                )
         
         # === MODE STANDARD (caisse normale) ===
         else:
@@ -576,22 +528,21 @@ async def open_pos_session(
         logger.error(f"Erreur lors de l'ouverture de session: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'ouverture: {str(e)}")
 
-@router.get("/{pos_id}/session/{session_id}/pumps", response_model=List[StationPumpData])
+@router.get("/{pos_id}/session/{session_id}/pumps", response_model=ApiResponse)
 async def get_session_pumps(
     pos_id: int = Path(..., description="ID du point de vente"),
     session_id: int = Path(..., description="ID de la session"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Récupérer les pompes pour l'initialisation d'une session
+    Récupérer les pompes sauvegardées pour une session
     
-    Cette route retourne les pompes disponibles dans le format attendu
-    pour l'initialisation d'une session de station service.
+    Cette route retourne les pompes avec leurs index actuels pour les ventes.
     """
     try:
         client = get_odoo_client(current_user)
         
-        # Vérifier que la session existe
+        # Vérifier que la session existe et appartient au bon PDV
         session_data = client.execute_kw(
             'pos.session',
             'read',
@@ -602,34 +553,31 @@ async def get_session_pumps(
         if not session_data or session_data[0]['config_id'][0] != pos_id:
             raise HTTPException(status_code=404, detail="Session non trouvée pour ce point de vente")
         
-        # Simuler des pompes pour la station (à adapter selon votre système)
-        # En réalité, ces données viendraient de votre base de données de station
-        station_pumps = []
+        # Récupérer les pompes depuis le gestionnaire
+        pumps = pump_manager.get_session_pumps(session_id)
         
-        # Générer des pompes exemples (à remplacer par vos vraies données)
-        fuel_types = ['PETROL', 'FUEL', 'DIESEL']
-        for i in range(1, 7):  # 6 pompes par exemple
-            for j, fuel_type in enumerate(fuel_types[:2]):  # 2 types de carburant
-                pump_id = f"cmg6lfzwa000{i}ta8m{fuel_type.lower()}"
-                pump_name = f"J{i}_{fuel_type[0]}{j+1}"
-                
-                # Index de départ (peut être récupéré d'une base externe ou calculé)
-                start_index = 1000.0 + (i * 100) + (j * 10)
-                
-                pump = StationPumpData(
-                    id=pump_id,
-                    name=pump_name,
-                    stationId=f"station_{pos_id}",  # ID de votre station
-                    type=fuel_type,
-                    createdAt=datetime.now().isoformat() + "Z",
-                    updatedAt=datetime.now().isoformat() + "Z",
-                    start_index=start_index,
-                    current_index=start_index
-                )
-                station_pumps.append(pump)
+        if not pumps:
+            logger.warning(f"Aucune pompe trouvée pour session {session_id}")
+            return ApiResponse(
+                success=True,
+                data=[],
+                count=0,
+                message="Aucune pompe configurée pour cette session"
+            )
         
-        # Limiter le nombre de pompes pour l'exemple
-        return station_pumps[:6]  # Retourner les 6 premières pompes
+        logger.info(f"Session {session_id}: {len(pumps)} pompes récupérées")
+        return ApiResponse(
+            success=True,
+            data=pumps,
+            count=len(pumps),
+            message=f"{len(pumps)} pompes disponibles"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des pompes pour session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des pompes: {str(e)}")
         
     except HTTPException:
         raise
@@ -667,45 +615,54 @@ async def update_pump_indexes(
         if session_data[0]['state'] != 'opened':
             raise HTTPException(status_code=400, detail="La session n'est pas ouverte")
         
-        # Traiter la mise à jour des index
+        # Traiter la mise à jour des index avec le gestionnaire de pompes
         updated_pumps = []
+        update_errors = []
+        
         for pump in pump_data:
-            pump_info = {
-                'pump_id': pump.id,
-                'pump_name': pump.name,
-                'fuel_type': pump.type,
-                'previous_index': pump.start_index or 0.0,
-                'current_index': pump.current_index or pump.start_index or 0.0,
-                'updated_at': pump.updatedAt
-            }
-            
-            # Calculer la quantité vendue depuis le début
-            quantity_sold = pump_info['current_index'] - pump_info['previous_index']
-            pump_info['quantity_sold'] = max(0, quantity_sold)  # Éviter les valeurs négatives
-            
-            updated_pumps.append(pump_info)
-            logger.info(f"Pompe {pump.name}: Index mis à jour à {pump_info['current_index']}, quantité vendue: {pump_info['quantity_sold']}")
+            try:
+                # Utiliser le gestionnaire pour mettre à jour l'index
+                success = pump_manager.update_pump_index(
+                    session_id=session_id,
+                    pump_id=pump.id,
+                    new_index=pump.start_index,  # L'index actuel est dans start_index
+                    order_id=None  # Pas d'order_id pour une mise à jour manuelle
+                )
+                
+                if success:
+                    updated_pumps.append({
+                        'pump_id': pump.id,
+                        'pump_name': pump.name,
+                        'fuel_type': pump.type,
+                        'new_index': pump.start_index,
+                        'status': 'updated'
+                    })
+                    logger.info(f"Pompe {pump.name}: Index mis à jour à {pump.start_index}")
+                else:
+                    update_errors.append(f"Échec mise à jour pompe {pump.name}")
+                    
+            except Exception as e:
+                error_msg = f"Erreur pompe {pump.name}: {str(e)}"
+                update_errors.append(error_msg)
+                logger.error(error_msg)
         
-        # Mettre à jour les notes de session avec les nouveaux index
-        pump_update_summary = f"Mise à jour index - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        total_sold = 0.0
-        for pump in updated_pumps:
-            pump_update_summary += f"- {pump['pump_name']}: {pump['current_index']:.2f}L (vendu: {pump['quantity_sold']:.2f}L)\n"
-            total_sold += pump['quantity_sold']
+        # Récupérer le résumé mis à jour
+        sales_summary = pump_manager.get_session_sales_summary(session_id)
         
-        pump_update_summary += f"Total vendu: {total_sold:.2f}L\n"
+        response_data = {
+            'session_id': session_id,
+            'pumps_updated': len(updated_pumps),
+            'update_errors': update_errors,
+            'pump_details': updated_pumps,
+            'sales_summary': sales_summary
+        }
         
-        # Ici vous pourriez mettre à jour votre système de gestion des pompes
-        # ou stocker dans Odoo selon votre architecture
+        if update_errors:
+            logger.warning(f"Session {session_id}: {len(update_errors)} erreurs lors de la mise à jour")
         
         return ApiResponse(
-            success=True,
-            data={
-                'session_id': session_id,
-                'pumps_updated': len(updated_pumps),
-                'total_quantity_sold': total_sold,
-                'pump_details': updated_pumps
-            },
+            success=len(update_errors) == 0,
+            data=response_data,
             message=f"Index de {len(updated_pumps)} pompes mis à jour avec succès"
         )
         
@@ -714,6 +671,177 @@ async def update_pump_indexes(
     except Exception as e:
         logger.error(f"Erreur lors de la mise à jour des index: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour: {str(e)}")
+
+@router.get("/{pos_id}/session/{session_id}/pumps/available", response_model=ApiResponse)
+async def get_available_pumps_for_sale(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    session_id: int = Path(..., description="ID de la session"),
+    min_quantity: float = 0.1,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les pompes disponibles pour la vente
+    
+    Cette route retourne uniquement les pompes qui ont encore du carburant disponible.
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que la session existe et est ouverte
+        session_data = client.execute_kw(
+            'pos.session',
+            'read',
+            [session_id],
+            {'fields': ['config_id', 'state']}
+        )
+        
+        if not session_data or session_data[0]['config_id'][0] != pos_id:
+            raise HTTPException(status_code=404, detail="Session non trouvée")
+        
+        if session_data[0]['state'] != 'opened':
+            raise HTTPException(status_code=400, detail="La session n'est pas ouverte")
+        
+        # Récupérer les pompes disponibles pour la vente
+        available_pumps = pump_manager.get_available_pumps_for_sale(session_id, min_quantity)
+        
+        return ApiResponse(
+            success=True,
+            data=available_pumps,
+            count=len(available_pumps),
+            message=f"{len(available_pumps)} pompes disponibles pour la vente"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des pompes disponibles: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+@router.get("/{pos_id}/session/{session_id}/sales-summary", response_model=ApiResponse)
+async def get_session_sales_summary(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    session_id: int = Path(..., description="ID de la session"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer le résumé des ventes par pompe pour une session
+    
+    Cette route retourne un résumé détaillé des ventes par pompe avec les totaux.
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que la session existe
+        session_data = client.execute_kw(
+            'pos.session',
+            'read',
+            [session_id],
+            {'fields': ['config_id', 'state']}
+        )
+        
+        if not session_data or session_data[0]['config_id'][0] != pos_id:
+            raise HTTPException(status_code=404, detail="Session non trouvée")
+        
+        # Récupérer le résumé des ventes
+        sales_summary = pump_manager.get_session_sales_summary(session_id)
+        
+        if not sales_summary:
+            return ApiResponse(
+                success=True,
+                data={},
+                message="Aucune donnée de vente trouvée pour cette session"
+            )
+        
+        return ApiResponse(
+            success=True,
+            data=sales_summary,
+            message="Résumé des ventes récupéré avec succès"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du résumé des ventes: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+@router.post("/{pos_id}/session/{session_id}/pumps/{pump_id}/sale", response_model=ApiResponse)
+async def record_pump_sale(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    session_id: int = Path(..., description="ID de la session"),
+    pump_id: str = Path(..., description="ID de la pompe"),
+    sale_data: Dict[str, Any] = Body(..., description="Données de la vente"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Enregistrer une vente sur une pompe spécifique
+    
+    Body attendu:
+    {
+        "end_index": 1234.56,
+        "order_id": 123,
+        "quantity": 25.5,
+        "amount": 35.50
+    }
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que la session existe et est ouverte
+        session_data = client.execute_kw(
+            'pos.session',
+            'read',
+            [session_id],
+            {'fields': ['config_id', 'state']}
+        )
+        
+        if not session_data or session_data[0]['config_id'][0] != pos_id:
+            raise HTTPException(status_code=404, detail="Session non trouvée")
+        
+        if session_data[0]['state'] != 'opened':
+            raise HTTPException(status_code=400, detail="La session n'est pas ouverte")
+        
+        # Extraire les données de vente
+        end_index = sale_data.get('end_index')
+        order_id = sale_data.get('order_id')
+        
+        if not end_index:
+            raise HTTPException(status_code=400, detail="end_index requis")
+        
+        # Mettre à jour l'index de la pompe
+        success = pump_manager.update_pump_index(
+            session_id=session_id,
+            pump_id=pump_id,
+            new_index=end_index,
+            order_id=order_id
+        )
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Erreur lors de l'enregistrement de la vente")
+        
+        # Récupérer les informations mises à jour de la pompe
+        pumps = pump_manager.get_session_pumps(session_id)
+        pump_info = next((p for p in pumps if p['id'] == pump_id), None)
+        
+        response_data = {
+            'pump_id': pump_id,
+            'order_id': order_id,
+            'sale_recorded': True,
+            'pump_info': pump_info
+        }
+        
+        logger.info(f"Vente enregistrée - Pompe {pump_id}, Order {order_id}, Index: {end_index}")
+        
+        return ApiResponse(
+            success=True,
+            data=response_data,
+            message=f"Vente enregistrée avec succès pour la pompe {pump_id}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de l'enregistrement de la vente: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'enregistrement: {str(e)}")
 
 @router.post("/{pos_id}/close-session", response_model=PosSessionResponse)
 async def close_pos_session(
@@ -801,24 +929,54 @@ async def close_pos_session(
         
         session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
         
-        # Mode Station-Service : Validation des pompes
+        # Mode Station-Service : Validation des pompes avec notre gestionnaire
         validation_result = None
         if is_station_mode:
             logger.info(f"Mode station activé - Validation de {len(request.pump_end_indexes)} pompe(s)")
             
             try:
-                validation_result = await validate_pump_indexes(
-                    client, session_id, request.pump_end_indexes, pos_id
-                )
+                # Mettre à jour les index finaux des pompes
+                update_errors = []
+                for pump_data in request.pump_end_indexes:
+                    pump_id = pump_data.get('pump_id') or pump_data.get('id')
+                    end_index = pump_data.get('end_index') or pump_data.get('current_index')
+                    
+                    if not pump_id or end_index is None:
+                        update_errors.append(f"Données manquantes pour pompe: {pump_data}")
+                        continue
+                    
+                    success = pump_manager.update_pump_index(
+                        session_id=session_id,
+                        pump_id=pump_id,
+                        new_index=end_index,
+                        order_id=None  # Fermeture de session
+                    )
+                    
+                    if not success:
+                        update_errors.append(f"Erreur mise à jour pompe {pump_id}")
                 
-                if not validation_result.is_valid:
-                    logger.warning(f"Validation des pompes échouée: {validation_result.validation_errors}")
+                if update_errors:
+                    logger.error(f"Erreurs lors de la mise à jour des pompes: {update_errors}")
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Validation des pompes échouée: {'; '.join(validation_result.validation_errors)}"
+                        detail=f"Erreurs pompes: {'; '.join(update_errors)}"
                     )
                 
-                logger.info("✅ Validation des pompes réussie")
+                # Valider la cohérence des données avec notre gestionnaire
+                validation_report = pump_manager.validate_session_closure(session_id)
+                
+                if not validation_report['valid']:
+                    logger.warning(f"Validation des pompes échouée: {validation_report['errors']}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Validation des pompes échouée: {'; '.join(validation_report['errors'])}"
+                    )
+                
+                if validation_report['warnings']:
+                    logger.warning(f"Avertissements validation pompes: {validation_report['warnings']}")
+                
+                logger.info("✅ Validation des pompes réussie avec notre gestionnaire")
+                validation_result = validation_report
                 
             except HTTPException:
                 raise
@@ -911,99 +1069,6 @@ async def close_pos_session(
         raise HTTPException(status_code=500, detail=f"Erreur lors de la fermeture: {str(e)}")
 # ===== GESTION DES POMPES ET VENTES =====
 
-@router.get("/{pos_id}/pumps", response_model=List[PumpDetails])
-async def get_available_pumps(
-    pos_id: int = Path(..., description="ID du point de vente"),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Récupérer les pompes disponibles pour un point de vente
-    
-    Cette route retourne la liste des pompes avec leurs produits associés.
-    
-    Requires:
-    - Authentification JWT avec scope 'pos'
-    - Session POS active sur le point de vente
-    """
-    try:
-        client = get_odoo_client(current_user)
-        
-        # Vérifier que le PDV a une session active
-        pos_config = client.execute_kw(
-            'pos.config',
-            'read',
-            [pos_id],
-            {'fields': ['name', 'current_session_id']}
-        )
-        
-        if not pos_config or not pos_config[0].get('current_session_id'):
-            raise HTTPException(
-                status_code=400, 
-                detail="Aucune session active sur ce point de vente. Veuillez d'abord ouvrir une session."
-            )
-        
-        # Dans Odoo, les pompes peuvent être représentées par des produits de type service
-        # ou par un modèle personnalisé. Je vais simuler avec des produits pour cet exemple
-        
-        # Récupérer les produits carburant disponibles dans le PDV
-        fuel_products = client.execute_kw(
-            'product.product',
-            'search_read',
-            [[
-                ('sale_ok', '=', True),
-                ('available_in_pos', '=', True),
-                '|',
-                ('categ_id.name', 'ilike', 'carburant'),
-                ('categ_id.name', 'ilike', 'fuel')
-            ]],
-            {'fields': ['id', 'name', 'default_code', 'list_price', 'categ_id']}
-        )
-        
-        # Si aucun produit carburant spécifique, prendre les produits POS
-        if not fuel_products:
-            fuel_products = client.execute_kw(
-                'product.product',
-                'search_read',
-                [[('available_in_pos', '=', True)]],
-                {'fields': ['id', 'name', 'default_code', 'list_price', 'categ_id'], 'limit': 10}
-            )
-        
-        pumps = []
-        session_id = pos_config[0]['current_session_id'][0]
-        
-        # Créer des pompes fictives basées sur les produits (à adapter selon votre modèle)
-        for i, product in enumerate(fuel_products[:6]):  # Maximum 6 pompes
-            pump_id = i + 1
-            
-            # Récupérer l'index de début de session pour cette pompe (si stocké)
-            start_index = 0.0
-            try:
-                # Chercher les index de début dans les notes de session ou un modèle custom
-                # Pour cet exemple, on utilise un index par défaut
-                start_index = 1000.0 + (pump_id * 100)  # Index fictif
-            except:
-                start_index = 0.0
-            
-            pump = PumpDetails(
-                id=pump_id,
-                name=f"Pompe {pump_id}",
-                product_id=product['id'],
-                product_name=product['name'],
-                product_code=product.get('default_code', ''),
-                unit_price=float(product['list_price']),
-                start_index=start_index,
-                current_index=start_index,  # À actualiser lors des ventes
-                is_available=True
-            )
-            pumps.append(pump)
-        
-        return pumps
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération des pompes: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des pompes: {str(e)}")
 
 @router.post("/{pos_id}/select-pumps")
 async def select_pumps_for_sale(
