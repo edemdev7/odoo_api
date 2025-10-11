@@ -9,7 +9,8 @@ from models.schemas import (
     PosSessionResponse, PosPump, PosOpenSessionRequest, PosCloseSessionRequest,
     PumpDetails, PumpSelectionRequest, PosOrderCreateFullRequest,
     CashRegisterCloseRequest, PumpIndexValidation, CashRegisterValidation,
-    StationPumpData, PosOpenSessionWithPumpsRequest, PosUnifiedOpenSessionRequest
+    StationPumpData, PosOpenSessionWithPumpsRequest, PosUnifiedOpenSessionRequest,
+    PosCreateRequest, PosEmployeeAssignmentRequest, PosConfigResponse
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -18,6 +19,348 @@ from core.config import logger
 from core.pump_manager import pump_manager
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
+
+# ===== GESTION ADMINISTRATIVE DES PDV =====
+
+@router.post("/create", response_model=ApiResponse)
+async def create_pos_config(
+    config_data: PosCreateRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Créer un nouveau point de vente (PDV)
+    
+    Cette route permet de créer une nouvelle configuration de point de vente dans Odoo.
+    
+    **Paramètres obligatoires :**
+    - **name** : Nom du point de vente
+    
+    **Paramètres optionnels :**
+    - **company_id** : ID de la société (par défaut : société principale)
+    - **picking_type_id** : Type d'opération pour les livraisons
+    - **journal_id** : Journal comptable pour les écritures POS
+    - **currency_id** : Devise du PDV
+    - **pricelist_id** : Liste de prix par défaut
+    - **receipt_header/footer** : Personnalisation des reçus
+    - **cash_control** : Contrôle de caisse avancé (défaut: True)
+    - **module_pos_hr** : Connexion par employés (défaut: True)
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le nom n'existe pas déjà
+        existing_pos = client.execute_kw(
+            'pos.config',
+            'search',
+            [[('name', '=', config_data.name)]]
+        )
+        
+        if existing_pos:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Un PDV avec le nom '{config_data.name}' existe déjà"
+            )
+        
+        # Préparer les données de création
+        pos_vals = {
+            'name': config_data.name,
+            'iface_tax_included': config_data.iface_tax_included,
+            'cash_control': config_data.cash_control,
+            'module_pos_hr': config_data.module_pos_hr,
+        }
+        
+        # Ajouter les champs optionnels s'ils sont fournis
+        if config_data.company_id:
+            pos_vals['company_id'] = config_data.company_id
+        else:
+            # Récupérer la société par défaut
+            try:
+                company = client.execute_kw('res.company', 'search', [[]], {'limit': 1})
+                if company:
+                    pos_vals['company_id'] = company[0]
+            except Exception as e:
+                logger.warning(f"Impossible de récupérer la société par défaut: {e}")
+        
+        if config_data.picking_type_id:
+            pos_vals['picking_type_id'] = config_data.picking_type_id
+        else:
+            # Essayer de trouver un type d'opération par défaut
+            try:
+                picking_types = client.execute_kw(
+                    'stock.picking.type',
+                    'search',
+                    [[('code', '=', 'outgoing'), ('warehouse_id.company_id', '=', pos_vals.get('company_id'))]],
+                    {'limit': 1}
+                )
+                if picking_types:
+                    pos_vals['picking_type_id'] = picking_types[0]
+            except Exception as e:
+                logger.warning(f"Impossible de récupérer le type d'opération par défaut: {e}")
+        
+        if config_data.journal_id:
+            pos_vals['journal_id'] = config_data.journal_id
+        
+        if config_data.currency_id:
+            pos_vals['currency_id'] = config_data.currency_id
+        
+        if config_data.pricelist_id:
+            pos_vals['pricelist_id'] = config_data.pricelist_id
+        
+        if config_data.receipt_header:
+            pos_vals['receipt_header'] = config_data.receipt_header
+        
+        if config_data.receipt_footer:
+            pos_vals['receipt_footer'] = config_data.receipt_footer
+        
+        # Créer le PDV
+        pos_id = client.execute_kw('pos.config', 'create', [pos_vals])
+        
+        # Récupérer les informations du PDV créé
+        pos_config = client.execute_kw(
+            'pos.config',
+            'read',
+            [pos_id],
+            {'fields': ['id', 'name', 'company_id', 'active', 'basic_employee_ids', 'advanced_employee_ids']}
+        )[0]
+        
+        logger.info(f"PDV créé avec succès: {config_data.name} (ID: {pos_id})")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'name': pos_config['name'],
+                'company_id': pos_config.get('company_id'),
+                'active': pos_config.get('active', True),
+                'created': True
+            },
+            message=f"Point de vente '{config_data.name}' créé avec succès"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du PDV: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la création du PDV: {str(e)}"
+        )
+
+@router.post("/{pos_id}/assign-employees", response_model=ApiResponse)
+async def assign_employees_to_pos(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    assignment_data: PosEmployeeAssignmentRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Affecter des employés à un point de vente
+    
+    Cette route permet d'affecter ou de retirer des employés d'un PDV avec deux niveaux d'accès :
+    - **basic** : Accès employé standard (basic_employee_ids)
+    - **advanced** : Accès manager/gérant (advanced_employee_ids)
+    
+    **Paramètres :**
+    - **employee_ids** : Liste des IDs d'employés à affecter
+    - **access_level** : Niveau d'accès ("basic" ou "advanced")
+    - **replace** : True pour remplacer les affectations existantes, False pour ajouter
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'basic_employee_ids', 'advanced_employee_ids'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Vérifier que tous les employés existent
+        valid_employees = client.execute_kw(
+            'hr.employee',
+            'search',
+            [[('id', 'in', assignment_data.employee_ids), ('active', '=', True)]]
+        )
+        
+        if len(valid_employees) != len(assignment_data.employee_ids):
+            invalid_ids = set(assignment_data.employee_ids) - set(valid_employees)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Employés introuvables ou inactifs: {list(invalid_ids)}"
+            )
+        
+        # Déterminer le champ à mettre à jour
+        field_name = f"{assignment_data.access_level}_employee_ids"
+        current_employees = pos_config.get(field_name, [])
+        
+        # Calculer les nouvelles affectations
+        if assignment_data.replace:
+            # Remplacer complètement
+            new_employees = assignment_data.employee_ids
+            action_msg = "remplacées"
+        else:
+            # Ajouter aux existants (éviter les doublons)
+            new_employees = list(set(current_employees + assignment_data.employee_ids))
+            action_msg = "ajoutées"
+        
+        # Mettre à jour le PDV
+        update_vals = {field_name: [(6, 0, new_employees)]}  # (6, 0, ids) = remplacer par cette liste
+        
+        success = client.execute_kw(
+            'pos.config',
+            'write',
+            [[pos_id], update_vals]
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Erreur lors de la mise à jour des affectations"
+            )
+        
+        # Récupérer les noms des employés pour la réponse
+        employee_names = client.execute_kw(
+            'hr.employee',
+            'read',
+            [assignment_data.employee_ids],
+            {'fields': ['id', 'name']}
+        )
+        
+        logger.info(f"Affectations {action_msg} pour PDV {pos_config['name']}: {len(assignment_data.employee_ids)} employés ({assignment_data.access_level})")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'pos_name': pos_config['name'],
+                'access_level': assignment_data.access_level,
+                'employees_assigned': [{'id': emp['id'], 'name': emp['name']} for emp in employee_names],
+                'total_employees': len(new_employees),
+                'action': 'replaced' if assignment_data.replace else 'added'
+            },
+            message=f"{len(assignment_data.employee_ids)} employé(s) affecté(s) au PDV '{pos_config['name']}' avec accès {assignment_data.access_level}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de l'affectation des employés au PDV {pos_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'affectation: {str(e)}"
+        )
+
+@router.get("/{pos_id}/config", response_model=ApiResponse)
+async def get_pos_config_details(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les détails de configuration d'un PDV
+    
+    Cette route retourne les informations détaillées d'un point de vente,
+    y compris les employés affectés et la session active.
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Récupérer la configuration du PDV
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': [
+                'id', 'name', 'company_id', 'active', 'basic_employee_ids', 'advanced_employee_ids',
+                'current_session_id', 'current_session_state', 'receipt_header', 'receipt_footer',
+                'cash_control', 'module_pos_hr', 'journal_id', 'currency_id', 'pricelist_id'
+            ], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Récupérer les noms des employés affectés
+        all_employee_ids = pos_config.get('basic_employee_ids', []) + pos_config.get('advanced_employee_ids', [])
+        employee_details = {}
+        
+        if all_employee_ids:
+            employees = client.execute_kw(
+                'hr.employee',
+                'read',
+                [all_employee_ids],
+                {'fields': ['id', 'name', 'job_id']}
+            )
+            employee_details = {emp['id']: emp for emp in employees}
+        
+        # Construire la réponse avec les détails des employés
+        basic_employees = [
+            {
+                'id': emp_id,
+                'name': employee_details.get(emp_id, {}).get('name', f'Employé {emp_id}'),
+                'job': employee_details.get(emp_id, {}).get('job_id', [None, 'Non défini'])[1] if employee_details.get(emp_id, {}).get('job_id') else 'Non défini'
+            }
+            for emp_id in pos_config.get('basic_employee_ids', [])
+        ]
+        
+        advanced_employees = [
+            {
+                'id': emp_id,
+                'name': employee_details.get(emp_id, {}).get('name', f'Employé {emp_id}'),
+                'job': employee_details.get(emp_id, {}).get('job_id', [None, 'Non défini'])[1] if employee_details.get(emp_id, {}).get('job_id') else 'Non défini'
+            }
+            for emp_id in pos_config.get('advanced_employee_ids', [])
+        ]
+        
+        config_details = {
+            'id': pos_config['id'],
+            'name': pos_config['name'],
+            'company_id': pos_config.get('company_id'),
+            'active': pos_config.get('active', True),
+            'current_session_id': pos_config.get('current_session_id'),
+            'current_session_state': pos_config.get('current_session_state'),
+            'employees': {
+                'basic': basic_employees,
+                'advanced': advanced_employees,
+                'total': len(basic_employees) + len(advanced_employees)
+            },
+            'configuration': {
+                'cash_control': pos_config.get('cash_control', False),
+                'module_pos_hr': pos_config.get('module_pos_hr', False),
+                'receipt_header': pos_config.get('receipt_header'),
+                'receipt_footer': pos_config.get('receipt_footer'),
+                'journal_id': pos_config.get('journal_id'),
+                'currency_id': pos_config.get('currency_id'),
+                'pricelist_id': pos_config.get('pricelist_id')
+            }
+        }
+        
+        return ApiResponse(
+            success=True,
+            data=config_details,
+            message=f"Configuration du PDV '{pos_config['name']}' récupérée"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération de la config PDV {pos_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
   
 # ===== GESTION DES SESSIONS POS =====
 @router.get("/available", response_model=List[PosShop])

@@ -216,3 +216,33 @@ class CashRegisterValidation(BaseModel):
     pump_validations: List[PumpIndexValidation]
     is_valid: bool = Field(description="Validation globale conforme")
     validation_errors: List[str] = Field(default=[], description="Liste des erreurs de validation")
+
+# ===== NOUVEAUX SCHEMAS POUR GESTION PDV =====
+
+class PosCreateRequest(BaseModel):
+    name: str = Field(..., description="Nom du point de vente", min_length=1, max_length=100)
+    company_id: Optional[int] = Field(None, description="ID de la société (optionnel, par défaut la société principale)")
+    picking_type_id: Optional[int] = Field(None, description="ID du type d'opération (optionnel)")
+    journal_id: Optional[int] = Field(None, description="ID du journal comptable (optionnel)")
+    currency_id: Optional[int] = Field(None, description="ID de la devise (optionnel)")
+    pricelist_id: Optional[int] = Field(None, description="ID de la liste de prix (optionnel)")
+    receipt_header: Optional[str] = Field(None, description="En-tête des reçus", max_length=500)
+    receipt_footer: Optional[str] = Field(None, description="Pied de page des reçus", max_length=500)
+    iface_tax_included: Optional[str] = Field("total", description="Affichage des taxes (total/subtotal)")
+    cash_control: Optional[bool] = Field(True, description="Contrôle de caisse avancé")
+    module_pos_hr: Optional[bool] = Field(True, description="Connexion par employés")
+
+class PosEmployeeAssignmentRequest(BaseModel):
+    employee_ids: List[int] = Field(..., description="Liste des IDs d'employés à affecter", min_items=1)
+    access_level: str = Field(..., description="Niveau d'accès (basic/advanced)", pattern="^(basic|advanced)$")
+    replace: bool = Field(False, description="Remplacer les affectations existantes (True) ou ajouter (False)")
+
+class PosConfigResponse(BaseModel):
+    id: int
+    name: str
+    company_id: Optional[List[Any]] = None
+    active: bool
+    basic_employee_ids: List[int] = []
+    advanced_employee_ids: List[int] = []
+    current_session_id: Optional[List[Any]] = None
+    current_session_state: Optional[str] = None
