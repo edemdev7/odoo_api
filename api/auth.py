@@ -425,7 +425,10 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
     - Numéro de téléphone
     - Permissions (scopes)
     - Statut d'activité
-    - Informations additionnelles
+    - Informations additionnelles incluant :
+      - Informations de compagnie (ID, nom, email, téléphone, site web, TVA, devise, pays)
+      - Poste et département (pour les employés)
+      - Fonction et tags (pour les utilisateurs standards)
     """
     # Vérifier si c'est un employé authentifié par PIN (username commence par "employee_")
     if current_user.get("username", "").startswith("employee_"):
@@ -444,7 +447,7 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                     'hr.employee', 
                     'read', 
                     [employee_id], 
-                    {'fields': ['name', 'work_email', 'mobile_phone', 'work_phone', 'image_1920', 'job_id', 'department_id']}
+                    {'fields': ['name', 'work_email', 'mobile_phone', 'work_phone', 'image_1920', 'job_id', 'department_id', 'company_id']}
                 )
                 
                 if employee_details:
@@ -464,6 +467,40 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                     if employee.get('department_id') and isinstance(employee.get('department_id'), (list, tuple)) and len(employee.get('department_id')) > 1:
                         dept_info = employee.get('department_id')[1]
                     
+                    # Récupérer les informations de la compagnie
+                    company_info = None
+                    if employee.get('company_id') and isinstance(employee.get('company_id'), (list, tuple)) and len(employee.get('company_id')) > 1:
+                        company_id = employee.get('company_id')[0]
+                        company_name = employee.get('company_id')[1]
+                        
+                        # Récupérer des détails supplémentaires de la compagnie
+                        try:
+                            company_details = default_odoo_client.execute_kw(
+                                'res.company',
+                                'read',
+                                [company_id],
+                                {'fields': ['name', 'email', 'phone', 'website', 'vat', 'currency_id', 'country_id']}
+                            )
+                            
+                            if company_details:
+                                company_data = company_details[0]
+                                company_info = {
+                                    "id": company_id,
+                                    "name": company_name,
+                                    "email": company_data.get('email'),
+                                    "phone": company_data.get('phone'),
+                                    "website": company_data.get('website'),
+                                    "vat": company_data.get('vat'),
+                                    "currency": company_data.get('currency_id')[1] if company_data.get('currency_id') else None,
+                                    "country": company_data.get('country_id')[1] if company_data.get('country_id') else None
+                                }
+                        except Exception as e:
+                            logger.warning(f"Erreur lors de la récupération des détails de la compagnie: {e}")
+                            company_info = {
+                                "id": company_id,
+                                "name": company_name
+                            }
+                    
                     return UserData(
                         username=current_user["username"],
                         fullname=employee.get('name') if isinstance(employee.get('name'), str) else None,
@@ -476,7 +513,8 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                             "employee_id": employee_id,
                             "matricule": current_user.get("employee_matricule"),
                             "job": job_info,
-                            "department": dept_info
+                            "department": dept_info,
+                            "company": company_info
                         }
                     )
         except Exception as e:
@@ -490,7 +528,7 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                 'res.users', 
                 'search_read', 
                 [[['login', '=', current_user["username"]]]], 
-                {'fields': ['name', 'email', 'phone', 'image_1920', 'partner_id'], 'limit': 1}
+                {'fields': ['name', 'email', 'phone', 'image_1920', 'partner_id', 'company_id'], 'limit': 1}
             )
             
             if user_info:
@@ -540,6 +578,45 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                             }
                     except Exception as e:
                         logger.warning(f"Erreur lors de la récupération des détails du partenaire: {e}")
+                
+                # Récupérer les informations détaillées de la compagnie
+                company_info = None
+                if odoo_user.get('company_id') and isinstance(odoo_user.get('company_id'), (list, tuple)) and len(odoo_user.get('company_id')) > 1:
+                    company_id = odoo_user.get('company_id')[0]
+                    company_name = odoo_user.get('company_id')[1]
+                    
+                    try:
+                        company_details = client.execute_kw(
+                            'res.company',
+                            'read',
+                            [company_id],
+                            {'fields': ['name', 'email', 'phone', 'website', 'vat', 'currency_id', 'country_id']}
+                        )
+                        
+                        if company_details:
+                            company_data = company_details[0]
+                            company_info = {
+                                "id": company_id,
+                                "name": company_name,
+                                "email": company_data.get('email'),
+                                "phone": company_data.get('phone'),
+                                "website": company_data.get('website'),
+                                "vat": company_data.get('vat'),
+                                "currency": company_data.get('currency_id')[1] if company_data.get('currency_id') else None,
+                                "country": company_data.get('country_id')[1] if company_data.get('country_id') else None
+                            }
+                    except Exception as e:
+                        logger.warning(f"Erreur lors de la récupération des détails de la compagnie: {e}")
+                        company_info = {
+                            "id": company_id,
+                            "name": company_name
+                        }
+                
+                # Fusionner les informations de compagnie avec les additional_info existantes
+                if company_info:
+                    if not additional_info:
+                        additional_info = {}
+                    additional_info["company"] = company_info
                 
                 # Si on n'a pas trouvé de téléphone dans le partenaire, utiliser celui de l'utilisateur
                 if not phone and isinstance(odoo_user.get('phone'), str):

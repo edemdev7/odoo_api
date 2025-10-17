@@ -12,7 +12,8 @@ from models.schemas import (
     StationPumpData, PosOpenSessionWithPumpsRequest, PosUnifiedOpenSessionRequest,
     PosCreateRequest, PosEmployeeAssignmentRequest, PosConfigResponse,
     ProductCreateRequest, PosProductAssignmentRequest, StockMovementRequest,
-    StockLevelRequest, ProductStockResponse
+    StockLevelRequest, ProductStockResponse, StockPickingResponse,
+    StockPickingStateUpdateRequest, StockPickingListRequest
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -1073,6 +1074,368 @@ async def adjust_product_stock(
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de l'ajustement: {str(e)}"
+        )
+
+# ===== GESTION DES INVENTAIRES (STOCK.PICKING) =====
+
+@router.get("/{pos_id}/inventory/transfers", response_model=ApiResponse)
+async def get_pos_inventory_transfers(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    state: Optional[str] = None,
+    picking_type_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    partner_id: Optional[int] = None,
+    limit: Optional[int] = 50,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les transferts de stock (inventaires) pour un point de vente
+    
+    Cette route permet de consulter tous les transferts de stock (stock.picking)
+    liés à un point de vente spécifique. Utile pour gérer les inventaires,
+    réceptions, livraisons et transferts internes.
+    
+    **Filtres disponibles :**
+    - **state** : État du transfert (draft/waiting/ready/done/cancel)
+    - **picking_type_code** : Type d'opération (incoming/outgoing/internal)
+    - **date_from/date_to** : Période de recherche (YYYY-MM-DD)
+    - **partner_id** : Filtrer par partenaire/fournisseur
+    - **limit** : Nombre maximum de résultats (défaut: 50)
+    
+    **États des transferts :**
+    - **draft** : Brouillon, non confirmé
+    - **waiting** : En attente d'une autre opération
+    - **ready** : Prêt à être traité
+    - **done** : Terminé/traité
+    - **cancel** : Annulé
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe et récupérer ses informations
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'warehouse_id', 'company_id'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Construire le domaine de recherche de manière simple et robuste
+        domain = []
+        
+        # Filtrer par société du PDV si disponible (plus simple que par entrepôt)
+        if pos_config.get('company_id'):
+            try:
+                company_id = pos_config['company_id'][0] if isinstance(pos_config['company_id'], list) else pos_config['company_id']
+                domain.append(('company_id', '=', company_id))
+            except Exception as e:
+                logger.warning(f"Impossible de filtrer par société: {e}")
+        
+        # Ajouter les filtres optionnels
+        if state:
+            domain.append(('state', '=', state))
+        
+        if picking_type_code:
+            domain.append(('picking_type_code', '=', picking_type_code))
+        
+        if partner_id:
+            domain.append(('partner_id', '=', partner_id))
+        
+        if date_from:
+            domain.append(('date', '>=', f"{date_from} 00:00:00"))
+        
+        if date_to:
+            domain.append(('date', '<=', f"{date_to} 23:59:59"))
+        
+        # Limiter la recherche pour éviter les timeouts
+        final_limit = min(limit or 50, 500)
+        
+        logger.info(f"Recherche transferts avec domaine: {domain}")
+        
+        # Récupérer les transferts
+        fields = [
+            'id', 'name', 'origin', 'state', 'picking_type_code', 'partner_id',
+            'location_id', 'location_dest_id', 'scheduled_date', 'date_done',
+            'user_id', 'company_id', 'products_availability', 'products_availability_state',
+            'move_ids', 'pos_session_id', 'pos_order_id', 'note'
+        ]
+        
+        transfers = client.execute_kw(
+            'stock.picking',
+            'search_read',
+            [domain],
+            {
+                'fields': fields,
+                'limit': final_limit,
+                'order': 'date desc, id desc'
+            }
+        )
+        
+        # Formater les résultats avec gestion des valeurs Odoo False
+        formatted_transfers = []
+        for transfer in transfers:
+            try:
+                # Utiliser le modèle Pydantic avec les validateurs pour gérer les False d'Odoo
+                formatted_transfer = StockPickingResponse(**transfer)
+                formatted_transfers.append(formatted_transfer.dict())
+            except Exception as e:
+                logger.warning(f"Erreur formatage transfert {transfer.get('id', 'unknown')}: {e}")
+                # En cas d'erreur, créer manuellement avec valeurs sûres
+                formatted_transfer = {
+                    'id': transfer['id'],
+                    'name': transfer.get('name', ''),
+                    'origin': transfer.get('origin') if transfer.get('origin') is not False else None,
+                    'state': transfer.get('state', 'draft'),
+                    'picking_type_code': transfer.get('picking_type_code') if transfer.get('picking_type_code') is not False else None,
+                    'partner_id': transfer.get('partner_id') if transfer.get('partner_id') is not False else None,
+                    'location_id': transfer.get('location_id') if transfer.get('location_id') is not False else None,
+                    'location_dest_id': transfer.get('location_dest_id') if transfer.get('location_dest_id') is not False else None,
+                    'scheduled_date': transfer.get('scheduled_date') if transfer.get('scheduled_date') is not False else None,
+                    'date_done': transfer.get('date_done') if transfer.get('date_done') is not False else None,
+                    'user_id': transfer.get('user_id') if transfer.get('user_id') is not False else None,
+                    'company_id': transfer.get('company_id') if transfer.get('company_id') is not False else None,
+                    'products_availability': transfer.get('products_availability') if transfer.get('products_availability') is not False else None,
+                    'products_availability_state': transfer.get('products_availability_state') if transfer.get('products_availability_state') is not False else None,
+                    'move_ids': transfer.get('move_ids', []) if transfer.get('move_ids') is not False else [],
+                    'pos_session_id': transfer.get('pos_session_id') if transfer.get('pos_session_id') is not False else None,
+                    'pos_order_id': transfer.get('pos_order_id') if transfer.get('pos_order_id') is not False else None,
+                    'note': transfer.get('note') if transfer.get('note') is not False else None
+                }
+                formatted_transfers.append(formatted_transfer)
+        
+        logger.info(f"Récupération de {len(transfers)} transferts pour PDV {pos_config['name']}")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_info': {
+                    'id': pos_id,
+                    'name': pos_config['name'],
+                    'warehouse_id': pos_config.get('warehouse_id'),
+                    'company_id': pos_config.get('company_id'),
+                },
+                'transfers': formatted_transfers,
+                'filters_applied': {
+                    'state': state,
+                    'picking_type_code': picking_type_code,
+                    'date_from': date_from,
+                    'date_to': date_to,
+                    'partner_id': partner_id
+                },
+                'domain_used': domain
+            },
+            count=len(transfers),
+            message=f"Trouvé {len(transfers)} transfert(s) pour le PDV '{pos_config['name']}'"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des transferts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
+
+@router.post("/{pos_id}/inventory/transfers/update-state", response_model=ApiResponse)
+async def update_inventory_transfer_state(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    request: StockPickingStateUpdateRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Changer l'état des transferts de stock (de prêt à fait, par exemple)
+    
+    Cette route permet de faire évoluer l'état des transferts de stock selon
+    le workflow Odoo standard :
+    - **confirm** : Confirmer le transfert (draft → waiting/ready)
+    - **assign** : Réserver les produits (waiting → ready)
+    - **done** : Marquer comme terminé (ready → done)
+    - **cancel** : Annuler le transfert (any → cancel)
+    
+    **Actions disponibles :**
+    - **confirm** : Confirme les transferts en brouillon
+    - **assign** : Réserve les quantités disponibles
+    - **done** : Valide et termine les transferts
+    - **cancel** : Annule les transferts
+    
+    **Paramètres :**
+    - **picking_ids** : Liste des IDs de transferts à traiter
+    - **action** : Action à effectuer
+    - **force** : Forcer l'action même si les conditions ne sont pas remplies
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Vérifier que les transferts existent
+        existing_transfers = client.execute_kw(
+            'stock.picking',
+            'search_read',
+            [[('id', 'in', request.picking_ids)]],
+            {'fields': ['id', 'name', 'state'], 'limit': len(request.picking_ids)}
+        )
+        
+        if len(existing_transfers) != len(request.picking_ids):
+            found_ids = [t['id'] for t in existing_transfers]
+            missing_ids = set(request.picking_ids) - set(found_ids)
+            raise HTTPException(
+                status_code=404,
+                detail=f"Transferts non trouvés: {list(missing_ids)}"
+            )
+        
+        # Préparer les résultats
+        results = []
+        errors = []
+        
+        # Traiter chaque transfert selon l'action demandée
+        for transfer in existing_transfers:
+            transfer_id = transfer['id']
+            transfer_name = transfer['name']
+            current_state = transfer['state']
+            
+            try:
+                success = False
+                new_state = current_state
+                
+                if request.action == "confirm":
+                    # Confirmer le transfert
+                    if current_state == 'draft':
+                        client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
+                        success = True
+                        new_state = 'waiting'
+                    elif request.force:
+                        client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
+                        success = True
+                    else:
+                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la confirmation")
+                
+                elif request.action == "assign":
+                    # Réserver les produits
+                    if current_state in ['waiting', 'confirmed']:
+                        client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
+                        success = True
+                        new_state = 'assigned'
+                    elif request.force:
+                        client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
+                        success = True
+                    else:
+                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la réservation")
+                
+                elif request.action == "done":
+                    # Terminer le transfert
+                    if current_state in ['assigned', 'ready']:
+                        # Vérifier que toutes les quantités sont définies
+                        client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                        success = True
+                        new_state = 'done'
+                    elif request.force:
+                        try:
+                            client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                            success = True
+                            new_state = 'done'
+                        except Exception as e:
+                            # Si la validation échoue, essayer de forcer
+                            client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
+                            success = True
+                            new_state = 'done'
+                    else:
+                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la validation")
+                
+                elif request.action == "cancel":
+                    # Annuler le transfert
+                    if current_state != 'done':
+                        client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
+                        success = True
+                        new_state = 'cancel'
+                    elif request.force:
+                        client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
+                        success = True
+                        new_state = 'cancel'
+                    else:
+                        errors.append(f"{transfer_name}: Transfert terminé, impossible d'annuler")
+                
+                if success:
+                    results.append({
+                        'id': transfer_id,
+                        'name': transfer_name,
+                        'previous_state': current_state,
+                        'new_state': new_state,
+                        'success': True
+                    })
+                
+            except Exception as e:
+                error_msg = f"{transfer_name}: Erreur lors de l'action '{request.action}': {str(e)}"
+                errors.append(error_msg)
+                logger.error(f"Erreur transfert {transfer_id}: {e}")
+                
+                results.append({
+                    'id': transfer_id,
+                    'name': transfer_name,
+                    'previous_state': current_state,
+                    'new_state': current_state,
+                    'success': False,
+                    'error': str(e)
+                })
+        
+        # Préparer la réponse
+        success_count = len([r for r in results if r.get('success', False)])
+        error_count = len(errors)
+        
+        message = f"Action '{request.action}' : {success_count} succès"
+        if error_count > 0:
+            message += f", {error_count} erreur(s)"
+        
+        logger.info(f"Mise à jour état transferts PDV {pos_config['name']}: {message}")
+        
+        return ApiResponse(
+            success=error_count == 0,
+            data={
+                'pos_info': {
+                    'id': pos_id,
+                    'name': pos_config['name']
+                },
+                'action': request.action,
+                'results': results,
+                'summary': {
+                    'total_processed': len(request.picking_ids),
+                    'success_count': success_count,
+                    'error_count': error_count
+                },
+                'errors': errors if errors else None
+            },
+            message=message
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour des transferts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la mise à jour: {str(e)}"
         )
   
 # ===== GESTION DES SESSIONS POS =====

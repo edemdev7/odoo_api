@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List, Dict, Any, Union
 
 class PosShopUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, description="Nom du point de vente")
@@ -297,3 +297,57 @@ class ProductStockResponse(BaseModel):
     unit_of_measure: str
     location_name: str
     last_update: Optional[str] = None
+
+# ===== SCHEMAS POUR GESTION DES INVENTAIRES (STOCK.PICKING) =====
+
+class StockPickingResponse(BaseModel):
+    id: int
+    name: str = Field(description="Référence du transfert")
+    origin: Optional[str] = Field(None, description="Document source")
+    state: str = Field(description="État du transfert (draft/waiting/ready/done/cancel)")
+    picking_type_code: Optional[str] = Field(None, description="Type d'opération (incoming/outgoing/internal)")
+    partner_id: Optional[List[Any]] = Field(None, description="Contact [ID, nom]")
+    location_id: Optional[List[Any]] = Field(None, description="Emplacement source [ID, nom]")
+    location_dest_id: Optional[List[Any]] = Field(None, description="Emplacement destination [ID, nom]")
+    scheduled_date: Optional[str] = Field(None, description="Date prévue")
+    date_done: Optional[str] = Field(None, description="Date de réalisation")
+    user_id: Optional[List[Any]] = Field(None, description="Responsable [ID, nom]")
+    company_id: Optional[List[Any]] = Field(None, description="Société [ID, nom]")
+    products_availability: Optional[str] = Field(None, description="Disponibilité des produits")
+    products_availability_state: Optional[str] = Field(None, description="État de disponibilité")
+    move_ids: Optional[List[int]] = Field(None, description="IDs des mouvements de stock")
+    pos_session_id: Optional[List[Any]] = Field(None, description="Session POS [ID, nom]")
+    pos_order_id: Optional[List[Any]] = Field(None, description="Commande POS [ID, nom]")
+    note: Optional[str] = Field(None, description="Notes")
+    
+    @field_validator('partner_id', 'user_id', 'company_id', 'location_id', 'location_dest_id', 'pos_session_id', 'pos_order_id', mode='before')
+    @classmethod
+    def validate_many2one_fields(cls, v):
+        """Convertir False d'Odoo en None pour les champs many2one"""
+        return None if v is False else v
+    
+    @field_validator('origin', 'picking_type_code', 'scheduled_date', 'date_done', 'products_availability', 'products_availability_state', 'note', mode='before')
+    @classmethod
+    def validate_string_fields(cls, v):
+        """Convertir False d'Odoo en None pour les champs string"""
+        return None if v is False else v
+    
+    @field_validator('move_ids', mode='before')
+    @classmethod
+    def validate_move_ids(cls, v):
+        """Convertir False d'Odoo en liste vide pour move_ids"""
+        return [] if v is False else v
+
+class StockPickingStateUpdateRequest(BaseModel):
+    picking_ids: List[int] = Field(..., description="IDs des transferts à mettre à jour", min_items=1)
+    action: str = Field(..., description="Action à effectuer", pattern="^(confirm|assign|done|cancel)$")
+    force: bool = Field(False, description="Forcer l'action même si les conditions ne sont pas remplies")
+
+class StockPickingListRequest(BaseModel):
+    pos_id: Optional[int] = Field(None, description="Filtrer par point de vente")
+    state: Optional[str] = Field(None, description="Filtrer par état (draft/waiting/ready/done/cancel)")
+    picking_type_code: Optional[str] = Field(None, description="Type d'opération (incoming/outgoing/internal)")
+    date_from: Optional[str] = Field(None, description="Date de début (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Date de fin (YYYY-MM-DD)")
+    partner_id: Optional[int] = Field(None, description="Filtrer par partenaire")
+    limit: Optional[int] = Field(50, description="Nombre maximum de résultats", ge=1, le=500)
