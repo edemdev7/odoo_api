@@ -300,11 +300,63 @@ class ProductStockResponse(BaseModel):
 
 # ===== SCHEMAS POUR GESTION DES INVENTAIRES (STOCK.PICKING) =====
 
+class StockMoveDetails(BaseModel):
+    """Détails d'un mouvement de stock"""
+    id: int
+    name: str = Field(description="Description du mouvement")
+    product_id: Optional[List[Any]] = Field(None, description="Produit [ID, nom]")
+    product_uom_qty: Optional[float] = Field(None, description="Quantité demandée")
+    quantity_done: Optional[float] = Field(None, description="Quantité réalisée")
+    product_uom: Optional[List[Any]] = Field(None, description="Unité de mesure [ID, nom]")
+    state: Optional[str] = Field(None, description="État du mouvement")
+    location_id: Optional[List[Any]] = Field(None, description="Emplacement source [ID, nom]")
+    location_dest_id: Optional[List[Any]] = Field(None, description="Emplacement destination [ID, nom]")
+    date: Optional[str] = Field(None, description="Date du mouvement")
+    date_expected: Optional[str] = Field(None, description="Date prévue")
+    origin: Optional[str] = Field(None, description="Document source")
+    price_unit: Optional[float] = Field(None, description="Prix unitaire")
+    product_details: Optional[Dict[str, Any]] = Field(None, description="Détails du produit")
+    
+    @field_validator('product_id', 'product_uom', 'location_id', 'location_dest_id', mode='before')
+    @classmethod
+    def validate_many2one_fields(cls, v):
+        return None if v is False else v
+    
+    @field_validator('name', 'state', 'date', 'date_expected', 'origin', mode='before')
+    @classmethod
+    def validate_string_fields(cls, v):
+        return None if v is False else v
+
+class StockPickingTypeDetails(BaseModel):
+    """Détails du type de picking"""
+    id: int
+    name: str = Field(description="Nom du type")
+    code: Optional[str] = Field(None, description="Code (incoming/outgoing/internal)")
+    warehouse_id: Optional[List[Any]] = Field(None, description="Entrepôt [ID, nom]")
+    default_location_src_id: Optional[List[Any]] = Field(None, description="Emplacement source par défaut [ID, nom]")
+    default_location_dest_id: Optional[List[Any]] = Field(None, description="Emplacement destination par défaut [ID, nom]")
+    use_create_lots: Optional[bool] = Field(None, description="Créer des lots")
+    use_existing_lots: Optional[bool] = Field(None, description="Utiliser des lots existants")
+    show_entire_packs: Optional[bool] = Field(None, description="Afficher paquets entiers")
+    show_reserved: Optional[bool] = Field(None, description="Afficher réservé")
+    show_operations: Optional[bool] = Field(None, description="Afficher opérations")
+    
+    @field_validator('warehouse_id', 'default_location_src_id', 'default_location_dest_id', mode='before')
+    @classmethod
+    def validate_many2one_fields(cls, v):
+        return None if v is False else v
+    
+    @field_validator('code', mode='before')
+    @classmethod
+    def validate_string_fields(cls, v):
+        return None if v is False else v
+
 class StockPickingResponse(BaseModel):
+    # Champs de base
     id: int
     name: str = Field(description="Référence du transfert")
     origin: Optional[str] = Field(None, description="Document source")
-    state: str = Field(description="État du transfert (draft/waiting/ready/done/cancel)")
+    state: str = Field(description="État du transfert (draft/waiting/confirmed/assigned/done/cancel)")
     picking_type_code: Optional[str] = Field(None, description="Type d'opération (incoming/outgoing/internal)")
     partner_id: Optional[List[Any]] = Field(None, description="Contact [ID, nom]")
     location_id: Optional[List[Any]] = Field(None, description="Emplacement source [ID, nom]")
@@ -320,13 +372,50 @@ class StockPickingResponse(BaseModel):
     pos_order_id: Optional[List[Any]] = Field(None, description="Commande POS [ID, nom]")
     note: Optional[str] = Field(None, description="Notes")
     
-    @field_validator('partner_id', 'user_id', 'company_id', 'location_id', 'location_dest_id', 'pos_session_id', 'pos_order_id', mode='before')
+    # Champs détaillés supplémentaires
+    picking_type_id: Optional[List[Any]] = Field(None, description="Type de picking [ID, nom]")
+    priority: Optional[str] = Field(None, description="Priorité")
+    date: Optional[str] = Field(None, description="Date de création")
+    date_deadline: Optional[str] = Field(None, description="Date limite")
+    move_type: Optional[str] = Field(None, description="Type de mouvement")
+    group_id: Optional[List[Any]] = Field(None, description="Groupe de procurement [ID, nom]")
+    has_scrap_move: Optional[bool] = Field(None, description="A des mouvements de rebut")
+    has_packages: Optional[bool] = Field(None, description="A des colis")
+    is_locked: Optional[bool] = Field(None, description="Est verrouillé")
+    is_assigned: Optional[bool] = Field(None, description="Est assigné")
+    is_available: Optional[bool] = Field(None, description="Est disponible")
+    
+    # Informations de livraison
+    carrier_id: Optional[List[Any]] = Field(None, description="Transporteur [ID, nom]")
+    carrier_tracking_ref: Optional[str] = Field(None, description="Référence de suivi")
+    weight: Optional[float] = Field(None, description="Poids")
+    carrier_price: Optional[float] = Field(None, description="Prix transport")
+    number_of_packages: Optional[int] = Field(None, description="Nombre de colis")
+    
+    # Informations de workflow
+    backorder_id: Optional[List[Any]] = Field(None, description="Commande en retard [ID, nom]")
+    immediate_transfer: Optional[bool] = Field(None, description="Transfert immédiat")
+    show_operations: Optional[bool] = Field(None, description="Afficher opérations")
+    show_lots_text: Optional[bool] = Field(None, description="Afficher texte des lots")
+    has_tracking: Optional[bool] = Field(None, description="A un suivi")
+    
+    # Informations de dates et utilisateurs
+    create_date: Optional[str] = Field(None, description="Date de création")
+    write_date: Optional[str] = Field(None, description="Date de modification")
+    create_uid: Optional[List[Any]] = Field(None, description="Créé par [ID, nom]")
+    write_uid: Optional[List[Any]] = Field(None, description="Modifié par [ID, nom]")
+    
+    # Détails enrichis
+    move_details: Optional[List[StockMoveDetails]] = Field(None, description="Détails des mouvements de stock")
+    picking_type_details: Optional[StockPickingTypeDetails] = Field(None, description="Détails du type de picking")
+    
+    @field_validator('partner_id', 'user_id', 'company_id', 'location_id', 'location_dest_id', 'pos_session_id', 'pos_order_id', 'picking_type_id', 'group_id', 'carrier_id', 'backorder_id', 'create_uid', 'write_uid', mode='before')
     @classmethod
     def validate_many2one_fields(cls, v):
         """Convertir False d'Odoo en None pour les champs many2one"""
         return None if v is False else v
     
-    @field_validator('origin', 'picking_type_code', 'scheduled_date', 'date_done', 'products_availability', 'products_availability_state', 'note', mode='before')
+    @field_validator('origin', 'picking_type_code', 'scheduled_date', 'date_done', 'products_availability', 'products_availability_state', 'note', 'priority', 'date', 'date_deadline', 'move_type', 'carrier_tracking_ref', 'create_date', 'write_date', mode='before')
     @classmethod
     def validate_string_fields(cls, v):
         """Convertir False d'Odoo en None pour les champs string"""
@@ -337,6 +426,18 @@ class StockPickingResponse(BaseModel):
     def validate_move_ids(cls, v):
         """Convertir False d'Odoo en liste vide pour move_ids"""
         return [] if v is False else v
+    
+    @field_validator('weight', 'carrier_price', mode='before')
+    @classmethod
+    def validate_float_fields(cls, v):
+        """Convertir False d'Odoo en None pour les champs float"""
+        return None if v is False else v
+    
+    @field_validator('number_of_packages', mode='before')
+    @classmethod
+    def validate_int_fields(cls, v):
+        """Convertir False d'Odoo en None pour les champs int"""
+        return None if v is False else v
 
 class StockPickingStateUpdateRequest(BaseModel):
     picking_ids: List[int] = Field(..., description="IDs des transferts à mettre à jour", min_items=1)

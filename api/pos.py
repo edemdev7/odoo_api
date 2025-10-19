@@ -1160,12 +1160,47 @@ async def get_pos_inventory_transfers(
         
         logger.info(f"Recherche transferts avec domaine: {domain}")
         
-        # Récupérer les transferts
+        # Récupérer les transferts avec tous les détails possibles
         fields = [
+            # Champs de base
             'id', 'name', 'origin', 'state', 'picking_type_code', 'partner_id',
             'location_id', 'location_dest_id', 'scheduled_date', 'date_done',
             'user_id', 'company_id', 'products_availability', 'products_availability_state',
-            'move_ids', 'pos_session_id', 'pos_order_id', 'note'
+            'move_ids', 'pos_session_id', 'pos_order_id', 'note',
+            
+            # Champs détaillés supplémentaires
+            'picking_type_id', 'priority', 'date', 'date_deadline',
+            'move_type', 'group_id', 'has_scrap_move', 'has_packages', 
+            'show_check_availability', 'is_locked', 'package_level_ids', 
+            'package_level_ids_details',
+            
+            # Informations produits et quantités
+            'move_ids_without_package', 'move_line_ids', 'move_line_ids_without_package',
+            'move_line_exist', 'show_operations', 'show_reserved',
+            
+            # Informations de livraison et transport
+            'carrier_id', 'carrier_tracking_ref', 'delivery_type',
+            'weight', 'carrier_price', 'shipping_weight', 'weight_bulk',
+            
+            # Informations warehouse et stock
+            'picking_type_entire_packs', 'use_create_lots', 'use_existing_lots',
+            'printed', 'show_lots_text', 'has_tracking', 'owner_id',
+            
+            # Champs de workflow et validation
+            'backorder_id', 'backorder_ids', 'return_id', 'return_ids', 'return_count',
+            'signature', 'is_signed', 'batch_id',
+            
+            # Informations utilisateur et création
+            'create_date', 'write_date', 'create_uid', 'write_uid',
+            
+            # Champs de vente et achat
+            'sale_id', 'purchase_id',
+            
+            # Autres champs utiles
+            'json_popover', 'activity_ids', 'activity_state', 'activity_user_id', 
+            'activity_type_id', 'message_needaction', 'message_has_error', 
+            'message_attachment_count', 'country_code', 'has_deadline_issue',
+            'delay_alert_date', 'quality_check_todo', 'quality_check_fail'
         ]
         
         transfers = client.execute_kw(
@@ -1179,35 +1214,235 @@ async def get_pos_inventory_transfers(
             }
         )
         
-        # Formater les résultats avec gestion des valeurs Odoo False
+        # Enrichir chaque transfert avec les détails des mouvements
+        for transfer in transfers:
+            # Récupérer les détails des mouvements de stock (stock.move)
+            if transfer.get('move_ids'):
+                try:
+                    move_details = client.execute_kw(
+                        'stock.move',
+                        'read',
+                        [transfer['move_ids']],
+                        {
+                            'fields': [
+                                'id', 'name', 'product_id', 'product_uom_qty', 'product_qty',
+                                'product_uom', 'state', 'location_id', 'location_dest_id',
+                                'date', 'date_deadline', 'origin', 'procure_method',
+                                'description_picking', 'additional', 'picking_type_id', 
+                                'warehouse_id', 'partner_id', 'company_id', 'price_unit',
+                                'create_date', 'write_date', 'product_packaging_id',
+                                'product_packaging_qty', 'availability', 'forecast_availability',
+                                'reference', 'sequence', 'priority', 'picked'
+                            ]
+                        }
+                    )
+                    
+                    # Enrichir avec les informations produits détaillées
+                    product_ids = [move['product_id'][0] for move in move_details if move.get('product_id')]
+                    if product_ids:
+                        products_info = client.execute_kw(
+                            'product.product',
+                            'read',
+                            [product_ids],
+                            {
+                                'fields': [
+                                    'id', 'name', 'display_name', 'default_code', 'barcode', 'categ_id',
+                                    'uom_id', 'uom_po_id', 'list_price', 'standard_price',
+                                    'type', 'tracking', 'weight', 'volume', 'sale_ok', 
+                                    'purchase_ok', 'active', 'image_1920', 'description',
+                                    'description_sale', 'description_purchase', 'taxes_id',
+                                    'supplier_taxes_id', 'product_tmpl_id', 'product_variant_ids'
+                                ]
+                            }
+                        )
+                        
+                        # Créer un mapping des produits
+                        products_map = {p['id']: p for p in products_info}
+                        
+                        # Ajouter les infos produits aux mouvements
+                        for move in move_details:
+                            if move.get('product_id'):
+                                product_id = move['product_id'][0]
+                                move['product_details'] = products_map.get(product_id, {})
+                    
+                    transfer['move_details'] = move_details
+                    
+                except Exception as e:
+                    logger.warning(f"Erreur récupération détails mouvements pour transfert {transfer['id']}: {e}")
+                    transfer['move_details'] = []
+            else:
+                transfer['move_details'] = []
+            
+            # Récupérer les détails des opérations de stock (stock.move.line)
+            if transfer.get('move_line_ids'):
+                try:
+                    move_line_details = client.execute_kw(
+                        'stock.move.line',
+                        'read',
+                        [transfer['move_line_ids']],
+                        {
+                            'fields': [
+                                'id', 'move_id', 'product_id', 'product_uom_id', 'qty_done',
+                                'quantity', 'lot_id', 'lot_name', 'package_id',
+                                'result_package_id', 'date', 'owner_id', 'location_id',
+                                'location_dest_id', 'picking_id', 'company_id', 'state',
+                                'reference', 'description_picking', 'picked', 'tracking',
+                                'product_packaging_id', 'product_packaging_qty'
+                            ]
+                        }
+                    )
+                    transfer['move_line_details'] = move_line_details
+                except Exception as e:
+                    logger.warning(f"Erreur récupération détails move_line pour transfert {transfer['id']}: {e}")
+                    transfer['move_line_details'] = []
+            else:
+                transfer['move_line_details'] = []
+            
+            # Ajouter des informations sur le type de picking avec plus de détails
+            if transfer.get('picking_type_id'):
+                try:
+                    picking_type_info = client.execute_kw(
+                        'stock.picking.type',
+                        'read',
+                        [transfer['picking_type_id'][0]],
+                        {
+                            'fields': [
+                                'id', 'name', 'code', 'sequence_id', 'default_location_src_id',
+                                'default_location_dest_id', 'warehouse_id', 'active',
+                                'use_create_lots', 'use_existing_lots', 'show_entire_packs',
+                                'show_reserved', 'show_operations', 'auto_show_reception_report',
+                                'create_backorder', 'sequence_code', 'color'
+                            ]
+                        }
+                    )
+                    transfer['picking_type_details'] = picking_type_info[0] if picking_type_info else {}
+                except Exception as e:
+                    logger.warning(f"Erreur récupération type picking pour transfert {transfer['id']}: {e}")
+                    transfer['picking_type_details'] = {}
+            else:
+                transfer['picking_type_details'] = {}
+        
+        # Formater les résultats - Créer directement le dictionnaire avec tous les détails
+        def clean_odoo_value(value):
+            """Nettoyer les valeurs False d'Odoo"""
+            return None if value is False else value
+        
         formatted_transfers = []
         for transfer in transfers:
             try:
-                # Utiliser le modèle Pydantic avec les validateurs pour gérer les False d'Odoo
-                formatted_transfer = StockPickingResponse(**transfer)
-                formatted_transfers.append(formatted_transfer.dict())
+                # Créer le dictionnaire complet avec nettoyage des valeurs False
+                formatted_transfer = {
+                    # Champs de base
+                    'id': transfer['id'],
+                    'name': transfer.get('name', ''),
+                    'origin': clean_odoo_value(transfer.get('origin')),
+                    'state': transfer.get('state', 'draft'),
+                    'picking_type_code': clean_odoo_value(transfer.get('picking_type_code')),
+                    'partner_id': clean_odoo_value(transfer.get('partner_id')),
+                    'location_id': clean_odoo_value(transfer.get('location_id')),
+                    'location_dest_id': clean_odoo_value(transfer.get('location_dest_id')),
+                    'scheduled_date': clean_odoo_value(transfer.get('scheduled_date')),
+                    'date_done': clean_odoo_value(transfer.get('date_done')),
+                    'user_id': clean_odoo_value(transfer.get('user_id')),
+                    'company_id': clean_odoo_value(transfer.get('company_id')),
+                    'products_availability': clean_odoo_value(transfer.get('products_availability')),
+                    'products_availability_state': clean_odoo_value(transfer.get('products_availability_state')),
+                    'move_ids': transfer.get('move_ids', []) if transfer.get('move_ids') is not False else [],
+                    'pos_session_id': clean_odoo_value(transfer.get('pos_session_id')),
+                    'pos_order_id': clean_odoo_value(transfer.get('pos_order_id')),
+                    'note': clean_odoo_value(transfer.get('note')),
+                    
+                    # Champs détaillés supplémentaires
+                    'picking_type_id': clean_odoo_value(transfer.get('picking_type_id')),
+                    'priority': clean_odoo_value(transfer.get('priority')),
+                    'date': clean_odoo_value(transfer.get('date')),
+                    'date_deadline': clean_odoo_value(transfer.get('date_deadline')),
+                    'move_type': clean_odoo_value(transfer.get('move_type')),
+                    'group_id': clean_odoo_value(transfer.get('group_id')),
+                    'has_scrap_move': clean_odoo_value(transfer.get('has_scrap_move')),
+                    'has_packages': clean_odoo_value(transfer.get('has_packages')),
+                    'is_locked': clean_odoo_value(transfer.get('is_locked')),
+                    'package_level_ids': clean_odoo_value(transfer.get('package_level_ids')),
+                    'package_level_ids_details': clean_odoo_value(transfer.get('package_level_ids_details')),
+                    'show_check_availability': clean_odoo_value(transfer.get('show_check_availability')),
+                    
+                    # Informations produits et quantités
+                    'move_ids_without_package': clean_odoo_value(transfer.get('move_ids_without_package')),
+                    'move_line_ids': clean_odoo_value(transfer.get('move_line_ids')),
+                    'move_line_ids_without_package': clean_odoo_value(transfer.get('move_line_ids_without_package')),
+                    'move_line_exist': clean_odoo_value(transfer.get('move_line_exist')),
+                    'show_operations': clean_odoo_value(transfer.get('show_operations')),
+                    'show_reserved': clean_odoo_value(transfer.get('show_reserved')),
+                    
+                    # Informations de livraison et transport
+                    'carrier_id': clean_odoo_value(transfer.get('carrier_id')),
+                    'carrier_tracking_ref': clean_odoo_value(transfer.get('carrier_tracking_ref')),
+                    'delivery_type': clean_odoo_value(transfer.get('delivery_type')),
+                    'weight': clean_odoo_value(transfer.get('weight')),
+                    'carrier_price': clean_odoo_value(transfer.get('carrier_price')),
+                    'shipping_weight': clean_odoo_value(transfer.get('shipping_weight')),
+                    'weight_bulk': clean_odoo_value(transfer.get('weight_bulk')),
+                    
+                    # Informations warehouse et stock
+                    'picking_type_entire_packs': clean_odoo_value(transfer.get('picking_type_entire_packs')),
+                    'use_create_lots': clean_odoo_value(transfer.get('use_create_lots')),
+                    'use_existing_lots': clean_odoo_value(transfer.get('use_existing_lots')),
+                    'printed': clean_odoo_value(transfer.get('printed')),
+                    'show_lots_text': clean_odoo_value(transfer.get('show_lots_text')),
+                    'has_tracking': clean_odoo_value(transfer.get('has_tracking')),
+                    'owner_id': clean_odoo_value(transfer.get('owner_id')),
+                    
+                    # Informations de workflow
+                    'backorder_id': clean_odoo_value(transfer.get('backorder_id')),
+                    'backorder_ids': clean_odoo_value(transfer.get('backorder_ids')),
+                    'return_id': clean_odoo_value(transfer.get('return_id')),
+                    'return_ids': clean_odoo_value(transfer.get('return_ids')),
+                    'return_count': clean_odoo_value(transfer.get('return_count')),
+                    'signature': clean_odoo_value(transfer.get('signature')),
+                    'is_signed': clean_odoo_value(transfer.get('is_signed')),
+                    'batch_id': clean_odoo_value(transfer.get('batch_id')),
+                    
+                    # Informations de dates et utilisateurs
+                    'create_date': clean_odoo_value(transfer.get('create_date')),
+                    'write_date': clean_odoo_value(transfer.get('write_date')),
+                    'create_uid': clean_odoo_value(transfer.get('create_uid')),
+                    'write_uid': clean_odoo_value(transfer.get('write_uid')),
+                    
+                    # Champs de vente et achat
+                    'sale_id': clean_odoo_value(transfer.get('sale_id')),
+                    'purchase_id': clean_odoo_value(transfer.get('purchase_id')),
+                    
+                    # Autres champs utiles
+                    'json_popover': clean_odoo_value(transfer.get('json_popover')),
+                    'activity_ids': clean_odoo_value(transfer.get('activity_ids')),
+                    'activity_state': clean_odoo_value(transfer.get('activity_state')),
+                    'activity_user_id': clean_odoo_value(transfer.get('activity_user_id')),
+                    'activity_type_id': clean_odoo_value(transfer.get('activity_type_id')),
+                    'message_needaction': clean_odoo_value(transfer.get('message_needaction')),
+                    'message_has_error': clean_odoo_value(transfer.get('message_has_error')),
+                    'message_attachment_count': clean_odoo_value(transfer.get('message_attachment_count')),
+                    'country_code': clean_odoo_value(transfer.get('country_code')),
+                    'has_deadline_issue': clean_odoo_value(transfer.get('has_deadline_issue')),
+                    'delay_alert_date': clean_odoo_value(transfer.get('delay_alert_date')),
+                    'quality_check_todo': clean_odoo_value(transfer.get('quality_check_todo')),
+                    'quality_check_fail': clean_odoo_value(transfer.get('quality_check_fail')),
+                    
+                    # Détails enrichis
+                    'move_details': transfer.get('move_details', []),
+                    'move_line_details': transfer.get('move_line_details', []),
+                    'picking_type_details': transfer.get('picking_type_details', {})
+                }
+                
+                formatted_transfers.append(formatted_transfer)
+                
             except Exception as e:
                 logger.warning(f"Erreur formatage transfert {transfer.get('id', 'unknown')}: {e}")
-                # En cas d'erreur, créer manuellement avec valeurs sûres
+                # En cas d'erreur, inclure au minimum les champs de base
                 formatted_transfer = {
                     'id': transfer['id'],
                     'name': transfer.get('name', ''),
-                    'origin': transfer.get('origin') if transfer.get('origin') is not False else None,
                     'state': transfer.get('state', 'draft'),
-                    'picking_type_code': transfer.get('picking_type_code') if transfer.get('picking_type_code') is not False else None,
-                    'partner_id': transfer.get('partner_id') if transfer.get('partner_id') is not False else None,
-                    'location_id': transfer.get('location_id') if transfer.get('location_id') is not False else None,
-                    'location_dest_id': transfer.get('location_dest_id') if transfer.get('location_dest_id') is not False else None,
-                    'scheduled_date': transfer.get('scheduled_date') if transfer.get('scheduled_date') is not False else None,
-                    'date_done': transfer.get('date_done') if transfer.get('date_done') is not False else None,
-                    'user_id': transfer.get('user_id') if transfer.get('user_id') is not False else None,
-                    'company_id': transfer.get('company_id') if transfer.get('company_id') is not False else None,
-                    'products_availability': transfer.get('products_availability') if transfer.get('products_availability') is not False else None,
-                    'products_availability_state': transfer.get('products_availability_state') if transfer.get('products_availability_state') is not False else None,
-                    'move_ids': transfer.get('move_ids', []) if transfer.get('move_ids') is not False else [],
-                    'pos_session_id': transfer.get('pos_session_id') if transfer.get('pos_session_id') is not False else None,
-                    'pos_order_id': transfer.get('pos_order_id') if transfer.get('pos_order_id') is not False else None,
-                    'note': transfer.get('note') if transfer.get('note') is not False else None
+                    'error': f"Erreur formatage: {str(e)}"
                 }
                 formatted_transfers.append(formatted_transfer)
         
