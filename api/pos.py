@@ -1298,6 +1298,29 @@ async def get_pos_inventory_transfers(
             else:
                 transfer['move_line_details'] = []
             
+            # Ajouter des informations sur le transporteur
+            if transfer.get('carrier_id'):
+                try:
+                    carrier_info = client.execute_kw(
+                        'delivery.carrier',
+                        'read',
+                        [transfer['carrier_id'][0]],
+                        {
+                            'fields': [
+                                'id', 'name', 'delivery_type', 'product_id', 'website_url',
+                                'country_ids', 'state_ids', 'zip_from', 'zip_to',
+                                'margin', 'free_over', 'amount', 'fixed_price',
+                                'active', 'sequence', 'company_id'
+                            ]
+                        }
+                    )
+                    transfer['carrier_details'] = carrier_info[0] if carrier_info else {}
+                except Exception as e:
+                    logger.warning(f"Erreur récupération transporteur pour transfert {transfer['id']}: {e}")
+                    transfer['carrier_details'] = {}
+            else:
+                transfer['carrier_details'] = {}
+            
             # Ajouter des informations sur le type de picking avec plus de détails
             if transfer.get('picking_type_id'):
                 try:
@@ -1430,6 +1453,7 @@ async def get_pos_inventory_transfers(
                     # Détails enrichis
                     'move_details': transfer.get('move_details', []),
                     'move_line_details': transfer.get('move_line_details', []),
+                    'carrier_details': transfer.get('carrier_details', {}),
                     'picking_type_details': transfer.get('picking_type_details', {})
                 }
                 
@@ -1581,23 +1605,55 @@ async def update_inventory_transfer_state(
                 
                 elif request.action == "done":
                     # Terminer le transfert
-                    if current_state in ['assigned', 'ready']:
-                        # Vérifier que toutes les quantités sont définies
-                        client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                        success = True
-                        new_state = 'done'
-                    elif request.force:
+                    if current_state in ['assigned', 'confirmed'] or request.force:
                         try:
-                            client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                            success = True
-                            new_state = 'done'
+                            # Étape 1 : Réserver les produits si nécessaire
+                            if current_state != 'assigned':
+                                client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
+                            
+                            # Étape 2 : Définir les quantités réalisées pour toutes les move_lines
+                            move_lines = client.execute_kw(
+                                'stock.move.line',
+                                'search_read',
+                                [[('picking_id', '=', transfer_id)]],
+                                {'fields': ['id', 'qty_done', 'quantity']}
+                            )
+                            
+                            # Mettre à jour qty_done = quantity pour toutes les lignes
+                            for line in move_lines:
+                                if line['qty_done'] == 0 and line['quantity'] > 0:
+                                    client.execute_kw(
+                                        'stock.move.line',
+                                        'write',
+                                        [[line['id']], {'qty_done': line['quantity']}]
+                                    )
+                            
+                            # Étape 3 : Valider le transfert
+                            # Essayer d'abord button_validate (méthode standard)
+                            try:
+                                client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                                success = True
+                                new_state = 'done'
+                            except Exception as validate_error:
+                                logger.warning(f"button_validate failed for {transfer_id}: {validate_error}")
+                                # Si button_validate échoue, utiliser action_done (plus direct)
+                                client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
+                                success = True
+                                new_state = 'done'
+                                
                         except Exception as e:
-                            # Si la validation échoue, essayer de forcer
-                            client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
-                            success = True
-                            new_state = 'done'
+                            if request.force:
+                                try:
+                                    # Forcer la completion avec action_done
+                                    client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
+                                    success = True
+                                    new_state = 'done'
+                                except Exception as force_error:
+                                    errors.append(f"{transfer_name}: Impossible de forcer la validation: {str(force_error)}")
+                            else:
+                                errors.append(f"{transfer_name}: Erreur validation: {str(e)}")
                     else:
-                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la validation")
+                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la validation (utilisez force=true)")
                 
                 elif request.action == "cancel":
                     # Annuler le transfert
