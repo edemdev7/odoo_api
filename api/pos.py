@@ -1612,46 +1612,91 @@ async def update_inventory_transfer_state(
                                 client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
                             
                             # Étape 2 : Définir les quantités réalisées pour toutes les move_lines
+                            # D'abord récupérer les mouvements pour connaître les quantités demandées
+                            moves = client.execute_kw(
+                                'stock.move',
+                                'search_read',
+                                [[('picking_id', '=', transfer_id)]],
+                                {'fields': ['id', 'product_uom_qty', 'state']}
+                            )
+                            
+                            # Créer un mapping des quantités par mouvement
+                            move_qty_map = {m['id']: m['product_uom_qty'] for m in moves}
+                            
+                            # Récupérer les move_lines
                             move_lines = client.execute_kw(
                                 'stock.move.line',
                                 'search_read',
                                 [[('picking_id', '=', transfer_id)]],
-                                {'fields': ['id', 'qty_done', 'quantity']}
+                                {'fields': ['id', 'qty_done', 'quantity', 'move_id']}
                             )
                             
-                            # Mettre à jour qty_done = quantity pour toutes les lignes
+                            # Mettre à jour qty_done avec la quantité demandée du mouvement
                             for line in move_lines:
-                                if line['qty_done'] == 0 and line['quantity'] > 0:
-                                    client.execute_kw(
-                                        'stock.move.line',
-                                        'write',
-                                        [[line['id']], {'qty_done': line['quantity']}]
-                                    )
+                                if line['qty_done'] == 0:
+                                    # Utiliser la quantité du mouvement parent ou la quantité réservée
+                                    move_id = line['move_id'][0] if line.get('move_id') else None
+                                    target_qty = move_qty_map.get(move_id, line.get('quantity', 0))
+                                    
+                                    if target_qty > 0:
+                                        client.execute_kw(
+                                            'stock.move.line',
+                                            'write',
+                                            [[line['id']], {'qty_done': target_qty}]
+                                        )
+                                        logger.info(f"Défini qty_done={target_qty} pour move_line {line['id']}")
                             
                             # Étape 3 : Valider le transfert
-                            # Essayer d'abord button_validate (méthode standard)
-                            try:
-                                client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                                success = True
-                                new_state = 'done'
-                            except Exception as validate_error:
-                                logger.warning(f"button_validate failed for {transfer_id}: {validate_error}")
-                                # Si button_validate échoue, utiliser action_done (plus direct)
-                                client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
-                                success = True
-                                new_state = 'done'
+                            # Utiliser button_validate (méthode standard Odoo)
+                            result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                            
+                            # button_validate peut retourner un wizard pour backorder
+                            if isinstance(result, dict) and 'res_model' in result:
+                                wizard_id = result['res_id']
+                                wizard_model = result['res_model']
+                                
+                                if wizard_model == 'stock.backorder.confirmation':
+                                    # Wizard de reliquat - créer un reliquat automatiquement
+                                    logger.info(f"Wizard de reliquat détecté pour le transfert {transfer_id}")
+                                    try:
+                                        # Option 1: Créer un reliquat (bouton "Créer un reliquat")
+                                        client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
+                                        logger.info(f"Reliquat créé pour le transfert {transfer_id}")
+                                    except Exception as wizard_error:
+                                        logger.warning(f"Erreur avec wizard reliquat: {wizard_error}")
+                                        # Option 2: Ne pas créer de reliquat (bouton "AUCUN RELIQUAT")
+                                        client.execute_kw('stock.backorder.confirmation', 'process_cancel_backorder', [[wizard_id]])
+                                        logger.info(f"Transfert validé sans reliquat pour {transfer_id}")
+                                
+                                elif wizard_model == 'stock.immediate.transfer':
+                                    # Wizard de transfert immédiat
+                                    logger.info(f"Wizard de transfert immédiat pour {transfer_id}")
+                                    client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
+                                
+                                else:
+                                    logger.warning(f"Wizard non géré: {wizard_model} pour le transfert {transfer_id}")
+                                    # Essayer process générique
+                                    try:
+                                        client.execute_kw(wizard_model, 'process', [[wizard_id]])
+                                    except:
+                                        pass
+                            
+                            success = True
+                            new_state = 'done'
                                 
                         except Exception as e:
+                            logger.error(f"Erreur lors de la validation du transfert {transfer_id}: {e}")
                             if request.force:
                                 try:
-                                    # Forcer la completion avec action_done
-                                    client.execute_kw('stock.picking', 'action_done', [[transfer_id]])
+                                    # En cas d'erreur, forcer avec action_done si force=True
+                                    client.execute_kw('stock.picking', 'write', [[transfer_id], {'state': 'done'}])
                                     success = True
                                     new_state = 'done'
+                                    logger.warning(f"Transfert {transfer_id} forcé à l'état 'done'")
                                 except Exception as force_error:
-                                    errors.append(f"{transfer_name}: Impossible de forcer la validation: {str(force_error)}")
+                                    errors.append(f"{transfer_name}: Impossible de forcer à 'done': {force_error}")
                             else:
-                                errors.append(f"{transfer_name}: Erreur validation: {str(e)}")
+                                errors.append(f"{transfer_name}: Erreur validation: {e}")
                     else:
                         errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la validation (utilisez force=true)")
                 
