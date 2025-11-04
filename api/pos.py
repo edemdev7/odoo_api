@@ -1139,12 +1139,35 @@ async def get_pos_inventory_transfers(
             except Exception as e:
                 logger.warning(f"Impossible de filtrer par société: {e}")
         
+        # **IMPORTANT:** Filtrer automatiquement par type de transfert en fonction de la base de données
+        # Si picking_type_code n'est pas explicitement fourni, utiliser celui de la DB
+        from core.security import get_odoo_config_from_user
+        
+        db_config = get_odoo_config_from_user(current_user)
+        if db_config and 'transfer_type_code' in db_config:
+            # Si le code n'est pas fourni dans la requête, utiliser celui de la DB
+            if not picking_type_code:
+                picking_type_code = db_config['transfer_type_code']
+                logger.info(f"Filtrage automatique par type de transfert de la DB: {picking_type_code}")
+            else:
+                # Si un code est fourni, vérifier qu'il correspond au type autorisé pour cette DB
+                if picking_type_code != db_config['transfer_type_code']:
+                    logger.warning(
+                        f"Type de transfert '{picking_type_code}' demandé ne correspond pas "
+                        f"au type autorisé '{db_config['transfer_type_code']}' pour cette base"
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Cette base de données ne gère que les transferts de type '{db_config['transfer_type_code']}'"
+                    )
+        
         # Ajouter les filtres optionnels
         if state:
             domain.append(('state', '=', state))
         
         if picking_type_code:
             domain.append(('picking_type_code', '=', picking_type_code))
+            logger.info(f"Filtrage par picking_type_code: {picking_type_code}")
         
         if partner_id:
             domain.append(('partner_id', '=', partner_id))

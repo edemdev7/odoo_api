@@ -17,13 +17,34 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 heures
 # Liste des tokens invalidés/révoqués
 REVOKED_TOKENS = set()
 
-# Configuration Odoo
-ODOO_CONFIG = {
-    "url": os.getenv("ODOO_URL", "https://erp.jnpgroupe.com"),
-    "db": os.getenv("ODOO_DB", "OMHI-TEST"),
-    "username": os.getenv("ODOO_USERNAME", "admin@jnpgroupe.com"),
-    "api_key": os.getenv("ODOO_API_KEY", "33e3aa2baad77fc78418d2747d6b0c5616d5dcb6")
+# Configuration Odoo - Multi-base de données
+# DB1: Base Test JNP Directe (Transferts internes)
+ODOO_DB1_CONFIG = {
+    "name": "jnp_directe",
+    "url": os.getenv("ODOO_DB1_URL", "https://sandbox-erp.dagbehamiithiel.com"),
+    "db": os.getenv("ODOO_DB1_NAME", "sandbox.dagbehamiithiel.com"),
+    "username": os.getenv("ODOO_DB1_USERNAME", "api@jnpgroupe.com"),
+    "api_key": os.getenv("ODOO_DB1_API_KEY", "863271b496f59c7bf01ff2e58995a311784ffc35"),
+    "transfer_type": "internal",  # Transferts internes
+    "transfer_type_code": "internal"
 }
+
+# DB2: Base Test Franchise (Transferts réceptions)
+ODOO_DB2_CONFIG = {
+    "name": "franchise",
+    "url": os.getenv("ODOO_DB2_URL", "https://sandbox.perfect-erp.com"),
+    "db": os.getenv("ODOO_DB2_NAME", "sandbox"),
+    "username": os.getenv("ODOO_DB2_USERNAME", "api-rest@odoo.com"),
+    "api_key": os.getenv("ODOO_DB2_API_KEY", "95ba6d2425dc735f3ad9c624e41a946a8a94ca42"),
+    "transfer_type": "reception",  # Transferts réceptions
+    "transfer_type_code": "incoming"
+}
+
+# Liste des configurations Odoo (ordre de priorité pour l'authentification)
+ODOO_DATABASES = [ODOO_DB1_CONFIG, ODOO_DB2_CONFIG]
+
+# Configuration par défaut (pour compatibilité avec l'ancien code)
+ODOO_CONFIG = ODOO_DB1_CONFIG
 
 # Utilisateurs API (en production, utilisez une vraie base de données)
 API_USERS = {

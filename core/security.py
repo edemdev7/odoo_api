@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
 
-from core.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, ODOO_CONFIG, logger, REVOKED_TOKENS
+from core.config import (
+    SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, 
+    ODOO_CONFIG, ODOO_DATABASES, logger, REVOKED_TOKENS
+)
 
 # Classes de sécurité
 security = HTTPBearer()
@@ -35,7 +38,15 @@ def authenticate_user(username: str, password: str):
         logger.error(f"Erreur lors de l'authentification de l'utilisateur {username}: {e}")
         return False
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def create_access_token(data: dict, expires_delta: timedelta = None, odoo_db_name: str = None):
+    """
+    Crée un token JWT avec les données utilisateur et l'information de la base de données Odoo
+    
+    Args:
+        data: Données à encoder dans le token
+        expires_delta: Durée de validité du token
+        odoo_db_name: Nom de la base de données Odoo (jnp_directe ou franchise)
+    """
     try:
         to_encode = data.copy()
         if expires_delta:
@@ -44,6 +55,11 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
             expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         
         to_encode.update({"exp": expire})
+        
+        # Ajouter l'information de la base de données Odoo si fournie
+        if odoo_db_name:
+            to_encode.update({"odoo_db": odoo_db_name})
+        
         encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
         return encoded_jwt
     except Exception as e:
@@ -185,3 +201,31 @@ def require_scope(required_scope: str):
         logger.debug(f"Accès autorisé: {user_id} a accédé à {required_scope}")
         return current_user
     return scope_checker
+
+def get_odoo_config_from_user(current_user: dict) -> dict:
+    """
+    Récupère la configuration Odoo appropriée selon la base de données de l'utilisateur
+    
+    Args:
+        current_user: Dictionnaire contenant les informations de l'utilisateur (du token JWT)
+        
+    Returns:
+        dict: Configuration Odoo correspondante
+    """
+    # Récupérer le nom de la DB depuis les infos utilisateur
+    odoo_db_name = current_user.get("odoo_db")
+    
+    # Si pas d'info de DB, utiliser la config par défaut
+    if not odoo_db_name:
+        logger.warning("Aucune information de base de données dans le token, utilisation de la config par défaut")
+        return ODOO_CONFIG
+    
+    # Trouver la configuration correspondante
+    for db_config in ODOO_DATABASES:
+        if db_config["name"] == odoo_db_name:
+            logger.debug(f"Configuration Odoo trouvée: {db_config['name']} ({db_config['url']})")
+            return db_config
+    
+    # Si la DB n'est pas trouvée, utiliser la config par défaut
+    logger.warning(f"Base de données '{odoo_db_name}' non trouvée, utilisation de la config par défaut")
+    return ODOO_CONFIG

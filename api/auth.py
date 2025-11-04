@@ -184,7 +184,7 @@ async def login(user_data: UserLogin):
             detail="Erreur lors de la connexion",
         )
 
-@router.post("/pin-login", response_model=Token, summary="Authentification par PIN et matricule")
+@router.post("/pin-login", response_model=Token, summary="Authentification par PIN et matricule (Multi-DB)")
 async def pin_login(login_data: PinLogin):
     """
     **Connexion avec matricule et PIN pour les utilisateurs de point de vente/stock**
@@ -192,11 +192,16 @@ async def pin_login(login_data: PinLogin):
     Cette route permet à un employé de s'authentifier avec son matricule et son code PIN,
     principalement pour les opérations de point de vente et gestion de stock.
     
+    **Authentification en cascade** : Essaie d'abord sur la base JNP Directe, puis sur la base Franchise.
+    
     - **matricule**: Matricule de l'employé (champ x_studio_matricule dans Odoo)
     - **pin**: Code PIN de l'employé (utilisé pour le point de vente)
     
     **Retourne** un token JWT avec une durée de validité de 30 minutes et des droits limités aux opérations POS.
     """
+    from core.config import ODOO_DATABASES
+    from core.odoo_client import OdooClient
+    
     try:
         # Valider les données d'entrée
         if not login_data.matricule or not login_data.pin:
@@ -206,107 +211,133 @@ async def pin_login(login_data: PinLogin):
                 detail="Le matricule et le PIN sont requis",
             )
         
-        # Rechercher l'employé dans Odoo en utilisant le matricule et le PIN
-        try:
-            domain = [
-                ('x_studio_matricule', '=', login_data.matricule),
-                ('pin', '=', login_data.pin),
-                ('active', '=', True)
-            ]
+        # Critères de recherche de l'employé
+        domain = [
+            ('x_studio_matricule', '=', login_data.matricule),
+            ('pin', '=', login_data.pin),
+            ('active', '=', True)
+        ]
+        
+        employee = None
+        authenticated_db_config = None
+        odoo_client_used = None
+        
+        # Essayer l'authentification sur chaque base de données dans l'ordre
+        for db_config in ODOO_DATABASES:
+            logger.info(f"Tentative d'authentification sur {db_config['name']} ({db_config['url']})")
             
-            # Utiliser le client Odoo par défaut pour la recherche
-            employee = default_odoo_client.execute_kw(
-                'hr.employee', 
-                'search_read', 
-                [domain], 
-                {'fields': ['id', 'name', 'work_email', 'job_id', 'department_id'], 'limit': 1}
-            )
-            
-            if not employee:
-                logger.warning(f"Aucun employé trouvé avec matricule={login_data.matricule} et PIN fourni")
-                raise HTTPException(
-                    status_code=401,
-                    detail="Matricule ou PIN incorrect",
-                )
-            
-            employee = employee[0]
-            logger.info(f"Employé trouvé: {employee['name']}")
-            
-            # Créer un utilisateur virtuel avec des droits limités pour le POS/stock
-            virtual_user = {
-                "username": f"employee_{employee['id']}",
-                "is_active": True,
-                "scopes": ["read", "pos"],  # Limiter aux opérations POS/stock
-                "employee_id": employee['id'],
-                "employee_name": employee['name'],
-                "employee_matricule": login_data.matricule
-            }
-            
-            # Générer le token JWT
-            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-            token_data = {
-                "sub": virtual_user["username"],
-                "scopes": virtual_user["scopes"],
-                "iat": datetime.utcnow(),
-                "employee_id": employee['id'],
-                "employee_name": employee['name'],
-                "employee_matricule": login_data.matricule
-            }
-            
-            access_token = create_access_token(
-                data=token_data,
-                expires_delta=access_token_expires
-            )
-            
-            # Créer les données utilisateur pour l'employé
-            user_data = {
-                "username": virtual_user["username"],
-                "fullname": employee['name'],
-                "email": employee.get('work_email'),
-                "scopes": virtual_user["scopes"],
-                "is_active": True,
-                "phone": None,
-                "image_url": None,
-                "additional_info": {
-                    "employee_id": employee['id'],
-                    "matricule": login_data.matricule,
-                    "job": employee.get('job_id')[1] if employee.get('job_id') else None,
-                    "department": employee.get('department_id')[1] if employee.get('department_id') else None
-                }
-            }
-            
-            # Essayer de récupérer plus d'informations sur l'employé
             try:
-                employee_details = default_odoo_client.execute_kw(
+                # Créer un client Odoo pour cette base de données avec custom_config
+                temp_client = OdooClient(custom_config={
+                    'url': db_config['url'],
+                    'db': db_config['db'],
+                    'username': db_config['username'],
+                    'api_key': db_config['api_key']
+                })
+                
+                # Rechercher l'employé dans cette base
+                employees = temp_client.execute_kw(
                     'hr.employee', 
-                    'read', 
-                    [employee['id']], 
-                    {'fields': ['mobile_phone', 'work_phone', 'image_1920']}
+                    'search_read', 
+                    [domain], 
+                    {'fields': ['id', 'name', 'work_email', 'job_id', 'department_id'], 'limit': 1}
                 )
                 
-                if employee_details:
-                    user_data["phone"] = employee_details[0].get('mobile_phone') or employee_details[0].get('work_phone')
+                if employees and len(employees) > 0:
+                    employee = employees[0]
+                    authenticated_db_config = db_config
+                    odoo_client_used = temp_client
+                    logger.info(f"✅ Employé trouvé sur {db_config['name']}: {employee['name']}")
+                    break  # Arrêter la recherche, employé trouvé
+                else:
+                    logger.debug(f"Employé non trouvé sur {db_config['name']}")
                     
-                    # Si l'image est disponible, créer une URL
-                    if employee_details[0].get('image_1920'):
-                        user_data["image_url"] = f"/api/employees/{employee['id']}/image"
             except Exception as e:
-                logger.warning(f"Impossible de récupérer les détails supplémentaires de l'employé: {e}")
-            
-            logger.info(f"Connexion par PIN réussie pour l'employé: {employee['name']}")
-            return {
-                "access_token": access_token,
-                "token_type": "bearer",
-                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-                "user_data": user_data
-            }
-            
-        except Exception as e:
-            logger.error(f"Erreur lors de la vérification de l'employé: {e}")
+                logger.warning(f"Erreur lors de la recherche sur {db_config['name']}: {e}")
+                continue
+        
+        # Si l'employé n'a été trouvé sur aucune base
+        if not employee or not authenticated_db_config:
+            logger.warning(f"Aucun employé trouvé avec matricule={login_data.matricule} sur aucune base de données")
             raise HTTPException(
-                status_code=500,
-                detail="Erreur lors de la vérification des informations d'employé",
+                status_code=401,
+                detail="Matricule ou PIN incorrect",
             )
+        
+        logger.info(f"Authentification réussie sur {authenticated_db_config['name']}: {employee['name']}")
+        
+        # Créer un utilisateur virtuel avec des droits limités pour le POS/stock
+        virtual_user = {
+            "username": f"employee_{employee['id']}",
+            "is_active": True,
+            "scopes": ["read", "pos"],  # Limiter aux opérations POS/stock
+            "employee_id": employee['id'],
+            "employee_name": employee['name'],
+            "employee_matricule": login_data.matricule,
+            "odoo_db": authenticated_db_config['name']  # Ajouter le nom de la DB
+        }
+        
+        # Générer le token JWT avec le nom de la base de données
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        token_data = {
+            "sub": virtual_user["username"],
+            "scopes": virtual_user["scopes"],
+            "iat": datetime.utcnow(),
+            "employee_id": employee['id'],
+            "employee_name": employee['name'],
+            "employee_matricule": login_data.matricule,
+            "odoo_db": authenticated_db_config['name']  # Important: inclure le nom de la DB
+        }
+        
+        access_token = create_access_token(
+            data=token_data,
+            expires_delta=access_token_expires,
+            odoo_db_name=authenticated_db_config['name']  # Passer le nom de la DB
+        )
+        
+        # Créer les données utilisateur pour l'employé
+        user_data = {
+            "username": virtual_user["username"],
+            "fullname": employee['name'],
+            "email": employee.get('work_email'),
+            "scopes": virtual_user["scopes"],
+            "is_active": True,
+            "phone": None,
+            "image_url": None,
+            "additional_info": {
+                "employee_id": employee['id'],
+                "matricule": login_data.matricule,
+                "job": employee.get('job_id')[1] if employee.get('job_id') else None,
+                "department": employee.get('department_id')[1] if employee.get('department_id') else None,
+                "odoo_database": authenticated_db_config['name']  # Inclure le nom de la DB dans les infos
+            }
+        }
+        
+        # Essayer de récupérer plus d'informations sur l'employé
+        try:
+            employee_details = odoo_client_used.execute_kw(
+                'hr.employee', 
+                'read', 
+                [employee['id']], 
+                {'fields': ['mobile_phone', 'work_phone', 'image_1920']}
+            )
+            
+            if employee_details:
+                user_data["phone"] = employee_details[0].get('mobile_phone') or employee_details[0].get('work_phone')
+                
+                # Si l'image est disponible, créer une URL
+                if employee_details[0].get('image_1920'):
+                    user_data["image_url"] = f"/api/employees/{employee['id']}/image"
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer les détails supplémentaires de l'employé: {e}")
+        
+        logger.info(f"Connexion par PIN réussie pour l'employé: {employee['name']} sur {authenticated_db_config['name']}")
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            "user_data": user_data
+        }
             
     except HTTPException:
         raise

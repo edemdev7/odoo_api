@@ -98,17 +98,34 @@ default_odoo_client = OdooClient()
 # Fonction pour obtenir le client Odoo approprié pour l'utilisateur
 def get_odoo_client(user=None):
     """
-    Renvoie le client Odoo approprié en fonction de l'utilisateur
-    :param user: Utilisateur authentifié (avec éventuellement une config Odoo personnalisée)
-    :return: Instance de OdooClient
+    Renvoie le client Odoo approprié en fonction de l'utilisateur et de sa base de données authentifiée
+    
+    :param user: Utilisateur authentifié (avec odoo_db dans le token JWT)
+    :return: Instance de OdooClient configurée pour la bonne base de données
     """
-    if user and "odoo_config" in user:
+    from core.security import get_odoo_config_from_user
+    
+    if user:
         try:
-            # Créer un client Odoo avec les paramètres personnalisés
-            return OdooClient(custom_config=user["odoo_config"])
+            # Récupérer la configuration de la base de données depuis le token de l'utilisateur
+            db_config = get_odoo_config_from_user(user)
+            
+            if db_config:
+                # Créer un client Odoo avec la configuration de la base authentifiée
+                logger.debug(f"Création du client Odoo pour la base: {db_config['name']}")
+                return OdooClient(custom_config={
+                    'url': db_config['url'],
+                    'db': db_config['db'],
+                    'username': db_config['username'],
+                    'api_key': db_config['api_key']
+                })
+            else:
+                logger.warning(f"Configuration Odoo non trouvée pour l'utilisateur, utilisation de la base par défaut")
+                
         except Exception as e:
-            logger.error(f"Erreur lors de la création du client Odoo personnalisé: {e}")
+            logger.error(f"Erreur lors de la création du client Odoo pour l'utilisateur: {e}")
             # En cas d'erreur, utiliser le client par défaut
     
-    # Utiliser le client par défaut
+    # Utiliser le client par défaut si pas d'utilisateur ou erreur
+    logger.debug("Utilisation du client Odoo par défaut")
     return default_odoo_client
