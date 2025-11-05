@@ -23,6 +23,189 @@ from core.pump_manager import pump_manager
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
 
+# ===== LISTE DES POINTS DE VENTE =====
+
+@router.get("/list", response_model=ApiResponse, summary="Lister tous les points de vente")
+async def list_all_pos_configs(
+    active_only: bool = True,
+    limit: Optional[int] = None,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Lister tous les points de vente (POS) disponibles dans la base de données authentifiée
+    
+    Cette route retourne les configurations de points de vente accessibles pour l'employé connecté.
+    Par défaut, filtre uniquement les POS actifs de la société de l'employé.
+    
+    **Informations retournées pour chaque POS :**
+    - **id** : Identifiant unique du POS
+    - **name** : Nom du point de vente
+    - **company_id** : Société associée
+    - **warehouse_id** : Entrepôt associé
+    - **picking_type_id** : Type d'opération de stock
+    - **session_state** : État de la session en cours (opened/closed/opening_control/closing_control)
+    - **current_session_id** : ID de la session active (si existante)
+    - **pricelist_id** : Liste de prix par défaut
+    - **currency_id** : Devise utilisée
+    - **iface_tax_included** : Prix TTC affichés
+    - **cash_control** : Contrôle de caisse activé
+    
+    **Utilité :**
+    - Connaître les POS ID disponibles pour vos requêtes API
+    - Vérifier l'état des sessions
+    - Identifier les configurations actives
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        from core.security import get_odoo_config_from_user
+        
+        client = get_odoo_client(current_user)
+        
+        # Récupérer la configuration de la base authentifiée
+        db_config = get_odoo_config_from_user(current_user)
+        db_name = db_config['name'] if db_config else "Base par défaut"
+        
+        # Construire le domaine de recherche
+        domain = []
+        
+        # Filtrer par statut actif si demandé
+        if active_only:
+            domain.append(('active', '=', True))
+        
+        # Récupérer la société de l'employé pour filtrer
+        employee_id = current_user.get('employee_id')
+        
+        if employee_id:
+            try:
+                # Récupérer la société de l'employé connecté
+                employee = client.execute_kw(
+                    'hr.employee',
+                    'read',
+                    [employee_id],
+                    {'fields': ['company_id']}
+                )
+                
+                if employee and employee[0].get('company_id'):
+                    company_id = employee[0]['company_id'][0] if isinstance(employee[0]['company_id'], list) else employee[0]['company_id']
+                    domain.append(('company_id', '=', company_id))
+                    logger.info(f"Filtrage des POS par société ID {company_id} de l'employé {employee_id}")
+            except Exception as e:
+                logger.warning(f"Impossible de filtrer par société de l'employé: {e}")
+        
+        # Paramètres de recherche
+        search_params = {
+            'fields': [
+                'id', 'name', 'company_id', 'warehouse_id', 
+                'picking_type_id', 'current_session_id',
+                'pricelist_id', 'currency_id', 'iface_tax_included',
+                'cash_control', 'module_pos_hr', 'active'
+            ],
+            'order': 'id asc'
+        }
+        
+        if limit:
+            search_params['limit'] = limit
+        
+        logger.info(f"Recherche POS avec domaine: {domain}")
+        
+        # Rechercher les POS configs avec les filtres
+        pos_configs = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [domain],
+            search_params
+        )
+        
+        if not pos_configs:
+            logger.warning(f"Aucun point de vente trouvé dans la base {db_name}")
+            return {
+                "success": True,
+                "message": f"Aucun point de vente trouvé dans la base de données {db_name}",
+                "data": [],
+                "metadata": {
+                    "database": db_name,
+                    "total_count": 0
+                }
+            }
+        
+        # Enrichir les données avec des informations supplémentaires
+        enriched_pos = []
+        for pos in pos_configs:
+            # Déterminer l'état de la session
+            current_session_id = pos['current_session_id'][0] if isinstance(pos['current_session_id'], list) else pos.get('current_session_id')
+            session_state = 'closed'
+            
+            # Si une session existe, récupérer son état
+            if current_session_id:
+                try:
+                    session = client.execute_kw(
+                        'pos.session',
+                        'read',
+                        [current_session_id],
+                        {'fields': ['state']}
+                    )
+                    if session and len(session) > 0:
+                        session_state = session[0].get('state', 'closed')
+                except:
+                    session_state = 'opened'  # Assumer que la session est ouverte si l'ID existe
+            
+            pos_data = {
+                "id": pos['id'],
+                "name": pos['name'],
+                "active": pos.get('active', True),
+                "company": {
+                    "id": pos['company_id'][0] if isinstance(pos['company_id'], list) else pos['company_id'],
+                    "name": pos['company_id'][1] if isinstance(pos['company_id'], list) and len(pos['company_id']) > 1 else "N/A"
+                } if pos.get('company_id') else None,
+                "warehouse": {
+                    "id": pos['warehouse_id'][0] if isinstance(pos['warehouse_id'], list) else pos['warehouse_id'],
+                    "name": pos['warehouse_id'][1] if isinstance(pos['warehouse_id'], list) and len(pos['warehouse_id']) > 1 else "N/A"
+                } if pos.get('warehouse_id') else None,
+                "picking_type": {
+                    "id": pos['picking_type_id'][0] if isinstance(pos['picking_type_id'], list) else pos['picking_type_id'],
+                    "name": pos['picking_type_id'][1] if isinstance(pos['picking_type_id'], list) and len(pos['picking_type_id']) > 1 else "N/A"
+                } if pos.get('picking_type_id') else None,
+                "session_state": session_state,
+                "current_session_id": current_session_id,
+                "pricelist": {
+                    "id": pos['pricelist_id'][0] if isinstance(pos['pricelist_id'], list) else pos['pricelist_id'],
+                    "name": pos['pricelist_id'][1] if isinstance(pos['pricelist_id'], list) and len(pos['pricelist_id']) > 1 else "N/A"
+                } if pos.get('pricelist_id') else None,
+                "currency": {
+                    "id": pos['currency_id'][0] if isinstance(pos['currency_id'], list) else pos['currency_id'],
+                    "name": pos['currency_id'][1] if isinstance(pos['currency_id'], list) and len(pos['currency_id']) > 1 else "N/A"
+                } if pos.get('currency_id') else None,
+                "settings": {
+                    "tax_included": pos.get('iface_tax_included', False),
+                    "cash_control": pos.get('cash_control', False),
+                    "employee_login": pos.get('module_pos_hr', False)
+                }
+            }
+            
+            enriched_pos.append(pos_data)
+        
+        logger.info(f"{len(pos_configs)} point(s) de vente trouvé(s) dans la base {db_name}")
+        
+        return {
+            "success": True,
+            "message": f"{len(pos_configs)} point(s) de vente trouvé(s)",
+            "data": enriched_pos,
+            "metadata": {
+                "database": db_name,
+                "total_count": len(pos_configs),
+                "active_count": sum(1 for p in pos_configs if p.get('active', True)),
+                "with_open_session": sum(1 for p in enriched_pos if p.get('session_state') == 'opened')
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des points de vente: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des points de vente: {str(e)}"
+        )
+
 # ===== GESTION ADMINISTRATIVE DES PDV =====
 
 @router.post("/create", response_model=ApiResponse)
