@@ -2914,7 +2914,10 @@ async def close_pos_session(
                     )
                     
                     if not success:
-                        update_errors.append(f"Erreur mise à jour pompe {pump_id}")
+                        error_msg = f"Pompe '{pump_id}' non trouvée pour session {session_id}. "
+                        error_msg += "Assurez-vous que la pompe a été enregistrée lors de l'ouverture de la session."
+                        update_errors.append(error_msg)
+                        logger.error(error_msg)
                 
                 if update_errors:
                     logger.error(f"Erreurs lors de la mise à jour des pompes: {update_errors}")
