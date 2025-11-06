@@ -463,6 +463,10 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
     """
     # Vérifier si c'est un employé authentifié par PIN (username commence par "employee_")
     if current_user.get("username", "").startswith("employee_"):
+        # Récupérer le client Odoo approprié pour la base de l'utilisateur
+        from core.odoo_client import get_odoo_client
+        client = get_odoo_client(current_user)
+        
         # Récupérer des données supplémentaires de l'employé
         try:
             employee_id = current_user.get("employee_id")
@@ -474,7 +478,7 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                     pass
             
             if employee_id:
-                employee_details = default_odoo_client.execute_kw(
+                employee_details = client.execute_kw(
                     'hr.employee', 
                     'read', 
                     [employee_id], 
@@ -506,7 +510,7 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                         
                         # Récupérer des détails supplémentaires de la compagnie
                         try:
-                            company_details = default_odoo_client.execute_kw(
+                            company_details = client.execute_kw(
                                 'res.company',
                                 'read',
                                 [company_id],
@@ -545,7 +549,8 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
                             "matricule": current_user.get("employee_matricule"),
                             "job": job_info,
                             "department": dept_info,
-                            "company": company_info
+                            "company": company_info,
+                            "odoo_database": current_user.get("odoo_db")
                         }
                     )
         except Exception as e:
