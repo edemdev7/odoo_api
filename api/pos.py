@@ -23,6 +23,47 @@ from core.pump_manager import pump_manager
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
 
+# ===== HELPER FUNCTIONS =====
+
+def verify_manager_role(current_user: dict, client) -> bool:
+    """
+    Vérifie si l'utilisateur actuel est un gérant
+    
+    Args:
+        current_user: Données de l'utilisateur depuis le token JWT
+        client: Client Odoo pour les requêtes
+        
+    Returns:
+        bool: True si gérant, False sinon
+    """
+    is_manager = False
+    
+    if current_user.get("auth_type") == "pin":
+        # Vérifier d'abord dans les additional_info
+        additional_info = current_user.get("additional_info", {})
+        job_title = additional_info.get("job", "").lower() if additional_info.get("job") else ""
+        
+        logger.debug(f"Vérification gérant pour {current_user.get('username')}: job={job_title}")
+        is_manager = 'gérant' in job_title or 'manager' in job_title or 'chef' in job_title or 'responsable' in job_title
+        
+        # Si pas trouvé dans additional_info, chercher dans Odoo
+        if not is_manager and current_user.get("employee_id"):
+            try:
+                employee_data = client.execute_kw(
+                    'hr.employee',
+                    'read',
+                    [current_user["employee_id"]],
+                    {'fields': ['job_id']}
+                )
+                if employee_data and employee_data[0].get('job_id'):
+                    job_name = employee_data[0]['job_id'][1].lower()
+                    logger.debug(f"Job depuis Odoo: {job_name}")
+                    is_manager = any(keyword in job_name for keyword in ['gérant', 'manager', 'chef', 'responsable'])
+            except Exception as e:
+                logger.warning(f"Erreur lors de la récupération du job depuis Odoo: {e}")
+    
+    return is_manager
+
 # ===== LISTE DES POINTS DE VENTE =====
 
 @router.get("/list", response_model=ApiResponse, summary="Lister tous les points de vente")
@@ -214,7 +255,7 @@ async def create_pos_config(
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Créer un nouveau point de vente (PDV)
+    Créer un nouveau point de vente (PDV) - Gérants uniquement
     
     Cette route permet de créer une nouvelle configuration de point de vente dans Odoo.
     
@@ -231,10 +272,17 @@ async def create_pos_config(
     - **cash_control** : Contrôle de caisse avancé (défaut: True)
     - **module_pos_hr** : Connexion par employés (défaut: True)
     
-    **Requires:** Authentification JWT avec scope 'pos'
+    **Requires:** Authentification JWT avec scope 'pos' + Profil gérant
     """
     try:
         client = get_odoo_client(current_user)
+        
+        # Vérifier si l'utilisateur est gérant
+        if not verify_manager_role(current_user, client):
+            raise HTTPException(
+                status_code=403,
+                detail="Seuls les gérants peuvent créer un point de vente"
+            )
         
         # Vérifier que le nom n'existe pas déjà
         existing_pos = client.execute_kw(
@@ -332,6 +380,234 @@ async def create_pos_config(
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la création du PDV: {str(e)}"
+        )
+
+@router.put("/{pos_id}", response_model=ApiResponse, summary="Modifier un point de vente")
+async def update_pos_config(
+    pos_id: int = Path(..., description="ID du point de vente à modifier"),
+    config_data: PosCreateRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Modifier les informations d'un point de vente - Gérants uniquement
+    
+    Cette route permet de mettre à jour la configuration d'un point de vente existant.
+    
+    **Paramètres modifiables :**
+    - **name** : Nom du point de vente
+    - **company_id** : ID de la société
+    - **picking_type_id** : Type d'opération pour les livraisons
+    - **journal_id** : Journal comptable
+    - **currency_id** : Devise du PDV
+    - **pricelist_id** : Liste de prix
+    - **receipt_header/footer** : Personnalisation des reçus
+    - **cash_control** : Contrôle de caisse
+    - **module_pos_hr** : Connexion par employés
+    
+    **Requires:** Authentification JWT avec scope 'pos' + Profil gérant
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier si l'utilisateur est gérant
+        if not verify_manager_role(current_user, client):
+            raise HTTPException(
+                status_code=403,
+                detail="Seuls les gérants peuvent modifier un point de vente"
+            )
+        
+        # Vérifier que le PDV existe
+        existing_pos = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        
+        if not existing_pos:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        # Vérifier que le nouveau nom n'est pas déjà utilisé par un autre PDV
+        if config_data.name != existing_pos[0]['name']:
+            name_conflict = client.execute_kw(
+                'pos.config',
+                'search',
+                [[('name', '=', config_data.name), ('id', '!=', pos_id)]]
+            )
+            
+            if name_conflict:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Un PDV avec le nom '{config_data.name}' existe déjà"
+                )
+        
+        # Préparer les données de mise à jour
+        update_vals = {
+            'name': config_data.name,
+            'iface_tax_included': config_data.iface_tax_included,
+            'cash_control': config_data.cash_control,
+            'module_pos_hr': config_data.module_pos_hr,
+        }
+        
+        # Ajouter les champs optionnels s'ils sont fournis
+        if config_data.company_id:
+            update_vals['company_id'] = config_data.company_id
+        
+        if config_data.picking_type_id:
+            update_vals['picking_type_id'] = config_data.picking_type_id
+        
+        if config_data.journal_id:
+            update_vals['journal_id'] = config_data.journal_id
+        
+        if config_data.currency_id:
+            update_vals['currency_id'] = config_data.currency_id
+        
+        if config_data.pricelist_id:
+            update_vals['pricelist_id'] = config_data.pricelist_id
+        
+        if config_data.receipt_header:
+            update_vals['receipt_header'] = config_data.receipt_header
+        
+        if config_data.receipt_footer:
+            update_vals['receipt_footer'] = config_data.receipt_footer
+        
+        # Mettre à jour le PDV
+        client.execute_kw('pos.config', 'write', [[pos_id], update_vals])
+        
+        # Récupérer les informations mises à jour
+        updated_pos = client.execute_kw(
+            'pos.config',
+            'read',
+            [pos_id],
+            {'fields': ['id', 'name', 'company_id', 'active']}
+        )[0]
+        
+        logger.info(f"PDV modifié avec succès: {config_data.name} (ID: {pos_id})")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'name': updated_pos['name'],
+                'company_id': updated_pos.get('company_id'),
+                'active': updated_pos.get('active', True),
+                'updated': True
+            },
+            message=f"Point de vente '{config_data.name}' modifié avec succès"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la modification du PDV: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la modification du PDV: {str(e)}"
+        )
+
+@router.delete("/{pos_id}", response_model=ApiResponse, summary="Supprimer un point de vente")
+async def delete_pos_config(
+    pos_id: int = Path(..., description="ID du point de vente à supprimer"),
+    force: bool = False,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Supprimer (archiver) un point de vente - Gérants uniquement
+    
+    Cette route permet d'archiver un point de vente (désactivation).
+    Par défaut, le PDV est seulement désactivé (archive) pour préserver l'historique.
+    
+    **Paramètres :**
+    - **force** : Si True, supprime définitivement le PDV (⚠️ DANGER : perte de données)
+    
+    **Sécurité :**
+    - Impossible de supprimer un PDV avec une session active
+    - La suppression force n'est autorisée que si aucune session n'existe
+    
+    **Requires:** Authentification JWT avec scope 'pos' + Profil gérant
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier si l'utilisateur est gérant
+        if not verify_manager_role(current_user, client):
+            raise HTTPException(
+                status_code=403,
+                detail="Seuls les gérants peuvent supprimer un point de vente"
+            )
+        
+        # Vérifier que le PDV existe
+        pos_config = client.execute_kw(
+            'pos.config',
+            'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'current_session_id'], 'limit': 1}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        pos_name = pos_config['name']
+        
+        # Vérifier s'il y a une session active
+        if pos_config.get('current_session_id'):
+            raise HTTPException(
+                status_code=400,
+                detail="Impossible de supprimer un PDV avec une session active. Fermez d'abord la session."
+            )
+        
+        if force:
+            # Vérifier s'il existe des sessions (même fermées)
+            existing_sessions = client.execute_kw(
+                'pos.session',
+                'search_count',
+                [[('config_id', '=', pos_id)]]
+            )
+            
+            if existing_sessions > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Impossible de supprimer définitivement : {existing_sessions} session(s) existent. Utilisez l'archivage (force=false) à la place."
+                )
+            
+            # Suppression définitive
+            client.execute_kw('pos.config', 'unlink', [[pos_id]])
+            
+            logger.warning(f"PDV SUPPRIMÉ DÉFINITIVEMENT: {pos_name} (ID: {pos_id})")
+            
+            return ApiResponse(
+                success=True,
+                data={
+                    'pos_id': pos_id,
+                    'deleted': True,
+                    'permanently': True
+                },
+                message=f"Point de vente '{pos_name}' supprimé définitivement"
+            )
+        else:
+            # Archivage (désactivation)
+            client.execute_kw('pos.config', 'write', [[pos_id], {'active': False}])
+            
+            logger.info(f"PDV archivé: {pos_name} (ID: {pos_id})")
+            
+            return ApiResponse(
+                success=True,
+                data={
+                    'pos_id': pos_id,
+                    'archived': True,
+                    'permanently': False
+                },
+                message=f"Point de vente '{pos_name}' archivé avec succès"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la suppression du PDV: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la suppression du PDV: {str(e)}"
         )
 
 @router.post("/{pos_id}/assign-employees", response_model=ApiResponse)
@@ -2839,35 +3115,7 @@ async def close_pos_session(
         logger.info(f"Mode de fermeture: {'Station-Service' if is_station_mode else 'Standard'}")
         
         # Vérifier si l'employé est gérant
-        is_manager = False
-        
-        if current_user.get("auth_type") == "pin":
-            # Vérifier d'abord dans les additional_info
-            additional_info = current_user.get("additional_info", {})
-            job_title = additional_info.get("job", "").lower() if additional_info.get("job") else ""
-            
-            logger.info(f"Vérification gérant pour fermeture {current_user.get('username')}: job={job_title}")
-            is_manager = 'gérant' in job_title or 'manager' in job_title or 'chef' in job_title or 'responsable' in job_title
-            
-            # Si pas trouvé dans additional_info, chercher dans Odoo
-            if not is_manager and current_user.get("employee_id"):
-                try:
-                    employee_data = client.execute_kw(
-                        'hr.employee',
-                        'read',
-                        [current_user["employee_id"]],
-                        {'fields': ['job_id']}
-                    )
-                    if employee_data and employee_data[0].get('job_id'):
-                        job_name = employee_data[0]['job_id'][1].lower()
-                        logger.info(f"Job depuis Odoo pour fermeture: {job_name}")
-                        is_manager = any(keyword in job_name for keyword in ['gérant', 'manager', 'chef', 'responsable'])
-                except Exception as e:
-                    logger.warning(f"Erreur lors de la récupération du job depuis Odoo: {e}")
-        
-        logger.info(f"Résultat vérification gérant pour fermeture: is_manager={is_manager}")
-        
-        if not is_manager:
+        if not verify_manager_role(current_user, client):
             raise HTTPException(status_code=403, detail="Seuls les gérants peuvent fermer une session")
         
         # Récupérer la session active du PDV
