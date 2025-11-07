@@ -1660,10 +1660,6 @@ async def get_pos_inventory_transfers(
             'move_ids_without_package', 'move_line_ids', 'move_line_ids_without_package',
             'move_line_exist', 'show_operations', 'show_reserved',
             
-            # Informations de livraison et transport
-            'carrier_id', 'carrier_tracking_ref', 'delivery_type',
-            'weight', 'carrier_price', 'shipping_weight', 'weight_bulk',
-            
             # Informations warehouse et stock
             'picking_type_entire_packs', 'use_create_lots', 'use_existing_lots',
             'printed', 'show_lots_text', 'has_tracking', 'owner_id',
@@ -1780,29 +1776,6 @@ async def get_pos_inventory_transfers(
             else:
                 transfer['move_line_details'] = []
             
-            # Ajouter des informations sur le transporteur
-            if transfer.get('carrier_id'):
-                try:
-                    carrier_info = client.execute_kw(
-                        'delivery.carrier',
-                        'read',
-                        [transfer['carrier_id'][0]],
-                        {
-                            'fields': [
-                                'id', 'name', 'delivery_type', 'product_id', 'website_url',
-                                'country_ids', 'state_ids', 'zip_from', 'zip_to',
-                                'margin', 'free_over', 'amount', 'fixed_price',
-                                'active', 'sequence', 'company_id'
-                            ]
-                        }
-                    )
-                    transfer['carrier_details'] = carrier_info[0] if carrier_info else {}
-                except Exception as e:
-                    logger.warning(f"Erreur récupération transporteur pour transfert {transfer['id']}: {e}")
-                    transfer['carrier_details'] = {}
-            else:
-                transfer['carrier_details'] = {}
-            
             # Ajouter des informations sur le type de picking avec plus de détails
             if transfer.get('picking_type_id'):
                 try:
@@ -1878,15 +1851,6 @@ async def get_pos_inventory_transfers(
                     'move_line_exist': clean_odoo_value(transfer.get('move_line_exist')),
                     'show_operations': clean_odoo_value(transfer.get('show_operations')),
                     'show_reserved': clean_odoo_value(transfer.get('show_reserved')),
-                    
-                    # Informations de livraison et transport
-                    'carrier_id': clean_odoo_value(transfer.get('carrier_id')),
-                    'carrier_tracking_ref': clean_odoo_value(transfer.get('carrier_tracking_ref')),
-                    'delivery_type': clean_odoo_value(transfer.get('delivery_type')),
-                    'weight': clean_odoo_value(transfer.get('weight')),
-                    'carrier_price': clean_odoo_value(transfer.get('carrier_price')),
-                    'shipping_weight': clean_odoo_value(transfer.get('shipping_weight')),
-                    'weight_bulk': clean_odoo_value(transfer.get('weight_bulk')),
                     
                     # Informations warehouse et stock
                     'picking_type_entire_packs': clean_odoo_value(transfer.get('picking_type_entire_packs')),
