@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Path, Body
+from fastapi import APIRouter, Depends, HTTPException, Path, Body, Query
 from typing import List, Dict, Any, Optional
 import time
 from datetime import datetime
@@ -69,7 +69,8 @@ def verify_manager_role(current_user: dict, client) -> bool:
 @router.get("/list", response_model=ApiResponse, summary="Lister tous les points de vente")
 async def list_all_pos_configs(
     active_only: bool = True,
-    limit: Optional[int] = None,
+    page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
+    page_size: int = Query(20, ge=1, le=100, description="Nombre d'éléments par page (max 100)"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
@@ -77,6 +78,10 @@ async def list_all_pos_configs(
     
     Cette route retourne les configurations de points de vente accessibles pour l'employé connecté.
     Par défaut, filtre uniquement les POS actifs de la société de l'employé.
+    
+    **Pagination :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Nombre d'éléments par page (défaut: 20, max: 100)
     
     **Informations retournées pour chaque POS :**
     - **id** : Identifiant unique du POS
@@ -132,9 +137,19 @@ async def list_all_pos_configs(
                     domain.append(('company_id', '=', company_id))
                     logger.info(f"Filtrage des POS par société ID {company_id} de l'employé {employee_id}")
             except Exception as e:
-                logger.warning(f"Impossible de filtrer par société de l'employé: {e}")
+                    logger.warning(f"Impossible de filtrer par société de l'employé: {e}")
         
-        # Paramètres de recherche
+        # Compter le total d'éléments pour la pagination
+        total_count = client.execute_kw(
+            'pos.config',
+            'search_count',
+            [domain]
+        )
+        
+        # Calculer l'offset pour la pagination
+        offset = (page - 1) * page_size
+        
+        # Paramètres de recherche avec pagination
         search_params = {
             'fields': [
                 'id', 'name', 'company_id', 'warehouse_id', 
@@ -142,15 +157,12 @@ async def list_all_pos_configs(
                 'pricelist_id', 'currency_id', 'iface_tax_included',
                 'cash_control', 'module_pos_hr', 'active'
             ],
-            'order': 'id asc'
+            'order': 'id asc',
+            'limit': page_size,
+            'offset': offset
         }
         
-        if limit:
-            search_params['limit'] = limit
-        
-        logger.info(f"Recherche POS avec domaine: {domain}")
-        
-        # Rechercher les POS configs avec les filtres
+        logger.info(f"Recherche POS avec domaine: {domain}, page: {page}, page_size: {page_size}")        # Rechercher les POS configs avec les filtres
         pos_configs = client.execute_kw(
             'pos.config',
             'search_read',
@@ -166,7 +178,10 @@ async def list_all_pos_configs(
                 "data": [],
                 "metadata": {
                     "database": db_name,
-                    "total_count": 0
+                    "total_count": 0,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": 0
                 }
             }
         
@@ -228,13 +243,19 @@ async def list_all_pos_configs(
         
         logger.info(f"{len(pos_configs)} point(s) de vente trouvé(s) dans la base {db_name}")
         
+        # Calculer le nombre total de pages
+        total_pages = (total_count + page_size - 1) // page_size
+        
         return {
             "success": True,
             "message": f"{len(pos_configs)} point(s) de vente trouvé(s)",
             "data": enriched_pos,
             "metadata": {
                 "database": db_name,
-                "total_count": len(pos_configs),
+                "total_count": total_count,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages,
                 "active_count": sum(1 for p in pos_configs if p.get('active', True)),
                 "with_open_session": sum(1 for p in enriched_pos if p.get('session_state') == 'opened')
             }
@@ -1545,7 +1566,8 @@ async def get_pos_inventory_transfers(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     partner_id: Optional[int] = None,
-    limit: Optional[int] = 50,
+    page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
+    page_size: int = Query(50, ge=1, le=200, description="Nombre d'éléments par page (max 200)"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
@@ -1555,12 +1577,15 @@ async def get_pos_inventory_transfers(
     liés à un point de vente spécifique. Utile pour gérer les inventaires,
     réceptions, livraisons et transferts internes.
     
+    **Pagination :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Nombre d'éléments par page (défaut: 50, max: 200)
+    
     **Filtres disponibles :**
     - **state** : État du transfert (draft/waiting/ready/done/cancel)
     - **picking_type_code** : Type d'opération (incoming/outgoing/internal)
     - **date_from/date_to** : Période de recherche (YYYY-MM-DD)
     - **partner_id** : Filtrer par partenaire/fournisseur
-    - **limit** : Nombre maximum de résultats (défaut: 50)
     
     **États des transferts :**
     - **draft** : Brouillon, non confirmé
@@ -1637,10 +1662,17 @@ async def get_pos_inventory_transfers(
         if date_to:
             domain.append(('date', '<=', f"{date_to} 23:59:59"))
         
-        # Limiter la recherche pour éviter les timeouts
-        final_limit = min(limit or 50, 500)
+        # Compter le total d'éléments pour la pagination
+        total_count = client.execute_kw(
+            'stock.picking',
+            'search_count',
+            [domain]
+        )
         
-        logger.info(f"Recherche transferts avec domaine: {domain}")
+        # Calculer l'offset pour la pagination
+        offset = (page - 1) * page_size
+        
+        logger.info(f"Recherche transferts avec domaine: {domain}, page: {page}, page_size: {page_size}")
         
         # Récupérer les transferts avec tous les détails possibles
         fields = [
@@ -1687,7 +1719,8 @@ async def get_pos_inventory_transfers(
             [domain],
             {
                 'fields': fields,
-                'limit': final_limit,
+                'limit': page_size,
+                'offset': offset,
                 'order': 'date desc, id desc'
             }
         )
@@ -1918,6 +1951,9 @@ async def get_pos_inventory_transfers(
         
         logger.info(f"Récupération de {len(transfers)} transferts pour PDV {pos_config['name']}")
         
+        # Calculer le nombre total de pages
+        total_pages = (total_count + page_size - 1) // page_size
+        
         return ApiResponse(
             success=True,
             data={
@@ -1935,10 +1971,17 @@ async def get_pos_inventory_transfers(
                     'date_to': date_to,
                     'partner_id': partner_id
                 },
-                'domain_used': domain
+                'domain_used': domain,
+                'pagination': {
+                    'total_count': total_count,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': total_pages,
+                    'current_count': len(transfers)
+                }
             },
-            count=len(transfers),
-            message=f"Trouvé {len(transfers)} transfert(s) pour le PDV '{pos_config['name']}'"
+            count=total_count,
+            message=f"Trouvé {len(transfers)} transfert(s) sur {total_count} au total pour le PDV '{pos_config['name']}' (page {page}/{total_pages})"
         )
         
     except HTTPException:
@@ -2221,13 +2264,21 @@ async def update_inventory_transfer_state(
         )
   
 # ===== GESTION DES SESSIONS POS =====
-@router.get("/available", response_model=List[PosShop])
-async def get_available_pos_shops(current_user: dict = Depends(require_scope("pos"))):
+@router.get("/available", response_model=ApiResponse)
+async def get_available_pos_shops(
+    page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
+    page_size: int = Query(20, ge=1, le=100, description="Nombre d'éléments par page (max 100)"),
+    current_user: dict = Depends(require_scope("pos"))
+):
     """
     Récupérer les points de vente affectés à l'employé connecté
     
     Cette route retourne la liste des PDV auxquels l'employé connecté est affecté,
     avec l'état des sessions et les soldes.
+    
+    **Pagination :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Nombre d'éléments par page (défaut: 20, max: 100)
     
     Requires:
     - Authentification JWT avec scope 'pos'
@@ -2254,12 +2305,26 @@ async def get_available_pos_shops(current_user: dict = Depends(require_scope("po
         ]
         logger.info(f"Recherche des PDV affectés à l'employé {employee_id}")
         
-        # Récupérer les PDV selon le filtre
+        # Compter le total d'éléments
+        total_count = client.execute_kw(
+            'pos.config',
+            'search_count',
+            [pos_search_domain]
+        )
+        
+        # Calculer l'offset pour la pagination
+        offset = (page - 1) * page_size
+        
+        # Récupérer les PDV selon le filtre avec pagination
         pos_configs = client.execute_kw(
             'pos.config',
             'search_read',
             [pos_search_domain],
-            {'fields': ['id', 'name', 'current_session_id', 'basic_employee_ids', 'advanced_employee_ids']}
+            {
+                'fields': ['id', 'name', 'current_session_id', 'basic_employee_ids', 'advanced_employee_ids'],
+                'limit': page_size,
+                'offset': offset
+            }
         )
         
         logger.info(f"Trouvé {len(pos_configs)} PDV pour l'utilisateur")
@@ -2313,7 +2378,23 @@ async def get_available_pos_shops(current_user: dict = Depends(require_scope("po
             )
             available_pos.append(pos_shop)
         
-        return available_pos
+        # Convertir les modèles Pydantic en dictionnaires
+        available_pos_dict = [pos.model_dump() for pos in available_pos]
+        
+        # Calculer le nombre total de pages
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        return {
+            "success": True,
+            "message": f"{len(available_pos)} PDV disponible(s) sur {total_count} au total",
+            "data": available_pos_dict,
+            "metadata": {
+                "total_count": total_count,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": total_pages
+            }
+        }
         
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des PDV disponibles: {e}")
