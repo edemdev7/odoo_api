@@ -191,20 +191,40 @@ async def list_all_pos_configs(
             # Déterminer l'état de la session
             current_session_id = pos['current_session_id'][0] if isinstance(pos['current_session_id'], list) else pos.get('current_session_id')
             session_state = 'closed'
+            balance = 0.0
             
-            # Si une session existe, récupérer son état
+            # Si une session existe, récupérer son état et le solde
             if current_session_id:
                 try:
                     session = client.execute_kw(
                         'pos.session',
                         'read',
                         [current_session_id],
-                        {'fields': ['state']}
+                        {'fields': ['state', 'cash_register_balance_end_real', 'cash_register_balance_start']}
                     )
                     if session and len(session) > 0:
                         session_state = session[0].get('state', 'closed')
-                except:
+                        # Récupérer le solde de la session active
+                        balance = float(session[0].get('cash_register_balance_end_real', 0) or 
+                                      session[0].get('cash_register_balance_start', 0) or 0)
+                except Exception as e:
+                    logger.warning(f"Erreur récupération session pour POS {pos['id']}: {e}")
                     session_state = 'opened'  # Assumer que la session est ouverte si l'ID existe
+                    balance = 0.0
+            else:
+                # Si pas de session active, récupérer le solde de la dernière session fermée
+                try:
+                    last_sessions = client.execute_kw(
+                        'pos.session',
+                        'search_read',
+                        [[('config_id', '=', pos['id']), ('state', '=', 'closed')]],
+                        {'fields': ['cash_register_balance_end_real'], 'order': 'create_date desc', 'limit': 1}
+                    )
+                    if last_sessions:
+                        balance = float(last_sessions[0].get('cash_register_balance_end_real', 0) or 0)
+                except Exception as e:
+                    logger.warning(f"Impossible de récupérer le dernier solde pour POS {pos['id']}: {e}")
+                    balance = 0.0
             
             pos_data = {
                 "id": pos['id'],
@@ -224,6 +244,7 @@ async def list_all_pos_configs(
                 } if pos.get('picking_type_id') else None,
                 "session_state": session_state,
                 "current_session_id": current_session_id,
+                "balance": balance,
                 "pricelist": {
                     "id": pos['pricelist_id'][0] if isinstance(pos['pricelist_id'], list) else pos['pricelist_id'],
                     "name": pos['pricelist_id'][1] if isinstance(pos['pricelist_id'], list) and len(pos['pricelist_id']) > 1 else "N/A"
@@ -2321,7 +2342,7 @@ async def get_available_pos_shops(
             'search_read',
             [pos_search_domain],
             {
-                'fields': ['id', 'name', 'current_session_id', 'basic_employee_ids', 'advanced_employee_ids'],
+                'fields': ['id', 'name', 'current_session_id', 'basic_employee_ids', 'advanced_employee_ids', 'company_id'],
                 'limit': page_size,
                 'offset': offset
             }
@@ -2368,13 +2389,22 @@ async def get_available_pos_shops(
                     logger.warning(f"Impossible de récupérer le dernier solde pour PDV {pos_config['id']}: {e}")
                     balance = 0.0
             
+            # Extraire les informations de company
+            company_info = None
+            if pos_config.get('company_id'):
+                company_info = {
+                    "id": pos_config['company_id'][0] if isinstance(pos_config['company_id'], list) else pos_config['company_id'],
+                    "name": pos_config['company_id'][1] if isinstance(pos_config['company_id'], list) and len(pos_config['company_id']) > 1 else "N/A"
+                }
+            
             pos_shop = PosShop(
                 id=pos_config['id'],
                 name=pos_config['name'],
                 is_station=False,  # Par défaut, peut être déterminé par d'autres moyens
                 current_session_id=pos_config.get('current_session_id')[0] if pos_config.get('current_session_id') else None,
                 current_session_state=session_info['state'] if session_info else None,
-                balance=balance
+                balance=balance,
+                company=company_info
             )
             available_pos.append(pos_shop)
         

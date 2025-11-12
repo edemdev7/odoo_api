@@ -85,6 +85,7 @@ class PosShop(BaseModel):
     current_session_id: Optional[int] = None
     current_session_state: Optional[str] = None
     balance: Optional[float] = Field(None, description="Solde actuel du point de vente")
+    company: Optional[Dict[str, Any]] = Field(None, description="Informations sur la société")
 
 class PosSessionStatus(BaseModel):
     pos_id: int
