@@ -70,7 +70,7 @@ def verify_manager_role(current_user: dict, client) -> bool:
 async def list_all_pos_configs(
     active_only: bool = True,
     page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
-    page_size: int = Query(20, ge=1, le=100, description="Nombre d'éléments par page (max 100)"),
+    page_size: int = Query(20, ge=1, description="Nombre d'éléments par page"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
@@ -81,7 +81,7 @@ async def list_all_pos_configs(
     
     **Pagination :**
     - **page** : Numéro de page (défaut: 1)
-    - **page_size** : Nombre d'éléments par page (défaut: 20, max: 100)
+    - **page_size** : Nombre d'éléments par page (défaut: 20, pas de limite)
     
     **Informations retournées pour chaque POS :**
     - **id** : Identifiant unique du POS
@@ -2009,6 +2009,362 @@ async def get_pos_inventory_transfers(
         raise
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des transferts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
+
+@router.get("/inventory/transfers/by-truck", response_model=ApiResponse)
+async def get_transfers_by_truck(
+    truck_name: str = Query(..., description="Nom du camion (recherche partielle)"),
+    state: Optional[str] = Query(None, description="État du transfert"),
+    date_from: Optional[str] = Query(None, description="Date de début (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Date de fin (YYYY-MM-DD)"),
+    page: int = Query(1, ge=1, description="Numéro de page"),
+    page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les transferts internes filtrés par nom de camion
+    
+    Cette route permet de rechercher tous les transferts internes (internal)
+    associés à un camion spécifique, identifié par son nom.
+    
+    **Paramètres :**
+    - **truck_name** : Nom du camion (recherche partielle, insensible à la casse)
+    - **state** : Filtrer par état (draft/waiting/ready/done/cancel)
+    - **date_from/date_to** : Période de recherche
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Éléments par page (défaut: 50, max: 200)
+    
+    **Note:** Le nom du camion est recherché dans le champ personnalisé `x_studio_camionchauffeur`.
+    C'est le champ many2one qui référence le camion dans Odoo.
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # D'abord, rechercher les IDs des camions correspondant au nom
+        truck_ids = client.execute_kw(
+            'res.partner',  # Les camions sont généralement des partenaires
+            'search',
+            [[('name', 'ilike', truck_name)]]
+        )
+        
+        # Construire le domaine de recherche
+        domain = [
+            ('picking_type_code', '=', 'internal'),  # Uniquement les transferts internes
+        ]
+        
+        # Ajouter le filtre sur le camion si des IDs ont été trouvés
+        if truck_ids:
+            domain.append(('x_studio_camionchauffeur', 'in', truck_ids))
+        else:
+            # Si aucun camion trouvé, chercher aussi dans origin comme fallback
+            domain.append(('origin', 'ilike', truck_name))
+        
+        # Ajouter les filtres optionnels
+        if state:
+            domain.append(('state', '=', state))
+        
+        if date_from:
+            domain.append(('date', '>=', f"{date_from} 00:00:00"))
+        
+        if date_to:
+            domain.append(('date', '<=', f"{date_to} 23:59:59"))
+        
+        # Filtrer par base de données (si transfer_type_code est défini)
+        from core.security import get_odoo_config_from_user
+        
+        db_config = get_odoo_config_from_user(current_user)
+        db_name = db_config.get('name', 'Base par défaut') if db_config else 'Base par défaut'
+        
+        logger.info(f"Recherche transferts par camion '{truck_name}' (IDs: {truck_ids}) avec domaine: {domain}")
+        
+        # Compter le total d'éléments
+        total_count = client.execute_kw(
+            'stock.picking',
+            'search_count',
+            [domain]
+        )
+        
+        if total_count == 0:
+            return ApiResponse(
+                success=True,
+                data={
+                    'truck_name': truck_name,
+                    'transfers': [],
+                    'pagination': {
+                        'total_count': 0,
+                        'page': page,
+                        'page_size': page_size,
+                        'total_pages': 0,
+                        'current_count': 0
+                    }
+                },
+                count=0,
+                message=f"Aucun transfert trouvé pour le camion '{truck_name}'"
+            )
+        
+        # Calculer l'offset
+        offset = (page - 1) * page_size
+        
+        # Champs à récupérer
+        fields = [
+            # Champs de base
+            'id', 'name', 'origin', 'state', 'picking_type_code', 'partner_id',
+            'location_id', 'location_dest_id', 'scheduled_date', 'date_done',
+            'user_id', 'company_id', 'products_availability', 'products_availability_state',
+            'move_ids', 'pos_session_id', 'pos_order_id', 'note',
+            
+            # Champs personnalisés pour le camion et chauffeur
+            'x_studio_camionchauffeur', 'x_studio_chauffeur',
+            
+            # Champs détaillés
+            'picking_type_id', 'priority', 'date', 'date_deadline',
+            'move_type', 'group_id', 'has_packages', 'is_locked',
+            
+            # Informations produits
+            'move_ids_without_package', 'move_line_ids', 'move_line_ids_without_package',
+            
+            # Informations de création
+            'create_date', 'write_date', 'create_uid', 'write_uid'
+        ]
+        
+        # Récupérer les transferts
+        transfers = client.execute_kw(
+            'stock.picking',
+            'search_read',
+            [domain],
+            {
+                'fields': fields,
+                'limit': page_size,
+                'offset': offset,
+                'order': 'date desc, id desc'
+            }
+        )
+        
+        # Enrichir chaque transfert avec les détails des mouvements
+        for transfer in transfers:
+            # Récupérer les détails des mouvements de stock
+            if transfer.get('move_ids'):
+                try:
+                    move_details = client.execute_kw(
+                        'stock.move',
+                        'read',
+                        [transfer['move_ids']],
+                        {
+                            'fields': [
+                                'id', 'name', 'product_id', 'product_uom_qty', 'product_qty',
+                                'product_uom', 'state', 'location_id', 'location_dest_id',
+                                'date', 'origin', 'reference', 'description_picking'
+                            ]
+                        }
+                    )
+                    
+                    # Enrichir avec les infos produits
+                    product_ids = [move['product_id'][0] for move in move_details if move.get('product_id')]
+                    if product_ids:
+                        products_info = client.execute_kw(
+                            'product.product',
+                            'read',
+                            [product_ids],
+                            {
+                                'fields': [
+                                    'id', 'name', 'display_name', 'default_code', 'barcode',
+                                    'uom_id', 'type', 'tracking', 'list_price', 'standard_price'
+                                ]
+                            }
+                        )
+                        
+                        products_map = {p['id']: p for p in products_info}
+                        
+                        for move in move_details:
+                            if move.get('product_id'):
+                                product_id = move['product_id'][0]
+                                move['product_details'] = products_map.get(product_id, {})
+                    
+                    transfer['move_details'] = move_details
+                    
+                except Exception as e:
+                    logger.warning(f"Erreur enrichissement mouvements transfert {transfer['id']}: {e}")
+                    transfer['move_details'] = []
+            else:
+                transfer['move_details'] = []
+            
+            # Récupérer les détails des opérations de stock
+            if transfer.get('move_line_ids'):
+                try:
+                    move_line_details = client.execute_kw(
+                        'stock.move.line',
+                        'read',
+                        [transfer['move_line_ids']],
+                        {
+                            'fields': [
+                                'id', 'move_id', 'product_id', 'product_uom_id', 'qty_done',
+                                'quantity', 'lot_id', 'lot_name', 'location_id',
+                                'location_dest_id', 'picking_id', 'state', 'reference'
+                            ]
+                        }
+                    )
+                    transfer['move_line_details'] = move_line_details
+                except Exception as e:
+                    logger.warning(f"Erreur enrichissement move_line transfert {transfer['id']}: {e}")
+                    transfer['move_line_details'] = []
+            else:
+                transfer['move_line_details'] = []
+            
+            # Ajouter les détails du type de picking
+            if transfer.get('picking_type_id'):
+                try:
+                    picking_type_info = client.execute_kw(
+                        'stock.picking.type',
+                        'read',
+                        [transfer['picking_type_id'][0]],
+                        {
+                            'fields': [
+                                'id', 'name', 'code', 'warehouse_id', 'default_location_src_id',
+                                'default_location_dest_id', 'sequence_code'
+                            ]
+                        }
+                    )
+                    transfer['picking_type_details'] = picking_type_info[0] if picking_type_info else {}
+                except Exception as e:
+                    logger.warning(f"Erreur enrichissement picking_type transfert {transfer['id']}: {e}")
+                    transfer['picking_type_details'] = {}
+            else:
+                transfer['picking_type_details'] = {}
+        
+        # Formater les résultats
+        def clean_odoo_value(value):
+            return None if value is False else value
+        
+        formatted_transfers = []
+        for transfer in transfers:
+            try:
+                # Extraire les informations du camion et chauffeur
+                truck_info = None
+                if transfer.get('x_studio_camionchauffeur'):
+                    truck_info = {
+                        'id': transfer['x_studio_camionchauffeur'][0] if isinstance(transfer['x_studio_camionchauffeur'], list) else transfer['x_studio_camionchauffeur'],
+                        'name': transfer['x_studio_camionchauffeur'][1] if isinstance(transfer['x_studio_camionchauffeur'], list) and len(transfer['x_studio_camionchauffeur']) > 1 else 'N/A'
+                    }
+                
+                driver_info = None
+                if transfer.get('x_studio_chauffeur'):
+                    driver_info = {
+                        'id': transfer['x_studio_chauffeur'][0] if isinstance(transfer['x_studio_chauffeur'], list) else transfer['x_studio_chauffeur'],
+                        'name': transfer['x_studio_chauffeur'][1] if isinstance(transfer['x_studio_chauffeur'], list) and len(transfer['x_studio_chauffeur']) > 1 else 'N/A'
+                    }
+                
+                formatted_transfer = {
+                    # Champs de base
+                    'id': transfer['id'],
+                    'name': transfer.get('name', ''),
+                    'origin': clean_odoo_value(transfer.get('origin')),
+                    'state': transfer.get('state', 'draft'),
+                    'picking_type_code': clean_odoo_value(transfer.get('picking_type_code')),
+                    
+                    # Informations camion et chauffeur
+                    'truck': truck_info,
+                    'truck_name': truck_info['name'] if truck_info else clean_odoo_value(transfer.get('origin')),
+                    'driver': driver_info,
+                    
+                    'partner_id': clean_odoo_value(transfer.get('partner_id')),
+                    'location_id': clean_odoo_value(transfer.get('location_id')),
+                    'location_dest_id': clean_odoo_value(transfer.get('location_dest_id')),
+                    'scheduled_date': clean_odoo_value(transfer.get('scheduled_date')),
+                    'date_done': clean_odoo_value(transfer.get('date_done')),
+                    'date': clean_odoo_value(transfer.get('date')),
+                    'user_id': clean_odoo_value(transfer.get('user_id')),
+                    'company_id': clean_odoo_value(transfer.get('company_id')),
+                    'products_availability': clean_odoo_value(transfer.get('products_availability')),
+                    'products_availability_state': clean_odoo_value(transfer.get('products_availability_state')),
+                    'note': clean_odoo_value(transfer.get('note')),
+                    
+                    # Champs détaillés
+                    'picking_type_id': clean_odoo_value(transfer.get('picking_type_id')),
+                    'priority': clean_odoo_value(transfer.get('priority')),
+                    'date_deadline': clean_odoo_value(transfer.get('date_deadline')),
+                    'move_type': clean_odoo_value(transfer.get('move_type')),
+                    'group_id': clean_odoo_value(transfer.get('group_id')),
+                    'has_packages': clean_odoo_value(transfer.get('has_packages')),
+                    'is_locked': clean_odoo_value(transfer.get('is_locked')),
+                    
+                    # IDs des mouvements
+                    'move_ids': transfer.get('move_ids', []) if transfer.get('move_ids') is not False else [],
+                    'move_line_ids': clean_odoo_value(transfer.get('move_line_ids')),
+                    
+                    # Informations de création
+                    'create_date': clean_odoo_value(transfer.get('create_date')),
+                    'write_date': clean_odoo_value(transfer.get('write_date')),
+                    'create_uid': clean_odoo_value(transfer.get('create_uid')),
+                    'write_uid': clean_odoo_value(transfer.get('write_uid')),
+                    
+                    # Détails enrichis
+                    'move_details': transfer.get('move_details', []),
+                    'move_line_details': transfer.get('move_line_details', []),
+                    'picking_type_details': transfer.get('picking_type_details', {}),
+                    
+                    # Résumé des produits
+                    'product_summary': [
+                        {
+                            'product_name': move.get('product_details', {}).get('name', 'Produit inconnu'),
+                            'product_code': move.get('product_details', {}).get('default_code'),
+                            'quantity': move.get('product_uom_qty', 0),
+                            'uom': move.get('product_uom', [None, 'Unité'])[1] if move.get('product_uom') else 'Unité'
+                        }
+                        for move in transfer.get('move_details', [])
+                    ]
+                }
+                
+                formatted_transfers.append(formatted_transfer)
+                
+            except Exception as e:
+                logger.warning(f"Erreur formatage transfert {transfer.get('id', 'unknown')}: {e}")
+                formatted_transfer = {
+                    'id': transfer['id'],
+                    'name': transfer.get('name', ''),
+                    'state': transfer.get('state', 'draft'),
+                    'origin': transfer.get('origin', ''),
+                    'error': f"Erreur formatage: {str(e)}"
+                }
+                formatted_transfers.append(formatted_transfer)
+        
+        # Calculer le nombre total de pages
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        logger.info(f"Trouvé {len(transfers)} transfert(s) pour le camion '{truck_name}' sur {total_count} au total")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'truck_name': truck_name,
+                'database': db_name,
+                'transfers': formatted_transfers,
+                'filters_applied': {
+                    'truck_name': truck_name,
+                    'state': state,
+                    'date_from': date_from,
+                    'date_to': date_to
+                },
+                'pagination': {
+                    'total_count': total_count,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': total_pages,
+                    'current_count': len(transfers)
+                }
+            },
+            count=total_count,
+            message=f"Trouvé {len(transfers)} transfert(s) sur {total_count} pour le camion '{truck_name}' (page {page}/{total_pages})"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des transferts par camion: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
