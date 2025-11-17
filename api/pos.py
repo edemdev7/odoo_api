@@ -2639,6 +2639,244 @@ async def update_inventory_transfer_state(
             status_code=500,
             detail=f"Erreur lors de la mise à jour: {str(e)}"
         )
+
+# ===== GESTION DES CAMIONS (FLEET) =====
+
+@router.get("/fleet/trucks/by-driver/{driver_id}", response_model=ApiResponse)
+async def get_trucks_by_driver(
+    driver_id: int = Path(..., description="ID du chauffeur (res.partner)"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les camions associés à un chauffeur via les transferts
+    
+    Cette route récupère tous les camions (x_studio_camionchauffeur) 
+    qui ont été utilisés dans des transferts par un chauffeur spécifique.
+    
+    **Paramètres :**
+    - **driver_id** : ID du chauffeur (res.partner)
+    
+    **Informations retournées :**
+    - Liste des camions uniques utilisés par le chauffeur
+    - Informations du chauffeur
+    - Nombre de transferts par camion
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le chauffeur existe
+        driver_info = client.execute_kw(
+            'res.partner',
+            'search_read',
+            [[('id', '=', driver_id)]],
+            {'fields': ['id', 'name', 'phone', 'mobile', 'email'], 'limit': 1}
+        )
+        
+        if not driver_info:
+            raise HTTPException(status_code=404, detail="Chauffeur non trouvé")
+        
+        driver_info = driver_info[0]
+        
+        # Récupérer tous les transferts de ce chauffeur avec le camion
+        transfers = client.execute_kw(
+            'stock.picking',
+            'search_read',
+            [[('x_studio_chauffeur', '=', driver_id), ('x_studio_camionchauffeur', '!=', False)]],
+            {
+                'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
+                'order': 'date desc'
+            }
+        )
+        
+        if not transfers:
+            return ApiResponse(
+                success=True,
+                data={
+                    'driver': {
+                        'id': driver_info['id'],
+                        'name': driver_info['name'],
+                        'phone': driver_info.get('phone'),
+                        'mobile': driver_info.get('mobile'),
+                        'email': driver_info.get('email')
+                    },
+                    'trucks': [],
+                    'total_trucks': 0
+                },
+                count=0,
+                message=f"Aucun camion trouvé pour {driver_info['name']}"
+            )
+        
+        # Grouper par camion et compter les transferts
+        trucks_dict = {}
+        for transfer in transfers:
+            if transfer.get('x_studio_camionchauffeur'):
+                truck_id = transfer['x_studio_camionchauffeur'][0]
+                truck_name = transfer['x_studio_camionchauffeur'][1] if len(transfer['x_studio_camionchauffeur']) > 1 else f"Camion {truck_id}"
+                
+                if truck_id not in trucks_dict:
+                    trucks_dict[truck_id] = {
+                        'id': truck_id,
+                        'name': truck_name,
+                        'transfer_count': 0,
+                        'last_transfer_date': None,
+                        'transfers': []
+                    }
+                
+                trucks_dict[truck_id]['transfer_count'] += 1
+                trucks_dict[truck_id]['transfers'].append({
+                    'id': transfer['id'],
+                    'name': transfer['name'],
+                    'origin': transfer.get('origin'),
+                    'state': transfer.get('state'),
+                    'date': transfer.get('date')
+                })
+                
+                # Mettre à jour la dernière date de transfert
+                if transfer.get('date'):
+                    if not trucks_dict[truck_id]['last_transfer_date'] or transfer['date'] > trucks_dict[truck_id]['last_transfer_date']:
+                        trucks_dict[truck_id]['last_transfer_date'] = transfer['date']
+        
+        # Convertir en liste et trier par nombre de transferts
+        trucks_list = sorted(trucks_dict.values(), key=lambda x: x['transfer_count'], reverse=True)
+        
+        logger.info(f"Trouvé {len(trucks_list)} camion(s) pour le chauffeur {driver_info['name']} (ID: {driver_id})")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'driver': {
+                    'id': driver_info['id'],
+                    'name': driver_info['name'],
+                    'phone': driver_info.get('phone'),
+                    'mobile': driver_info.get('mobile'),
+                    'email': driver_info.get('email')
+                },
+                'trucks': trucks_list,
+                'total_trucks': len(trucks_list),
+                'total_transfers': len(transfers)
+            },
+            count=len(trucks_list),
+            message=f"Trouvé {len(trucks_list)} camion(s) pour {driver_info['name']} ({len(transfers)} transferts)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des camions du chauffeur {driver_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
+
+@router.get("/fleet/trucks", response_model=ApiResponse)
+async def get_all_trucks(
+    page: int = Query(1, ge=1, description="Numéro de page"),
+    page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer tous les camions distincts utilisés dans les transferts
+    
+    Cette route liste tous les camions uniques (x_studio_camionchauffeur)
+    qui ont été référencés dans les transferts de stock.
+    
+    **Paramètres :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Éléments par page (défaut: 50, max: 200)
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Récupérer tous les transferts avec camion (pour avoir les IDs uniques)
+        all_transfers = client.execute_kw(
+            'stock.picking',
+            'search_read',
+            [[('x_studio_camionchauffeur', '!=', False)]],
+            {
+                'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
+                'order': 'date desc'
+            }
+        )
+        
+        # Grouper par camion
+        trucks_dict = {}
+        for transfer in all_transfers:
+            if transfer.get('x_studio_camionchauffeur'):
+                truck_id = transfer['x_studio_camionchauffeur'][0]
+                truck_name = transfer['x_studio_camionchauffeur'][1] if len(transfer['x_studio_camionchauffeur']) > 1 else f"Camion {truck_id}"
+                
+                if truck_id not in trucks_dict:
+                    trucks_dict[truck_id] = {
+                        'id': truck_id,
+                        'name': truck_name,
+                        'transfer_count': 0,
+                        'last_transfer_date': None,
+                        'last_driver': None,
+                        'drivers_used': set()
+                    }
+                
+                trucks_dict[truck_id]['transfer_count'] += 1
+                
+                # Ajouter le chauffeur à la liste
+                if transfer.get('x_studio_chauffeur'):
+                    driver_id = transfer['x_studio_chauffeur'][0]
+                    driver_name = transfer['x_studio_chauffeur'][1] if len(transfer['x_studio_chauffeur']) > 1 else f"Chauffeur {driver_id}"
+                    trucks_dict[truck_id]['drivers_used'].add((driver_id, driver_name))
+                
+                # Mettre à jour la dernière date et le dernier chauffeur
+                if transfer.get('date'):
+                    if not trucks_dict[truck_id]['last_transfer_date'] or transfer['date'] > trucks_dict[truck_id]['last_transfer_date']:
+                        trucks_dict[truck_id]['last_transfer_date'] = transfer['date']
+                        if transfer.get('x_studio_chauffeur'):
+                            trucks_dict[truck_id]['last_driver'] = {
+                                'id': transfer['x_studio_chauffeur'][0],
+                                'name': transfer['x_studio_chauffeur'][1] if len(transfer['x_studio_chauffeur']) > 1 else f"Chauffeur {transfer['x_studio_chauffeur'][0]}"
+                            }
+        
+        # Convertir les sets en listes pour la sérialisation JSON
+        for truck in trucks_dict.values():
+            truck['drivers'] = [{'id': d[0], 'name': d[1]} for d in truck['drivers_used']]
+            del truck['drivers_used']
+        
+        # Convertir en liste et trier
+        trucks_list = sorted(trucks_dict.values(), key=lambda x: x['last_transfer_date'] or '', reverse=True)
+        
+        # Pagination
+        total_count = len(trucks_list)
+        total_pages = (total_count + page_size - 1) // page_size
+        offset = (page - 1) * page_size
+        trucks_paginated = trucks_list[offset:offset + page_size]
+        
+        logger.info(f"Récupération de {len(trucks_paginated)} camion(s) sur {total_count} au total")
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'trucks': trucks_paginated,
+                'pagination': {
+                    'total_count': total_count,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': total_pages,
+                    'current_count': len(trucks_paginated)
+                }
+            },
+            count=total_count,
+            message=f"Trouvé {len(trucks_paginated)} camion(s) sur {total_count} au total (page {page}/{total_pages})"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des camions: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
   
 # ===== GESTION DES SESSIONS POS =====
 @router.get("/available", response_model=ApiResponse)
