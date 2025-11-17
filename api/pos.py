@@ -2644,7 +2644,7 @@ async def update_inventory_transfer_state(
 
 @router.get("/fleet/trucks/by-driver/{driver_id}", response_model=ApiResponse)
 async def get_trucks_by_driver(
-    driver_id: int = Path(..., description="ID du chauffeur (res.partner)"),
+    driver_id: int = Path(..., description="ID du chauffeur (employee_id ou res.partner)"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
@@ -2654,7 +2654,7 @@ async def get_trucks_by_driver(
     qui ont été utilisés dans des transferts par un chauffeur spécifique.
     
     **Paramètres :**
-    - **driver_id** : ID du chauffeur (res.partner)
+    - **driver_id** : ID de l'employé (hr.employee) ou du partenaire (res.partner)
     
     **Informations retournées :**
     - Liste des camions uniques utilisés par le chauffeur
@@ -2666,24 +2666,66 @@ async def get_trucks_by_driver(
     try:
         client = get_odoo_client(current_user)
         
-        # Vérifier que le chauffeur existe
-        driver_info = client.execute_kw(
-            'res.partner',
-            'search_read',
-            [[('id', '=', driver_id)]],
-            {'fields': ['id', 'name', 'phone', 'mobile', 'email'], 'limit': 1}
-        )
+        # D'abord, vérifier si c'est un employee_id et récupérer le res.partner associé
+        partner_id = driver_id
+        driver_name = None
+        driver_phone = None
+        driver_mobile = None
+        driver_email = None
         
-        if not driver_info:
-            raise HTTPException(status_code=404, detail="Chauffeur non trouvé")
+        # Essayer de récupérer comme employé d'abord
+        try:
+            employee_info = client.execute_kw(
+                'hr.employee',
+                'search_read',
+                [[('id', '=', driver_id)]],
+                {'fields': ['id', 'name', 'work_phone', 'mobile_phone', 'work_email', 'user_partner_id', 'work_contact_id', 'related_partner_id'], 'limit': 1}
+            )
+            
+            if employee_info:
+                employee = employee_info[0]
+                driver_name = employee.get('name')
+                driver_phone = employee.get('work_phone')
+                driver_mobile = employee.get('mobile_phone')
+                driver_email = employee.get('work_email')
+                
+                # Chercher le res.partner associé (priorité: user_partner_id > related_partner_id > work_contact_id)
+                if employee.get('user_partner_id'):
+                    partner_id = employee['user_partner_id'][0] if isinstance(employee['user_partner_id'], list) else employee['user_partner_id']
+                    logger.info(f"Employé {driver_id} trouvé, utilisation du user_partner_id: {partner_id}")
+                elif employee.get('related_partner_id'):
+                    partner_id = employee['related_partner_id'][0] if isinstance(employee['related_partner_id'], list) else employee['related_partner_id']
+                    logger.info(f"Employé {driver_id} trouvé, utilisation du related_partner_id: {partner_id}")
+                elif employee.get('work_contact_id'):
+                    partner_id = employee['work_contact_id'][0] if isinstance(employee['work_contact_id'], list) else employee['work_contact_id']
+                    logger.info(f"Employé {driver_id} trouvé, utilisation du work_contact_id: {partner_id}")
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer l'employé {driver_id}: {e}")
         
-        driver_info = driver_info[0]
+        # Si pas trouvé comme employé, essayer comme res.partner directement
+        if not driver_name:
+            driver_info = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [[('id', '=', driver_id)]],
+                {'fields': ['id', 'name', 'phone', 'mobile', 'email'], 'limit': 1}
+            )
+            
+            if not driver_info:
+                raise HTTPException(status_code=404, detail="Chauffeur non trouvé (ni comme employé, ni comme partenaire)")
+            
+            driver_info = driver_info[0]
+            partner_id = driver_info['id']
+            driver_name = driver_info['name']
+            driver_phone = driver_info.get('phone')
+            driver_mobile = driver_info.get('mobile')
+            driver_email = driver_info.get('email')
         
-        # Récupérer tous les transferts de ce chauffeur avec le camion
+        # Récupérer tous les transferts de ce chauffeur (via res.partner) avec le camion
         transfers = client.execute_kw(
             'stock.picking',
             'search_read',
-            [[('x_studio_chauffeur', '=', driver_id), ('x_studio_camionchauffeur', '!=', False)]],
+            [[('x_studio_chauffeur', '=', partner_id), ('x_studio_camionchauffeur', '!=', False)]],
             {
                 'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
                 'order': 'date desc'
@@ -2695,17 +2737,18 @@ async def get_trucks_by_driver(
                 success=True,
                 data={
                     'driver': {
-                        'id': driver_info['id'],
-                        'name': driver_info['name'],
-                        'phone': driver_info.get('phone'),
-                        'mobile': driver_info.get('mobile'),
-                        'email': driver_info.get('email')
+                        'id': partner_id,
+                        'employee_id': driver_id if driver_id != partner_id else None,
+                        'name': driver_name,
+                        'phone': driver_phone,
+                        'mobile': driver_mobile,
+                        'email': driver_email
                     },
                     'trucks': [],
                     'total_trucks': 0
                 },
                 count=0,
-                message=f"Aucun camion trouvé pour {driver_info['name']}"
+                message=f"Aucun camion trouvé pour {driver_name}"
             )
         
         # Grouper par camion et compter les transferts
@@ -2741,17 +2784,18 @@ async def get_trucks_by_driver(
         # Convertir en liste et trier par nombre de transferts
         trucks_list = sorted(trucks_dict.values(), key=lambda x: x['transfer_count'], reverse=True)
         
-        logger.info(f"Trouvé {len(trucks_list)} camion(s) pour le chauffeur {driver_info['name']} (ID: {driver_id})")
+        logger.info(f"Trouvé {len(trucks_list)} camion(s) pour le chauffeur {driver_name} (ID: {driver_id}, Partner ID: {partner_id})")
         
         return ApiResponse(
             success=True,
             data={
                 'driver': {
-                    'id': driver_info['id'],
-                    'name': driver_info['name'],
-                    'phone': driver_info.get('phone'),
-                    'mobile': driver_info.get('mobile'),
-                    'email': driver_info.get('email')
+                    'id': partner_id,
+                    'employee_id': driver_id if driver_id != partner_id else None,
+                    'name': driver_name,
+                    'phone': driver_phone,
+                    'mobile': driver_mobile,
+                    'email': driver_email
                 },
                 'trucks': trucks_list,
                 'total_trucks': len(trucks_list),
