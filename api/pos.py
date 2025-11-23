@@ -230,6 +230,7 @@ async def list_all_pos_configs(
                 "id": pos['id'],
                 "name": pos['name'],
                 "active": pos.get('active', True),
+                "odoo_database": db_name,
                 "company": {
                     "id": pos['company_id'][0] if isinstance(pos['company_id'], list) else pos['company_id'],
                     "name": pos['company_id'][1] if isinstance(pos['company_id'], list) and len(pos['company_id']) > 1 else "N/A"
@@ -2943,7 +2944,13 @@ async def get_available_pos_shops(
     - Authentification JWT avec scope 'pos'
     """
     try:
+        from core.security import get_odoo_config_from_user
+        
         client = get_odoo_client(current_user)
+        
+        # Récupérer la configuration de la base authentifiée
+        db_config = get_odoo_config_from_user(current_user)
+        db_name = db_config['name'] if db_config else "Base par défaut"
         
         # Récupérer l'ID de l'employé actuel depuis le token
         employee_id = current_user.get("employee_id")
@@ -3046,8 +3053,12 @@ async def get_available_pos_shops(
             )
             available_pos.append(pos_shop)
         
-        # Convertir les modèles Pydantic en dictionnaires
-        available_pos_dict = [pos.model_dump() for pos in available_pos]
+        # Convertir les modèles Pydantic en dictionnaires et ajouter odoo_database
+        available_pos_dict = []
+        for pos in available_pos:
+            pos_dict = pos.model_dump()
+            pos_dict['odoo_database'] = db_name
+            available_pos_dict.append(pos_dict)
         
         # Calculer le nombre total de pages
         total_pages = (total_count + page_size - 1) // page_size
@@ -3057,6 +3068,7 @@ async def get_available_pos_shops(
             "message": f"{len(available_pos)} PDV disponible(s) sur {total_count} au total",
             "data": available_pos_dict,
             "metadata": {
+                "database": db_name,
                 "total_count": total_count,
                 "page": page,
                 "page_size": page_size,
