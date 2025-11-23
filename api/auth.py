@@ -240,7 +240,7 @@ async def pin_login(login_data: PinLogin):
                     'hr.employee', 
                     'search_read', 
                     [domain], 
-                    {'fields': ['id', 'name', 'work_email', 'job_id', 'department_id'], 'limit': 1}
+                    {'fields': ['id', 'name', 'work_email', 'job_id', 'department_id', 'user_partner_id', 'work_contact_id', 'related_partner_id'], 'limit': 1}
                 )
                 
                 if employees and len(employees) > 0:
@@ -266,6 +266,17 @@ async def pin_login(login_data: PinLogin):
         
         logger.info(f"Authentification réussie sur {authenticated_db_config['name']}: {employee['name']}")
         
+        # Extraire le partner_id de l'employé (priorité: user_partner_id > related_partner_id > work_contact_id)
+        partner_id = None
+        if employee.get('user_partner_id'):
+            partner_id = employee['user_partner_id'][0] if isinstance(employee['user_partner_id'], list) else employee['user_partner_id']
+        elif employee.get('related_partner_id'):
+            partner_id = employee['related_partner_id'][0] if isinstance(employee['related_partner_id'], list) else employee['related_partner_id']
+        elif employee.get('work_contact_id'):
+            partner_id = employee['work_contact_id'][0] if isinstance(employee['work_contact_id'], list) else employee['work_contact_id']
+        
+        logger.info(f"Partner ID extrait pour l'employé {employee['id']}: {partner_id}")
+        
         # Créer un utilisateur virtuel avec des droits limités pour le POS/stock
         virtual_user = {
             "username": f"employee_{employee['id']}",
@@ -274,6 +285,7 @@ async def pin_login(login_data: PinLogin):
             "employee_id": employee['id'],
             "employee_name": employee['name'],
             "employee_matricule": login_data.matricule,
+            "partner_id": partner_id,  # Ajouter le partner_id
             "odoo_db": authenticated_db_config['name']  # Ajouter le nom de la DB
         }
         
@@ -286,6 +298,7 @@ async def pin_login(login_data: PinLogin):
             "employee_id": employee['id'],
             "employee_name": employee['name'],
             "employee_matricule": login_data.matricule,
+            "partner_id": partner_id,  # Inclure le partner_id dans le token
             "odoo_db": authenticated_db_config['name']  # Important: inclure le nom de la DB
         }
         
@@ -306,6 +319,7 @@ async def pin_login(login_data: PinLogin):
             "image_url": None,
             "additional_info": {
                 "employee_id": employee['id'],
+                "partner_id": partner_id,  # Ajouter le partner_id dans les infos utilisateur
                 "matricule": login_data.matricule,
                 "job": employee.get('job_id')[1] if employee.get('job_id') else None,
                 "department": employee.get('department_id')[1] if employee.get('department_id') else None,
