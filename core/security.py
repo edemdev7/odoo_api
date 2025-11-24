@@ -129,11 +129,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 "employee_id": employee_id,
                 "employee_name": employee_name,
                 "employee_matricule": employee_matricule,
+                "partner_id": payload.get("partner_id"),  # IMPORTANT: Inclure le partner_id
                 "auth_type": "pin",  # Indiquer que c'est une authentification par PIN
                 "odoo_db": payload.get("odoo_db")  # IMPORTANT: Inclure le nom de la DB
             }
             
-            logger.info(f"Accès authentifié par PIN pour l'employé: {employee_name}")
+            logger.info(f"Accès authentifié par PIN pour l'employé: {employee_name} (Partner ID: {payload.get('partner_id')})")
             return virtual_user
             
         # Vérifier que l'utilisateur existe pour authentification standard

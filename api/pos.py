@@ -2643,6 +2643,122 @@ async def update_inventory_transfer_state(
 
 # ===== GESTION DES CAMIONS (FLEET) =====
 
+@router.get("/fleet/debug-user", response_model=ApiResponse)
+async def debug_fleet_user(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Debug: Afficher les informations de l'utilisateur et les IDs liés
+    """
+    try:
+        employee_id = current_user.get('employee_id')
+        partner_id = current_user.get('partner_id')
+        
+        client = get_odoo_client(current_user)
+        
+        # Récupérer l'employé avec tous ses champs partner
+        employee_info = client.execute_kw(
+            'hr.employee',
+            'search_read',
+            [[('id', '=', employee_id)]],
+            {
+                'fields': [
+                    'id', 'name', 'user_partner_id', 'related_partner_id', 
+                    'work_contact_id', 'user_id'
+                ],
+                'limit': 1
+            }
+        )
+        
+        # Récupérer le partner actuel
+        partner_info = client.execute_kw(
+            'res.partner',
+            'search_read',
+            [[('id', '=', partner_id)]],
+            {'fields': ['id', 'name', 'phone', 'mobile', 'email'], 'limit': 1}
+        )
+        
+        # Chercher les camions avec chaque ID possible
+        trucks_by_partner = client.execute_kw(
+            'fleet.vehicle',
+            'search_count',
+            [[('driver_id', '=', partner_id), ('active', '=', True)]]
+        )
+        
+        # Essayer avec d'autres IDs de l'employé si disponibles
+        debug_data = {
+            'jwt_token_info': {
+                'employee_id': employee_id,
+                'partner_id': partner_id
+            },
+            'employee_record': employee_info[0] if employee_info else None,
+            'partner_record': partner_info[0] if partner_info else None,
+            'trucks_found_with_partner_id': trucks_by_partner
+        }
+        
+        # Tester avec les autres partner IDs de l'employé
+        if employee_info:
+            emp = employee_info[0]
+            for field in ['user_partner_id', 'related_partner_id', 'work_contact_id']:
+                if emp.get(field):
+                    test_id = emp[field][0] if isinstance(emp[field], list) else emp[field]
+                    trucks_count = client.execute_kw(
+                        'fleet.vehicle',
+                        'search_count',
+                        [[('driver_id', '=', test_id), ('active', '=', True)]]
+                    )
+                    debug_data[f'trucks_with_{field}'] = {
+                        'partner_id': test_id,
+                        'trucks_count': trucks_count
+                    }
+        
+        # Chercher tous les res.partner avec le même nom
+        if partner_info:
+            partner_name = partner_info[0]['name']
+            all_partners_same_name = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [[('name', '=', partner_name)]],
+                {'fields': ['id', 'name', 'phone', 'mobile', 'email', 'employee'], 'limit': 10}
+            )
+            debug_data['all_partners_with_same_name'] = all_partners_same_name
+            
+            # Tester chaque partner avec le même nom
+            for p in all_partners_same_name:
+                trucks_count = client.execute_kw(
+                    'fleet.vehicle',
+                    'search_count',
+                    [[('driver_id', '=', p['id']), ('active', '=', True)]]
+                )
+                if trucks_count > 0:
+                    debug_data[f'FOUND_TRUCKS_WITH_PARTNER_{p["id"]}'] = {
+                        'partner_id': p['id'],
+                        'partner_name': p['name'],
+                        'trucks_count': trucks_count,
+                        'is_employee': p.get('employee', False)
+                    }
+        
+        # Chercher dans hr.employee avec le même nom
+        if employee_info:
+            employee_name = employee_info[0]['name']
+            all_employees_same_name = client.execute_kw(
+                'hr.employee',
+                'search_read',
+                [[('name', '=', employee_name)]],
+                {'fields': ['id', 'name', 'work_contact_id', 'user_partner_id', 'related_partner_id'], 'limit': 10}
+            )
+            debug_data['all_employees_with_same_name'] = all_employees_same_name
+        
+        return ApiResponse(
+            success=True,
+            data=debug_data,
+            message="Informations de debug récupérées"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du debug: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/fleet/my-trucks", response_model=ApiResponse)
 async def get_my_trucks(
     current_user: dict = Depends(require_scope("pos"))
@@ -2650,16 +2766,16 @@ async def get_my_trucks(
     """
     Récupérer les camions de l'utilisateur connecté
     
-    Cette route récupère tous les camions utilisés par le chauffeur actuellement connecté.
+    Cette route récupère tous les camions affectés au chauffeur actuellement connecté.
     Le partner_id est extrait automatiquement du token JWT.
     
     **Note:** Cette route est spécialement conçue pour les chauffeurs authentifiés par PIN.
     Elle utilise le partner_id stocké dans le token JWT lors de l'authentification.
     
     **Informations retournées :**
-    - Liste des camions uniques utilisés par le chauffeur
+    - Liste des camions affectés au chauffeur (via fleet.vehicle.driver_id)
     - Informations du chauffeur
-    - Nombre de transferts par camion
+    - Détails de chaque camion (modèle, plaque, etc.)
     
     **Requires:** Authentification JWT avec scope 'pos'
     """
@@ -2687,19 +2803,57 @@ async def get_my_trucks(
             raise HTTPException(status_code=404, detail="Chauffeur non trouvé")
         
         driver_info = driver_info[0]
+        driver_name = driver_info['name']
         
-        # Récupérer tous les transferts de ce chauffeur avec le camion
-        transfers = client.execute_kw(
-            'stock.picking',
+        # STRATÉGIE 1: Chercher directement avec le partner_id du token
+        trucks = client.execute_kw(
+            'fleet.vehicle',
             'search_read',
-            [[('x_studio_chauffeur', '=', partner_id), ('x_studio_camionchauffeur', '!=', False)]],
+            [[('driver_id', '=', partner_id), ('active', '=', True)]],
             {
-                'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
-                'order': 'date desc'
+                'fields': [
+                    'id', 'name', 'license_plate', 'model_id', 'brand_id', 
+                    'vin_sn', 'state_id', 'odometer', 'fuel_type', 
+                    'driver_id', 'x_studio_camion'
+                ],
+                'order': 'name asc'
             }
         )
         
-        if not transfers:
+        # STRATÉGIE 2: Si aucun camion trouvé, chercher tous les res.partner avec le même nom
+        # (car il peut y avoir plusieurs partners pour la même personne dans différentes entreprises)
+        if not trucks:
+            logger.info(f"Aucun camion trouvé avec partner_id {partner_id}, recherche par nom: {driver_name}")
+            
+            # Trouver tous les partners avec le même nom
+            all_partners = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [[('name', '=', driver_name)]],
+                {'fields': ['id', 'name', 'company_id'], 'limit': 10}
+            )
+            
+            # Chercher les camions pour chaque partner trouvé
+            for partner in all_partners:
+                partner_trucks = client.execute_kw(
+                    'fleet.vehicle',
+                    'search_read',
+                    [[('driver_id', '=', partner['id']), ('active', '=', True)]],
+                    {
+                        'fields': [
+                            'id', 'name', 'license_plate', 'model_id', 'brand_id', 
+                            'vin_sn', 'state_id', 'odometer', 'fuel_type', 
+                            'driver_id', 'x_studio_camion'
+                        ],
+                        'order': 'name asc'
+                    }
+                )
+                
+                if partner_trucks:
+                    trucks.extend(partner_trucks)
+                    logger.info(f"Trouvé {len(partner_trucks)} camion(s) pour {driver_name} avec partner_id {partner['id']}")
+        
+        if not trucks:
             return ApiResponse(
                 success=True,
                 data={
@@ -2714,41 +2868,25 @@ async def get_my_trucks(
                     'total_trucks': 0
                 },
                 count=0,
-                message=f"Aucun camion trouvé pour {driver_info['name']}"
+                message=f"Aucun camion affecté à {driver_info['name']}"
             )
         
-        # Grouper par camion et compter les transferts
-        trucks_dict = {}
-        for transfer in transfers:
-            if transfer.get('x_studio_camionchauffeur'):
-                truck_id = transfer['x_studio_camionchauffeur'][0]
-                truck_name = transfer['x_studio_camionchauffeur'][1] if len(transfer['x_studio_camionchauffeur']) > 1 else f"Camion {truck_id}"
-                
-                if truck_id not in trucks_dict:
-                    trucks_dict[truck_id] = {
-                        'id': truck_id,
-                        'name': truck_name,
-                        'transfer_count': 0,
-                        'last_transfer_date': None,
-                        'transfers': []
-                    }
-                
-                trucks_dict[truck_id]['transfer_count'] += 1
-                trucks_dict[truck_id]['transfers'].append({
-                    'id': transfer['id'],
-                    'name': transfer['name'],
-                    'origin': transfer.get('origin'),
-                    'state': transfer.get('state'),
-                    'date': transfer.get('date')
-                })
-                
-                # Mettre à jour la dernière date de transfert
-                if transfer.get('date'):
-                    if not trucks_dict[truck_id]['last_transfer_date'] or transfer['date'] > trucks_dict[truck_id]['last_transfer_date']:
-                        trucks_dict[truck_id]['last_transfer_date'] = transfer['date']
-        
-        # Convertir en liste et trier par nombre de transferts
-        trucks_list = sorted(trucks_dict.values(), key=lambda x: x['transfer_count'], reverse=True)
+        # Formater les données des camions
+        trucks_list = []
+        for truck in trucks:
+            truck_data = {
+                'id': truck['id'],
+                'name': truck.get('name', 'N/A'),
+                'license_plate': truck.get('license_plate', 'N/A'),
+                'model': truck['model_id'][1] if truck.get('model_id') and isinstance(truck['model_id'], list) else 'N/A',
+                'brand': truck['brand_id'][1] if truck.get('brand_id') and isinstance(truck['brand_id'], list) else 'N/A',
+                'chassis_number': truck.get('vin_sn'),
+                'state': truck['state_id'][1] if truck.get('state_id') and isinstance(truck['state_id'], list) else 'N/A',
+                'odometer': truck.get('odometer', 0),
+                'fuel_type': truck.get('fuel_type', 'N/A'),
+                'custom_name': truck.get('x_studio_camion')
+            }
+            trucks_list.append(truck_data)
         
         logger.info(f"Trouvé {len(trucks_list)} camion(s) pour le chauffeur {driver_info['name']} (Partner ID: {partner_id})")
         
@@ -2763,11 +2901,10 @@ async def get_my_trucks(
                     'email': driver_info.get('email')
                 },
                 'trucks': trucks_list,
-                'total_trucks': len(trucks_list),
-                'total_transfers': len(transfers)
+                'total_trucks': len(trucks_list)
             },
             count=len(trucks_list),
-            message=f"{len(trucks_list)} camion(s) trouvé(s) avec {len(transfers)} transfert(s)"
+            message=f"{len(trucks_list)} camion(s) affecté(s) à {driver_info['name']}"
         )
         
     except HTTPException:
@@ -2818,19 +2955,59 @@ async def get_trucks_by_driver(
             raise HTTPException(status_code=404, detail="Chauffeur non trouvé (res.partner)")
         
         driver_info = driver_info[0]
+        driver_name = driver_info['name']
         
-        # Récupérer tous les transferts de ce chauffeur avec le camion
-        transfers = client.execute_kw(
-            'stock.picking',
+        # STRATÉGIE 1: Chercher directement avec le driver_id fourni
+        trucks = client.execute_kw(
+            'fleet.vehicle',
             'search_read',
-            [[('x_studio_chauffeur', '=', driver_id), ('x_studio_camionchauffeur', '!=', False)]],
+            [[('driver_id', '=', driver_id), ('active', '=', True)]],
             {
-                'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
-                'order': 'date desc'
+                'fields': [
+                    'id', 'name', 'license_plate', 'model_id', 'brand_id',
+                    'vin_sn', 'state_id', 'odometer', 'fuel_type',
+                    'driver_id', 'x_studio_camion', 'category_id',
+                    'acquisition_date', 'color'
+                ],
+                'order': 'name asc'
             }
         )
         
-        if not transfers:
+        # STRATÉGIE 2: Si aucun camion trouvé, chercher tous les res.partner avec le même nom
+        # (car il peut y avoir plusieurs partners pour la même personne dans différentes entreprises)
+        if not trucks:
+            logger.info(f"Aucun camion trouvé avec driver_id {driver_id}, recherche par nom: {driver_name}")
+            
+            # Trouver tous les partners avec le même nom
+            all_partners = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [[('name', '=', driver_name)]],
+                {'fields': ['id', 'name', 'company_id'], 'limit': 10}
+            )
+            
+            # Chercher les camions pour chaque partner trouvé
+            for partner in all_partners:
+                partner_trucks = client.execute_kw(
+                    'fleet.vehicle',
+                    'search_read',
+                    [[('driver_id', '=', partner['id']), ('active', '=', True)]],
+                    {
+                        'fields': [
+                            'id', 'name', 'license_plate', 'model_id', 'brand_id',
+                            'vin_sn', 'state_id', 'odometer', 'fuel_type',
+                            'driver_id', 'x_studio_camion', 'category_id',
+                            'acquisition_date', 'color'
+                        ],
+                        'order': 'name asc'
+                    }
+                )
+                
+                if partner_trucks:
+                    trucks.extend(partner_trucks)
+                    logger.info(f"Trouvé {len(partner_trucks)} camion(s) pour {driver_name} avec partner_id {partner['id']}")
+        
+        if not trucks:
             return ApiResponse(
                 success=True,
                 data={
@@ -2845,41 +3022,28 @@ async def get_trucks_by_driver(
                     'total_trucks': 0
                 },
                 count=0,
-                message=f"Aucun camion trouvé pour {driver_info['name']}"
+                message=f"Aucun camion affecté à {driver_info['name']}"
             )
         
-        # Grouper par camion et compter les transferts
-        trucks_dict = {}
-        for transfer in transfers:
-            if transfer.get('x_studio_camionchauffeur'):
-                truck_id = transfer['x_studio_camionchauffeur'][0]
-                truck_name = transfer['x_studio_camionchauffeur'][1] if len(transfer['x_studio_camionchauffeur']) > 1 else f"Camion {truck_id}"
-                
-                if truck_id not in trucks_dict:
-                    trucks_dict[truck_id] = {
-                        'id': truck_id,
-                        'name': truck_name,
-                        'transfer_count': 0,
-                        'last_transfer_date': None,
-                        'transfers': []
-                    }
-                
-                trucks_dict[truck_id]['transfer_count'] += 1
-                trucks_dict[truck_id]['transfers'].append({
-                    'id': transfer['id'],
-                    'name': transfer['name'],
-                    'origin': transfer.get('origin'),
-                    'state': transfer.get('state'),
-                    'date': transfer.get('date')
-                })
-                
-                # Mettre à jour la dernière date de transfert
-                if transfer.get('date'):
-                    if not trucks_dict[truck_id]['last_transfer_date'] or transfer['date'] > trucks_dict[truck_id]['last_transfer_date']:
-                        trucks_dict[truck_id]['last_transfer_date'] = transfer['date']
-        
-        # Convertir en liste et trier par nombre de transferts
-        trucks_list = sorted(trucks_dict.values(), key=lambda x: x['transfer_count'], reverse=True)
+        # Formater les données des camions
+        trucks_list = []
+        for truck in trucks:
+            truck_data = {
+                'id': truck['id'],
+                'name': truck.get('name', 'N/A'),
+                'license_plate': truck.get('license_plate', 'N/A'),
+                'model': truck['model_id'][1] if truck.get('model_id') and isinstance(truck['model_id'], list) else 'N/A',
+                'brand': truck['brand_id'][1] if truck.get('brand_id') and isinstance(truck['brand_id'], list) else 'N/A',
+                'chassis_number': truck.get('vin_sn'),
+                'state': truck['state_id'][1] if truck.get('state_id') and isinstance(truck['state_id'], list) else 'N/A',
+                'category': truck['category_id'][1] if truck.get('category_id') and isinstance(truck['category_id'], list) else None,
+                'odometer': truck.get('odometer', 0),
+                'fuel_type': truck.get('fuel_type', 'N/A'),
+                'custom_name': truck.get('x_studio_camion'),
+                'acquisition_date': truck.get('acquisition_date'),
+                'color': truck.get('color')
+            }
+            trucks_list.append(truck_data)
         
         logger.info(f"Trouvé {len(trucks_list)} camion(s) pour le chauffeur {driver_info['name']} (Partner ID: {driver_id})")
         
@@ -2894,11 +3058,10 @@ async def get_trucks_by_driver(
                     'email': driver_info.get('email')
                 },
                 'trucks': trucks_list,
-                'total_trucks': len(trucks_list),
-                'total_transfers': len(transfers)
+                'total_trucks': len(trucks_list)
             },
             count=len(trucks_list),
-            message=f"Trouvé {len(trucks_list)} camion(s) pour {driver_info['name']} ({len(transfers)} transferts)"
+            message=f"{len(trucks_list)} camion(s) affecté(s) à {driver_info['name']}"
         )
         
     except HTTPException:
@@ -2914,99 +3077,149 @@ async def get_trucks_by_driver(
 async def get_all_trucks(
     page: int = Query(1, ge=1, description="Numéro de page"),
     page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
+    active_only: bool = Query(True, description="Afficher uniquement les camions actifs"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Récupérer tous les camions distincts utilisés dans les transferts
+    Récupérer tous les camions depuis fleet.vehicle
     
-    Cette route liste tous les camions uniques (x_studio_camionchauffeur)
-    qui ont été référencés dans les transferts de stock.
+    Cette route liste tous les camions avec leurs informations complètes :
+    - Informations du camion (nom, plaque, modèle, marque)
+    - Chauffeur affecté
+    - État, odomètre, type de carburant
+    - Dates d'acquisition, catégorie, couleur
+    - Informations techniques (chassis, etc.)
     
     **Paramètres :**
     - **page** : Numéro de page (défaut: 1)
     - **page_size** : Éléments par page (défaut: 50, max: 200)
+    - **active_only** : Afficher uniquement les camions actifs (défaut: True)
+    
+    **Informations retournées :**
+    - Liste complète des camions avec toutes leurs informations
+    - Informations du chauffeur affecté (si présent)
+    - Statistiques d'odomètre, état, etc.
     
     **Requires:** Authentification JWT avec scope 'pos'
     """
     try:
         client = get_odoo_client(current_user)
         
-        # Récupérer tous les transferts avec camion (pour avoir les IDs uniques)
-        all_transfers = client.execute_kw(
-            'stock.picking',
+        # Construire le domaine de recherche
+        domain = []
+        if active_only:
+            domain.append(('active', '=', True))
+        
+        # Compter le total
+        total_count = client.execute_kw(
+            'fleet.vehicle',
+            'search_count',
+            [domain]
+        )
+        
+        # Calculer l'offset
+        offset = (page - 1) * page_size
+        
+        # Récupérer les camions avec pagination
+        trucks = client.execute_kw(
+            'fleet.vehicle',
             'search_read',
-            [[('x_studio_camionchauffeur', '!=', False)]],
+            [domain],
             {
-                'fields': ['id', 'name', 'x_studio_camionchauffeur', 'x_studio_chauffeur', 'state', 'date', 'origin'],
-                'order': 'date desc'
+                'fields': [
+                    'id', 'name', 'license_plate', 'model_id', 'brand_id',
+                    'vin_sn', 'state_id', 'odometer', 'fuel_type',
+                    'driver_id', 'x_studio_camion', 'category_id',
+                    'acquisition_date', 'color', 'seats', 'doors',
+                    'transmission', 'horsepower', 'power', 'co2',
+                    'model_year', 'frame_type', 'frame_size',
+                    'car_value', 'residual_value', 'company_id'
+                ],
+                'order': 'name asc',
+                'limit': page_size,
+                'offset': offset
             }
         )
         
-        # Grouper par camion
-        trucks_dict = {}
-        for transfer in all_transfers:
-            if transfer.get('x_studio_camionchauffeur'):
-                truck_id = transfer['x_studio_camionchauffeur'][0]
-                truck_name = transfer['x_studio_camionchauffeur'][1] if len(transfer['x_studio_camionchauffeur']) > 1 else f"Camion {truck_id}"
-                
-                if truck_id not in trucks_dict:
-                    trucks_dict[truck_id] = {
-                        'id': truck_id,
-                        'name': truck_name,
-                        'transfer_count': 0,
-                        'last_transfer_date': None,
-                        'last_driver': None,
-                        'drivers_used': set()
-                    }
-                
-                trucks_dict[truck_id]['transfer_count'] += 1
-                
-                # Ajouter le chauffeur à la liste
-                if transfer.get('x_studio_chauffeur'):
-                    driver_id = transfer['x_studio_chauffeur'][0]
-                    driver_name = transfer['x_studio_chauffeur'][1] if len(transfer['x_studio_chauffeur']) > 1 else f"Chauffeur {driver_id}"
-                    trucks_dict[truck_id]['drivers_used'].add((driver_id, driver_name))
-                
-                # Mettre à jour la dernière date et le dernier chauffeur
-                if transfer.get('date'):
-                    if not trucks_dict[truck_id]['last_transfer_date'] or transfer['date'] > trucks_dict[truck_id]['last_transfer_date']:
-                        trucks_dict[truck_id]['last_transfer_date'] = transfer['date']
-                        if transfer.get('x_studio_chauffeur'):
-                            trucks_dict[truck_id]['last_driver'] = {
-                                'id': transfer['x_studio_chauffeur'][0],
-                                'name': transfer['x_studio_chauffeur'][1] if len(transfer['x_studio_chauffeur']) > 1 else f"Chauffeur {transfer['x_studio_chauffeur'][0]}"
-                            }
+        if not trucks:
+            return ApiResponse(
+                success=True,
+                data={
+                    'trucks': [],
+                    'total_trucks': 0,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': 0
+                },
+                count=0,
+                message="Aucun camion trouvé"
+            )
         
-        # Convertir les sets en listes pour la sérialisation JSON
-        for truck in trucks_dict.values():
-            truck['drivers'] = [{'id': d[0], 'name': d[1]} for d in truck['drivers_used']]
-            del truck['drivers_used']
+        # Formater les données des camions
+        trucks_list = []
+        for truck in trucks:
+            truck_data = {
+                'id': truck['id'],
+                'name': truck.get('name', 'N/A'),
+                'license_plate': truck.get('license_plate', 'N/A'),
+                'model': truck['model_id'][1] if truck.get('model_id') and isinstance(truck['model_id'], list) else 'N/A',
+                'model_id': truck['model_id'][0] if truck.get('model_id') and isinstance(truck['model_id'], list) else None,
+                'brand': truck['brand_id'][1] if truck.get('brand_id') and isinstance(truck['brand_id'], list) else 'N/A',
+                'brand_id': truck['brand_id'][0] if truck.get('brand_id') and isinstance(truck['brand_id'], list) else None,
+                'chassis_number': truck.get('vin_sn'),
+                'state': truck['state_id'][1] if truck.get('state_id') and isinstance(truck['state_id'], list) else 'N/A',
+                'state_id': truck['state_id'][0] if truck.get('state_id') and isinstance(truck['state_id'], list) else None,
+                'category': truck['category_id'][1] if truck.get('category_id') and isinstance(truck['category_id'], list) else None,
+                'category_id': truck['category_id'][0] if truck.get('category_id') and isinstance(truck['category_id'], list) else None,
+                'odometer': truck.get('odometer', 0),
+                'fuel_type': truck.get('fuel_type', 'N/A'),
+                'custom_name': truck.get('x_studio_camion'),
+                'acquisition_date': truck.get('acquisition_date'),
+                'color': truck.get('color'),
+                'seats': truck.get('seats'),
+                'doors': truck.get('doors'),
+                'transmission': truck.get('transmission'),
+                'horsepower': truck.get('horsepower'),
+                'power': truck.get('power'),
+                'co2': truck.get('co2'),
+                'model_year': truck.get('model_year'),
+                'frame_type': truck.get('frame_type'),
+                'frame_size': truck.get('frame_size'),
+                'car_value': truck.get('car_value'),
+                'residual_value': truck.get('residual_value'),
+                'company': truck['company_id'][1] if truck.get('company_id') and isinstance(truck['company_id'], list) else None,
+                'company_id': truck['company_id'][0] if truck.get('company_id') and isinstance(truck['company_id'], list) else None,
+                'driver': None
+            }
+            
+            # Ajouter les informations du chauffeur si présent
+            if truck.get('driver_id') and isinstance(truck['driver_id'], list):
+                truck_data['driver'] = {
+                    'id': truck['driver_id'][0],
+                    'name': truck['driver_id'][1]
+                }
+            
+            trucks_list.append(truck_data)
         
-        # Convertir en liste et trier
-        trucks_list = sorted(trucks_dict.values(), key=lambda x: x['last_transfer_date'] or '', reverse=True)
-        
-        # Pagination
-        total_count = len(trucks_list)
+        # Calculer le nombre total de pages
         total_pages = (total_count + page_size - 1) // page_size
-        offset = (page - 1) * page_size
-        trucks_paginated = trucks_list[offset:offset + page_size]
         
-        logger.info(f"Récupération de {len(trucks_paginated)} camion(s) sur {total_count} au total")
+        logger.info(f"Récupération de {len(trucks_list)} camion(s) sur {total_count} au total (page {page}/{total_pages})")
         
         return ApiResponse(
             success=True,
             data={
-                'trucks': trucks_paginated,
+                'trucks': trucks_list,
                 'pagination': {
                     'total_count': total_count,
                     'page': page,
                     'page_size': page_size,
                     'total_pages': total_pages,
-                    'current_count': len(trucks_paginated)
+                    'current_count': len(trucks_list)
                 }
             },
-            count=total_count,
-            message=f"Trouvé {len(trucks_paginated)} camion(s) sur {total_count} au total (page {page}/{total_pages})"
+            count=len(trucks_list),
+            message=f"Récupéré {len(trucks_list)} camion(s) sur {total_count} au total (page {page}/{total_pages})"
         )
         
     except HTTPException:
@@ -3019,6 +3232,155 @@ async def get_all_trucks(
         )
   
 # ===== GESTION DES SESSIONS POS =====
+
+@router.get("/{pos_id}/suggested-opening-balance", response_model=ApiResponse)
+async def get_suggested_opening_balance(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer le solde d'ouverture suggéré pour une nouvelle session
+    
+    Cette route retourne le solde de fermeture de la dernière session fermée
+    comme suggestion pour le starting_balance de la nouvelle session.
+    
+    **Logique du solde suggéré:**
+    1. Si une session est actuellement ouverte → retourne le solde actuel de cette session
+    2. Si aucune session n'est ouverte → retourne le solde de fermeture de la dernière session fermée
+    3. Si aucune session n'a jamais existé → retourne 0.00
+    
+    **Informations retournées:**
+    - **suggested_balance**: Le solde suggéré pour l'ouverture
+    - **last_session_id**: ID de la dernière session (si existante)
+    - **last_session_state**: État de la dernière session
+    - **last_closing_date**: Date de fermeture de la dernière session
+    - **source**: D'où provient le solde suggéré ('current_session', 'last_closed_session', 'default')
+    
+    **Cas d'utilisation:**
+    - Afficher le solde suggéré avant que le gérant n'ouvre une nouvelle session
+    - Pré-remplir le champ starting_balance dans le formulaire d'ouverture
+    - Vérifier la continuité des soldes entre les sessions
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Vérifier que le PDV existe
+        pos_config = client.execute_kw(
+            'pos.config',
+            'read',
+            [pos_id],
+            {'fields': ['name', 'current_session_id', 'cash_control']}
+        )
+        
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+        
+        pos_config = pos_config[0]
+        
+        # Initialiser les variables
+        suggested_balance = 0.0
+        last_session_id = None
+        last_session_state = None
+        last_closing_date = None
+        source = 'default'
+        
+        # CAS 1: Une session est actuellement ouverte
+        if pos_config.get('current_session_id'):
+            current_session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
+            
+            try:
+                session = client.execute_kw(
+                    'pos.session',
+                    'read',
+                    [current_session_id],
+                    {'fields': ['state', 'cash_register_balance_end_real', 'cash_register_balance_start', 'stop_at']}
+                )
+                
+                if session:
+                    session = session[0]
+                    last_session_id = current_session_id
+                    last_session_state = session.get('state')
+                    last_closing_date = session.get('stop_at')
+                    
+                    # Utiliser le solde actuel de la session ouverte
+                    suggested_balance = float(
+                        session.get('cash_register_balance_end_real', 0) or 
+                        session.get('cash_register_balance_start', 0) or 
+                        0
+                    )
+                    source = 'current_session'
+                    
+                    logger.info(f"PDV {pos_id}: Session {current_session_id} actuellement {last_session_state}, solde: {suggested_balance}")
+            except Exception as e:
+                logger.warning(f"Erreur lors de la récupération de la session courante: {e}")
+        
+        # CAS 2: Aucune session ouverte → chercher la dernière session fermée
+        if source == 'default':
+            try:
+                last_sessions = client.execute_kw(
+                    'pos.session',
+                    'search_read',
+                    [[('config_id', '=', pos_id), ('state', '=', 'closed')]],
+                    {
+                        'fields': ['id', 'cash_register_balance_end_real', 'stop_at'],
+                        'order': 'stop_at desc',  # Trier par date de fermeture décroissante
+                        'limit': 1
+                    }
+                )
+                
+                if last_sessions:
+                    last_session = last_sessions[0]
+                    last_session_id = last_session['id']
+                    last_session_state = 'closed'
+                    last_closing_date = last_session.get('stop_at')
+                    
+                    # Utiliser le solde de fermeture de la dernière session
+                    suggested_balance = float(last_session.get('cash_register_balance_end_real', 0) or 0)
+                    source = 'last_closed_session'
+                    
+                    logger.info(f"PDV {pos_id}: Dernière session fermée {last_session_id}, solde de fermeture: {suggested_balance}")
+                else:
+                    logger.info(f"PDV {pos_id}: Aucune session précédente trouvée, solde suggéré: 0.00")
+            except Exception as e:
+                logger.warning(f"Impossible de récupérer la dernière session fermée: {e}")
+        
+        # CAS 3: Format de réponse selon le contrôle de caisse
+        cash_control_enabled = pos_config.get('cash_control', False)
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'pos_name': pos_config['name'],
+                'suggested_balance': suggested_balance,
+                'last_session_id': last_session_id,
+                'last_session_state': last_session_state,
+                'last_closing_date': last_closing_date,
+                'source': source,
+                'cash_control_enabled': cash_control_enabled,
+                'recommendation': {
+                    'message': f"Utilisez {suggested_balance} comme solde de départ" if suggested_balance > 0 else "Aucune session précédente. Comptez votre caisse et entrez le montant réel.",
+                    'source_description': {
+                        'current_session': "Solde actuel de la session en cours",
+                        'last_closed_session': "Solde de fermeture de la dernière session",
+                        'default': "Aucune session précédente trouvée"
+                    }.get(source, "Solde par défaut")
+                }
+            },
+            message=f"Solde suggéré: {suggested_balance} (source: {source})"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du solde suggéré: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération du solde suggéré: {str(e)}"
+        )
+
 @router.get("/available", response_model=ApiResponse)
 async def get_available_pos_shops(
     page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
