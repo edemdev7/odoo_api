@@ -3230,6 +3230,107 @@ async def get_all_trucks(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
+
+# ===== GESTION DES PRODUITS POUR POMPES =====
+
+@router.get("/products/fuel", response_model=ApiResponse)
+async def get_fuel_products(
+    pos_id: Optional[int] = Query(None, description="ID du point de vente pour filtrer par catégorie"),
+    search: Optional[str] = Query(None, description="Rechercher un produit par nom"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les produits de type carburant/fuel disponibles dans Odoo
+    
+    Cette route est utilisée pour associer des produits aux pompes lors de la configuration.
+    Elle retourne tous les produits qui peuvent être vendus dans un point de vente.
+    
+    **Paramètres :**
+    - **pos_id** : Filtrer par point de vente (optionnel)
+    - **search** : Rechercher par nom (optionnel)
+    
+    **Informations retournées :**
+    - Liste des produits avec ID, nom, prix, code-barres
+    - Catégorie du produit
+    - Unité de mesure
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Construire le domaine de recherche
+        domain = [
+            ('available_in_pos', '=', True),  # Disponible dans POS
+            ('sale_ok', '=', True),  # Peut être vendu
+            ('active', '=', True)  # Actif
+        ]
+        
+        # Ajouter filtre par nom si recherche
+        if search:
+            domain.append(('name', 'ilike', search))
+        
+        # Récupérer les produits
+        products = client.execute_kw(
+            'product.product',
+            'search_read',
+            [domain],
+            {
+                'fields': [
+                    'id', 'name', 'default_code', 'barcode',
+                    'list_price', 'standard_price', 'categ_id',
+                    'uom_id', 'type', 'qty_available', 'description_sale'
+                ],
+                'order': 'name asc',
+                'limit': 100
+            }
+        )
+        
+        if not products:
+            return ApiResponse(
+                success=True,
+                data={'products': []},
+                count=0,
+                message="Aucun produit trouvé"
+            )
+        
+        # Formater les produits
+        products_list = []
+        for prod in products:
+            product_data = {
+                'id': prod['id'],
+                'name': prod.get('name', 'N/A'),
+                'code': prod.get('default_code'),
+                'barcode': prod.get('barcode'),
+                'price': prod.get('list_price', 0.0),
+                'cost': prod.get('standard_price', 0.0),
+                'category': prod['categ_id'][1] if prod.get('categ_id') and isinstance(prod['categ_id'], list) else 'N/A',
+                'category_id': prod['categ_id'][0] if prod.get('categ_id') and isinstance(prod['categ_id'], list) else None,
+                'unit': prod['uom_id'][1] if prod.get('uom_id') and isinstance(prod['uom_id'], list) else 'Unité',
+                'unit_id': prod['uom_id'][0] if prod.get('uom_id') and isinstance(prod['uom_id'], list) else None,
+                'type': prod.get('type', 'product'),
+                'stock_quantity': prod.get('qty_available', 0.0),
+                'description': prod.get('description_sale')
+            }
+            products_list.append(product_data)
+        
+        logger.info(f"Récupéré {len(products_list)} produits disponibles pour POS")
+        
+        return ApiResponse(
+            success=True,
+            data={'products': products_list},
+            count=len(products_list),
+            message=f"{len(products_list)} produit(s) disponible(s)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des produits: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
   
 # ===== GESTION DES SESSIONS POS =====
 
@@ -4715,6 +4816,23 @@ async def create_complete_pos_order(
         total_amount = 0.0
         
         for line in request.lines:
+            # VALIDATION: Vérifier que le produit existe dans Odoo
+            product = client.execute_kw(
+                'product.product',
+                'search_read',
+                [[('id', '=', line.product_id)]],
+                {'fields': ['id', 'name', 'list_price', 'type'], 'limit': 1}
+            )
+            
+            if not product:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Produit {line.product_id} non trouvé dans Odoo. Vérifiez que le produit existe et est actif."
+                )
+            
+            product_info = product[0]
+            logger.info(f"✅ Produit validé: ID={product_info['id']}, Nom={product_info['name']}, Type={product_info['type']}")
+            
             line_total = line.qty * line.price_unit * (1 - (line.discount or 0) / 100)
             total_amount += line_total
             
@@ -4731,10 +4849,15 @@ async def create_complete_pos_order(
             # Ajouter les informations de pompe si disponibles (non None)
             if line.pump_id is not None:
                 line_vals['pump_id'] = line.pump_id  # Champ personnalisé
+                logger.info(f"  → Pompe ID: {line.pump_id}")
             if line.start_pump_index is not None:
                 line_vals['start_pump_index'] = line.start_pump_index
+                logger.info(f"  → Index début: {line.start_pump_index}")
             if line.end_pump_index is not None:
                 line_vals['end_pump_index'] = line.end_pump_index
+                logger.info(f"  → Index fin: {line.end_pump_index}")
+            
+            logger.info(f"  → Quantité: {line.qty}, Prix unitaire: {line.price_unit}, Total: {line_total}")
             
             order_lines.append((0, 0, line_vals))
         

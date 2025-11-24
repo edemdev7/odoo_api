@@ -124,6 +124,8 @@ class StationPumpData(BaseModel):
     stationId: str = Field(..., description="ID de la station")
     type: str = Field(..., description="Type de carburant (PETROL, FUEL, etc.)")
     start_index: float = Field(..., description="Index de début de session")
+    product_id: Optional[int] = Field(None, description="ID du produit Odoo associé (product.product)")
+    product_name: Optional[str] = Field(None, description="Nom du produit Odoo")
 
 # Nouveau schéma unifié pour l'ouverture de session
 class PosUnifiedOpenSessionRequest(BaseModel):

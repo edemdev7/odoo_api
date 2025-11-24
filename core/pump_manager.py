@@ -31,6 +31,8 @@ class PumpManager:
                 pump_name TEXT NOT NULL,
                 station_id TEXT,
                 fuel_type TEXT,
+                product_id INTEGER,
+                product_name TEXT,
                 start_index REAL NOT NULL,
                 current_index REAL NOT NULL,
                 pump_data TEXT NOT NULL,
@@ -39,6 +41,21 @@ class PumpManager:
                 UNIQUE(session_id, pump_external_id)
             )
         ''')
+        
+        # Migration: Ajouter les colonnes product_id et product_name si elles n'existent pas
+        try:
+            cursor.execute("ALTER TABLE pump_sessions ADD COLUMN product_id INTEGER")
+            logger.info("Colonne product_id ajoutée à pump_sessions")
+        except sqlite3.OperationalError:
+            # La colonne existe déjà
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE pump_sessions ADD COLUMN product_name TEXT")
+            logger.info("Colonne product_name ajoutée à pump_sessions")
+        except sqlite3.OperationalError:
+            # La colonne existe déjà
+            pass
         
         # Table pour les ventes par pompe
         cursor.execute('''
@@ -100,17 +117,22 @@ class PumpManager:
                     'stationId': pump.stationId,
                     'type': pump.type,
                     'start_index': pump.start_index,
+                    'product_id': pump.product_id if hasattr(pump, 'product_id') else None,
+                    'product_name': pump.product_name if hasattr(pump, 'product_name') else None,
                     'created_at': datetime.now().isoformat()
                 }
                 
                 cursor.execute('''
                     INSERT INTO pump_sessions 
                     (session_id, pos_id, pump_external_id, pump_name, station_id, 
-                     fuel_type, start_index, current_index, pump_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fuel_type, product_id, product_name, start_index, current_index, pump_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     session_id, pos_id, pump.id, pump.name, pump.stationId,
-                    pump.type, pump.start_index, pump.start_index, 
+                    pump.type, 
+                    pump.product_id if hasattr(pump, 'product_id') else None,
+                    pump.product_name if hasattr(pump, 'product_name') else None,
+                    pump.start_index, pump.start_index, 
                     json.dumps(pump_data)
                 ))
                 
@@ -142,7 +164,7 @@ class PumpManager:
             
             cursor.execute('''
                 SELECT pump_external_id, pump_name, station_id, fuel_type, 
-                       start_index, current_index, pump_data
+                       start_index, current_index, pump_data, product_id, product_name
                 FROM pump_sessions 
                 WHERE session_id = ? 
                 ORDER BY pump_name
@@ -160,6 +182,9 @@ class PumpManager:
                     'type': result[3],
                     'start_index': result[4],
                     'current_index': result[5],
+                    'raw_data': json.loads(result[6]) if result[6] else {},
+                    'product_id': result[7],
+                    'product_name': result[8],
                     'available': True,
                     'quantity_available': result[5] - result[4]  # Index actuel - index début
                 }
