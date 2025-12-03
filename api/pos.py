@@ -4865,6 +4865,31 @@ async def create_complete_pos_order(
             
             order_lines.append((0, 0, line_vals))
         
+        # Gérer les paiements (nouveau format ou ancien format pour rétrocompatibilité)
+        payments_list = []
+        total_paid = 0.0
+        
+        if request.payments:
+            # Nouveau format : liste de paiements
+            for payment in request.payments:
+                payments_list.append(payment)
+                total_paid += payment.amount
+            logger.info(f"💳 {len(payments_list)} méthode(s) de paiement")
+        elif request.payment_method_id and request.amount_paid:
+            # Ancien format (rétrocompatibilité)
+            from models.schemas import PosPayment
+            payments_list.append(PosPayment(
+                payment_method_id=request.payment_method_id,
+                amount=request.amount_paid
+            ))
+            total_paid = request.amount_paid
+            logger.info(f"💳 Format legacy : 1 paiement de {total_paid}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Aucun paiement fourni. Utilisez 'payments' ou l'ancien format 'payment_method_id + amount_paid'"
+            )
+        
         # Créer la commande POS avec tous les champs
         order_vals = {
             'session_id': request.pos_session_id,
@@ -4872,7 +4897,7 @@ async def create_complete_pos_order(
             'user_id': session_data['user_id'][0],
             'lines': order_lines,
             'amount_total': total_amount,
-            'amount_paid': request.amount_paid,
+            'amount_paid': total_paid,
             'amount_return': request.amount_return or 0.0,
             'amount_tax': 0.0,  # À calculer selon les taxes
             'state': 'draft',
@@ -4910,20 +4935,25 @@ async def create_complete_pos_order(
             )
         
         # Créer le paiement
-        if request.amount_paid > 0:
+        # Créer les paiements (peut être multiple)
+        payment_ids = []
+        for payment in payments_list:
             payment_vals = {
                 'pos_order_id': order_id,
-                'payment_method_id': request.payment_method_id,
-                'amount': request.amount_paid,
+                'payment_method_id': payment.payment_method_id,
+                'amount': payment.amount,
                 'payment_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
             
             try:
                 payment_id = client.execute_kw('pos.payment', 'create', [payment_vals])
-                logger.info(f"✅ Paiement créé avec l'ID: {payment_id}")
+                payment_ids.append(payment_id)
+                logger.info(f"✅ Paiement créé: Méthode {payment.payment_method_id}, Montant {payment.amount} (ID: {payment_id})")
             except Exception as e:
                 logger.error(f"❌ Erreur création paiement: {e}")
                 logger.warning(f"Impossible de créer le paiement automatiquement: {e}")
+        
+        logger.info(f"💰 Total paiements créés: {len(payment_ids)}/{len(payments_list)}")
         
         # Marquer la commande comme payée et fermée
         try:
@@ -4955,8 +4985,9 @@ async def create_complete_pos_order(
                 'order_id': order_id,
                 'pos_reference': order_vals['pos_reference'],
                 'amount_total': total_amount,
-                'amount_paid': request.amount_paid,
-                'lines_count': len(order_lines)
+                'amount_paid': total_paid,
+                'lines_count': len(order_lines),
+                'payments_count': len(payment_ids)
             },
             message="Commande POS créée avec succès"
         )
