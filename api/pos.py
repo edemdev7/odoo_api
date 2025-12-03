@@ -4844,18 +4844,22 @@ async def create_complete_pos_order(
                 'discount': line.discount or 0.0,
                 'price_subtotal': line_total,
                 'price_subtotal_incl': line_total,  # À ajuster selon les taxes
+                'full_product_name': product_info['name'],  # ✨ Nom complet du produit
             }
             
-            # Ajouter les informations de pompe si disponibles (non None)
+            # Ajouter les informations de pompe dans la note (car les champs personnalisés n'existent pas)
+            note_parts = []
             if line.pump_id is not None:
-                line_vals['pump_id'] = line.pump_id  # Champ personnalisé
+                note_parts.append(f"Pompe #{line.pump_id}")
                 logger.info(f"  → Pompe ID: {line.pump_id}")
-            if line.start_pump_index is not None:
-                line_vals['start_pump_index'] = line.start_pump_index
-                logger.info(f"  → Index début: {line.start_pump_index}")
-            if line.end_pump_index is not None:
-                line_vals['end_pump_index'] = line.end_pump_index
-                logger.info(f"  → Index fin: {line.end_pump_index}")
+            if line.start_pump_index is not None and line.end_pump_index is not None:
+                note_parts.append(f"Index: {line.start_pump_index} → {line.end_pump_index}")
+                volume = line.end_pump_index - line.start_pump_index
+                note_parts.append(f"Volume: {volume:.2f}L")
+                logger.info(f"  → Index début: {line.start_pump_index}, fin: {line.end_pump_index}")
+            
+            if note_parts:
+                line_vals['note'] = " | ".join(note_parts)
             
             logger.info(f"  → Quantité: {line.qty}, Prix unitaire: {line.price_unit}, Total: {line_total}")
             
@@ -4875,19 +4879,35 @@ async def create_complete_pos_order(
             'date_order': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         
-        # Ajouter les champs optionnels seulement s'ils ne sont pas None
-        if request.partner_id is not None:
+        # Ajouter les champs optionnels seulement s'ils ne sont pas None ET différent de 0
+        if request.partner_id is not None and request.partner_id > 0:
             order_vals['partner_id'] = request.partner_id
+            logger.info(f"Client associé: ID={request.partner_id}")
+        else:
+            logger.info("Vente sans client (anonyme)")
         
         if current_user.get('employee_id'):
             order_vals['employee_id'] = current_user.get('employee_id')
+            logger.info(f"Employé associé: ID={current_user.get('employee_id')}")
         
         # Ajouter une note si fournie
         if request.note:
             order_vals['note'] = request.note
         
+        logger.info(f"📝 Création de la commande POS avec {len(order_lines)} ligne(s)")
+        logger.info(f"   Session: {request.pos_session_id}, Montant total: {total_amount}")
+        
         # Créer la commande
-        order_id = client.execute_kw('pos.order', 'create', [order_vals])
+        try:
+            order_id = client.execute_kw('pos.order', 'create', [order_vals])
+            logger.info(f"✅ Commande créée avec succès - ID: {order_id}")
+        except Exception as e:
+            logger.error(f"❌ Erreur lors de la création de la commande: {e}")
+            logger.error(f"   Valeurs envoyées: {order_vals}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erreur Odoo lors de la création de la commande: {str(e)}"
+            )
         
         # Créer le paiement
         if request.amount_paid > 0:
@@ -4900,15 +4920,34 @@ async def create_complete_pos_order(
             
             try:
                 payment_id = client.execute_kw('pos.payment', 'create', [payment_vals])
-                logger.info(f"Paiement créé avec l'ID: {payment_id}")
+                logger.info(f"✅ Paiement créé avec l'ID: {payment_id}")
             except Exception as e:
+                logger.error(f"❌ Erreur création paiement: {e}")
                 logger.warning(f"Impossible de créer le paiement automatiquement: {e}")
         
         # Marquer la commande comme payée et fermée
         try:
             client.execute_kw('pos.order', 'write', [[order_id], {'state': 'paid'}])
+            logger.info(f"✅ Commande {order_id} marquée comme payée")
         except Exception as e:
+            logger.error(f"❌ Erreur changement d'état: {e}")
             logger.warning(f"Impossible de marquer automatiquement comme payée: {e}")
+        
+        # Vérifier que la commande a bien été créée avec les lignes
+        try:
+            created_order = client.execute_kw(
+                'pos.order',
+                'read',
+                [order_id],
+                {'fields': ['id', 'name', 'lines', 'amount_total', 'state']}
+            )
+            if created_order:
+                logger.info(f"📊 Commande vérifiée: {created_order[0].get('name')}")
+                logger.info(f"   Lignes créées: {len(created_order[0].get('lines', []))} ligne(s)")
+                logger.info(f"   Montant: {created_order[0].get('amount_total')}")
+                logger.info(f"   État: {created_order[0].get('state')}")
+        except Exception as e:
+            logger.warning(f"Impossible de vérifier la commande créée: {e}")
         
         return ApiResponse(
             success=True,
@@ -4927,6 +4966,95 @@ async def create_complete_pos_order(
     except Exception as e:
         logger.error(f"Erreur lors de la création de la commande: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
+
+@router.get("/{pos_id}/orders/{order_id}/debug", response_model=ApiResponse)
+async def debug_pos_order(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    order_id: int = Path(..., description="ID de la commande POS"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les détails complets d'une commande POS pour debugging
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Récupérer la commande
+        order = client.execute_kw(
+            'pos.order',
+            'read',
+            [order_id],
+            {
+                'fields': [
+                    'id', 'name', 'pos_reference', 'date_order', 'state',
+                    'session_id', 'partner_id', 'user_id', 'employee_id',
+                    'lines', 'amount_total', 'amount_paid', 'amount_return',
+                    'amount_tax', 'note'
+                ]
+            }
+        )
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Commande non trouvée")
+        
+        order_data = order[0]
+        
+        # Récupérer les lignes de commande
+        line_ids = order_data.get('lines', [])
+        lines_details = []
+        
+        if line_ids:
+            lines = client.execute_kw(
+                'pos.order.line',
+                'read',
+                [line_ids],
+                {
+                    'fields': [
+                        'id', 'product_id', 'qty', 'price_unit', 'discount',
+                        'price_subtotal', 'price_subtotal_incl', 'full_product_name',
+                        'order_id', 'pack_lot_ids', 'note'
+                    ]
+                }
+            )
+            
+            # Pour chaque ligne, récupérer les lots associés
+            for line in lines:
+                line_info = dict(line)
+                pack_lot_ids = line.get('pack_lot_ids', [])
+                
+                if pack_lot_ids:
+                    # Récupérer les détails des lots
+                    lots = client.execute_kw(
+                        'pos.pack.operation.lot',
+                        'read',
+                        [pack_lot_ids],
+                        {'fields': ['lot_name', 'product_id', 'pos_order_line_id']}
+                    )
+                    line_info['lots_details'] = lots
+                else:
+                    line_info['lots_details'] = []
+                
+                lines_details.append(line_info)
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'order': order_data,
+                'lines': lines_details,
+                'lines_count': len(lines_details),
+                'debug_info': {
+                    'has_pack_lot_ids': any(line.get('pack_lot_ids') for line in lines_details),
+                    'total_lots': sum(len(line.get('pack_lot_ids', [])) for line in lines_details)
+                }
+            },
+            message=f"Commande {order_data.get('name')} - {len(lines_details)} ligne(s)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors du debug de la commande: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def validate_pump_indexes(
     client, session_id: int, pump_end_indexes: List[Dict], pos_id: int
