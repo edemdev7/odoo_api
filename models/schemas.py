@@ -450,7 +450,6 @@ class StockPickingResponse(BaseModel):
         return None if v is False else v
 
 class StockPickingStateUpdateRequest(BaseModel):
-    picking_ids: List[int] = Field(..., description="IDs des transferts à mettre à jour", min_items=1)
     action: str = Field(..., description="Action à effectuer", pattern="^(confirm|assign|done|cancel)$")
     force: bool = Field(False, description="Forcer l'action même si les conditions ne sont pas remplies")
 

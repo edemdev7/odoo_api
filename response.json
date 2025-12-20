@@ -1,0 +1,501 @@
+{
+  "success": true,
+  "data": {
+    "truck_name": "BA6505RB/BA7622RB",
+    "database": "jnp_directe",
+    "transfers": [
+      {
+        "id": 82534,
+        "name": "MGPK6/INT/00048",
+        "code": "25015949311220",
+        "origin": null,
+        "state": "assigned",
+        "picking_type_code": "internal",
+        "truck": {
+          "id": 11446,
+          "name": "SBTF SARL, BA6505RB/BA7622RB"
+        },
+        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
+        "driver": null,
+        "partner_id": [
+          9,
+          "JNP SA"
+        ],
+        "location_id": [
+          1633,
+          "MGPK6/Stock"
+        ],
+        "location_dest_id": [
+          1199,
+          "CAM/Stock"
+        ],
+        "scheduled_date": "2025-12-20 14:31:00",
+        "date_done": null,
+        "date": "2025-12-20 14:31:48",
+        "user_id": [
+          546,
+          "API User"
+        ],
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          1482,
+          "JNP SA - MAGASIN PK6: Transferts internes"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": null,
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          99502
+        ],
+        "move_line_ids": [
+          99134
+        ],
+        "create_date": "2025-12-20 14:31:48",
+        "write_date": "2025-12-20 14:31:52",
+        "create_uid": [
+          546,
+          "API User"
+        ],
+        "write_uid": [
+          546,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 99502,
+            "name": "ENOC ACTIVE SYN OEM 12X 1L",
+            "product_id": [
+              2432,
+              "ENOC ACTIVE SYN OEM 12X 1L"
+            ],
+            "product_uom_qty": 15,
+            "product_qty": 15,
+            "product_uom": [
+              1,
+              "Units"
+            ],
+            "state": "assigned",
+            "location_id": [
+              1633,
+              "MGPK6/Stock"
+            ],
+            "location_dest_id": [
+              1199,
+              "CAM/Stock"
+            ],
+            "date": "2025-12-20 14:31:00",
+            "origin": false,
+            "reference": "MGPK6/INT/00048",
+            "description_picking": "ENOC ACTIVE SYN OEM 12X 1L",
+            "product_details": {
+              "id": 2432,
+              "name": "ENOC ACTIVE SYN OEM 12X 1L",
+              "display_name": "ENOC ACTIVE SYN OEM 12X 1L",
+              "default_code": false,
+              "barcode": false,
+              "uom_id": [
+                1,
+                "Units"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 8500,
+              "standard_price": 3239
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 99134,
+            "move_id": [
+              99502,
+              "Stock>Stock"
+            ],
+            "product_id": [
+              2432,
+              "ENOC ACTIVE SYN OEM 12X 1L"
+            ],
+            "product_uom_id": [
+              1,
+              "Units"
+            ],
+            "qty_done": 0,
+            "quantity": 15,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1633,
+              "MGPK6/Stock"
+            ],
+            "location_dest_id": [
+              1199,
+              "CAM/Stock"
+            ],
+            "picking_id": [
+              82534,
+              "MGPK6/INT/00048"
+            ],
+            "state": "assigned",
+            "reference": "MGPK6/INT/00048"
+          }
+        ],
+        "picking_type_details": {
+          "id": 1482,
+          "name": "Transferts internes",
+          "code": "internal",
+          "warehouse_id": [
+            168,
+            "JNP SA - MAGASIN PK6"
+          ],
+          "default_location_src_id": [
+            1633,
+            "MGPK6/Stock"
+          ],
+          "default_location_dest_id": [
+            1633,
+            "MGPK6/Stock"
+          ],
+          "sequence_code": "INT"
+        },
+        "product_summary": [
+          {
+            "product_name": "ENOC ACTIVE SYN OEM 12X 1L",
+            "product_code": false,
+            "quantity": 15,
+            "uom": "Units"
+          }
+        ]
+      },
+      {
+        "id": 82533,
+        "name": "DEPOT/INT/00287",
+        "code": "25015626301220",
+        "origin": null,
+        "state": "confirmed",
+        "picking_type_code": "internal",
+        "truck": {
+          "id": 11446,
+          "name": "SBTF SARL, BA6505RB/BA7622RB"
+        },
+        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
+        "driver": null,
+        "partner_id": [
+          9,
+          "JNP SA"
+        ],
+        "location_id": [
+          1183,
+          "DEPOT/Stock"
+        ],
+        "location_dest_id": [
+          1199,
+          "CAM/Stock"
+        ],
+        "scheduled_date": "2025-12-20 14:29:42",
+        "date_done": null,
+        "date": "2025-12-20 14:30:26",
+        "user_id": [
+          546,
+          "API User"
+        ],
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          1238,
+          "JNP SA - DEPOT SOMMIER: Transferts internes"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": null,
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          99501
+        ],
+        "move_line_ids": [],
+        "create_date": "2025-12-20 14:30:26",
+        "write_date": "2025-12-20 14:30:28",
+        "create_uid": [
+          546,
+          "API User"
+        ],
+        "write_uid": [
+          546,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 99501,
+            "name": "[DIESEL] GASOIL",
+            "product_id": [
+              3014,
+              "[DIESEL] GAS-OIL"
+            ],
+            "product_uom_qty": 5000,
+            "product_qty": 5000,
+            "product_uom": [
+              10,
+              "L"
+            ],
+            "state": "confirmed",
+            "location_id": [
+              1183,
+              "DEPOT/Stock"
+            ],
+            "location_dest_id": [
+              1199,
+              "CAM/Stock"
+            ],
+            "date": "2025-12-20 14:29:42",
+            "origin": false,
+            "reference": "DEPOT/INT/00287",
+            "description_picking": "Pour les transfert internes, les produits doivent être pris dans l'emplacement Stock de l'entrepôt pour les camions et ensuite des camions pour les Point de vente gérance directe",
+            "product_details": {
+              "id": 3014,
+              "name": "GAS-OIL",
+              "display_name": "[DIESEL] GAS-OIL",
+              "default_code": "DIESEL",
+              "barcode": false,
+              "uom_id": [
+                10,
+                "L"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 720,
+              "standard_price": 539.7148000000001
+            }
+          }
+        ],
+        "move_line_details": [],
+        "picking_type_details": {
+          "id": 1238,
+          "name": "Transferts internes",
+          "code": "internal",
+          "warehouse_id": [
+            141,
+            "JNP SA - DEPOT SOMMIER"
+          ],
+          "default_location_src_id": [
+            1183,
+            "DEPOT/Stock"
+          ],
+          "default_location_dest_id": [
+            1183,
+            "DEPOT/Stock"
+          ],
+          "sequence_code": "INT"
+        },
+        "product_summary": [
+          {
+            "product_name": "GAS-OIL",
+            "product_code": "DIESEL",
+            "quantity": 5000,
+            "uom": "L"
+          }
+        ]
+      },
+      {
+        "id": 82532,
+        "name": "DEPOT/INT/00286",
+        "code": "25015353201220",
+        "origin": null,
+        "state": "done",
+        "picking_type_code": "internal",
+        "truck": {
+          "id": 11446,
+          "name": "SBTF SARL, BA6505RB/BA7622RB"
+        },
+        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
+        "driver": null,
+        "partner_id": [
+          9,
+          "JNP SA"
+        ],
+        "location_id": [
+          1183,
+          "DEPOT/Stock"
+        ],
+        "location_dest_id": [
+          1199,
+          "CAM/Stock"
+        ],
+        "scheduled_date": "2025-12-20 14:15:59",
+        "date_done": "2025-12-20 14:28:00",
+        "date": "2025-12-20 14:20:53",
+        "user_id": [
+          546,
+          "API User"
+        ],
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          1238,
+          "JNP SA - DEPOT SOMMIER: Transferts internes"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": null,
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          99500
+        ],
+        "move_line_ids": [
+          99133
+        ],
+        "create_date": "2025-12-20 14:20:53",
+        "write_date": "2025-12-20 14:28:00",
+        "create_uid": [
+          546,
+          "API User"
+        ],
+        "write_uid": [
+          546,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 99500,
+            "name": "[SUPER] ESSENCE",
+            "product_id": [
+              2998,
+              "[SUPER] ESSENCE"
+            ],
+            "product_uom_qty": 1000,
+            "product_qty": 1000,
+            "product_uom": [
+              10,
+              "L"
+            ],
+            "state": "done",
+            "location_id": [
+              1183,
+              "DEPOT/Stock"
+            ],
+            "location_dest_id": [
+              1199,
+              "CAM/Stock"
+            ],
+            "date": "2025-12-20 14:28:00",
+            "origin": false,
+            "reference": "DEPOT/INT/00286",
+            "description_picking": "ESSENCE",
+            "product_details": {
+              "id": 2998,
+              "name": "ESSENCE",
+              "display_name": "[SUPER] ESSENCE",
+              "default_code": "SUPER",
+              "barcode": false,
+              "uom_id": [
+                10,
+                "L"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 695,
+              "standard_price": 515.5006000000001
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 99133,
+            "move_id": [
+              99500,
+              "SUPER: Stock>Stock"
+            ],
+            "product_id": [
+              2998,
+              "[SUPER] ESSENCE"
+            ],
+            "product_uom_id": [
+              10,
+              "L"
+            ],
+            "qty_done": 1000,
+            "quantity": 1000,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1183,
+              "DEPOT/Stock"
+            ],
+            "location_dest_id": [
+              1199,
+              "CAM/Stock"
+            ],
+            "picking_id": [
+              82532,
+              "DEPOT/INT/00286"
+            ],
+            "state": "done",
+            "reference": "DEPOT/INT/00286"
+          }
+        ],
+        "picking_type_details": {
+          "id": 1238,
+          "name": "Transferts internes",
+          "code": "internal",
+          "warehouse_id": [
+            141,
+            "JNP SA - DEPOT SOMMIER"
+          ],
+          "default_location_src_id": [
+            1183,
+            "DEPOT/Stock"
+          ],
+          "default_location_dest_id": [
+            1183,
+            "DEPOT/Stock"
+          ],
+          "sequence_code": "INT"
+        },
+        "product_summary": [
+          {
+            "product_name": "ESSENCE",
+            "product_code": "SUPER",
+            "quantity": 1000,
+            "uom": "L"
+          }
+        ]
+      }
+    ],
+    "filters_applied": {
+      "truck_name": "BA6505RB/BA7622RB",
+      "state": null,
+      "date_from": null,
+      "date_to": null
+    },
+    "pagination": {
+      "total_count": 3,
+      "page": 1,
+      "page_size": 50,
+      "total_pages": 1,
+      "current_count": 3
+    }
+  },
+  "message": "Trouvé 3 transfert(s) sur 3 pour le camion 'BA6505RB/BA7622RB' (page 1/1)",
+  "count": 3
+}

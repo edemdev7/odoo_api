@@ -2120,7 +2120,7 @@ async def get_transfers_by_truck(
             'move_ids', 'pos_session_id', 'pos_order_id', 'note',
             
             # Champs personnalisés pour le camion et chauffeur
-            'x_studio_camionchauffeur', 'x_studio_chauffeur',
+            'x_studio_camionchauffeur', 'x_studio_chauffeur', 'x_studio_code',
             
             # Champs détaillés
             'picking_type_id', 'priority', 'date', 'date_deadline',
@@ -2263,6 +2263,7 @@ async def get_transfers_by_truck(
                     # Champs de base
                     'id': transfer['id'],
                     'name': transfer.get('name', ''),
+                    'code': clean_odoo_value(transfer.get('x_studio_code')),
                     'origin': clean_odoo_value(transfer.get('origin')),
                     'state': transfer.get('state', 'draft'),
                     'picking_type_code': clean_odoo_value(transfer.get('picking_type_code')),
@@ -2371,16 +2372,16 @@ async def get_transfers_by_truck(
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
 
-@router.post("/{pos_id}/inventory/transfers/update-state", response_model=ApiResponse)
+@router.post("/inventory/transfers/{transfer_id}/update-state", response_model=ApiResponse)
 async def update_inventory_transfer_state(
-    pos_id: int = Path(..., description="ID du point de vente"),
+    transfer_id: int = Path(..., description="ID du transfert de stock"),
     request: StockPickingStateUpdateRequest = Body(...),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Changer l'état des transferts de stock (de prêt à fait, par exemple)
+    Changer l'état d'un transfert de stock
     
-    Cette route permet de faire évoluer l'état des transferts de stock selon
+    Cette route permet de faire évoluer l'état d'un transfert de stock selon
     le workflow Odoo standard :
     - **confirm** : Confirmer le transfert (draft → waiting/ready)
     - **assign** : Réserver les produits (waiting → ready)
@@ -2388,254 +2389,150 @@ async def update_inventory_transfer_state(
     - **cancel** : Annuler le transfert (any → cancel)
     
     **Actions disponibles :**
-    - **confirm** : Confirme les transferts en brouillon
+    - **confirm** : Confirme le transfert en brouillon
     - **assign** : Réserve les quantités disponibles
-    - **done** : Valide et termine les transferts
-    - **cancel** : Annule les transferts
+    - **done** : Valide et termine le transfert
+    - **cancel** : Annule le transfert
     
     **Paramètres :**
-    - **picking_ids** : Liste des IDs de transferts à traiter
-    - **action** : Action à effectuer
+    - **transfer_id** : ID du transfert (dans l'URL)
+    - **action** : Action à effectuer (confirm/assign/done/cancel)
     - **force** : Forcer l'action même si les conditions ne sont pas remplies
+    
+    **Exemple d'utilisation :**
+    ```
+    POST /pos/inventory/transfers/82534/update-state
+    {
+      "action": "done",
+      "force": false
+    }
+    ```
     
     **Requires:** Authentification JWT avec scope 'pos'
     """
     try:
         client = get_odoo_client(current_user)
         
-        # Vérifier que le PDV existe
-        pos_config = client.execute_kw(
-            'pos.config',
-            'search_read',
-            [[('id', '=', pos_id)]],
-            {'fields': ['id', 'name'], 'limit': 1}
-        )
-        
-        if not pos_config:
-            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
-        
-        pos_config = pos_config[0]
-        
-        # Vérifier que les transferts existent
-        existing_transfers = client.execute_kw(
+        # Vérifier que le transfert existe
+        transfer = client.execute_kw(
             'stock.picking',
             'search_read',
-            [[('id', 'in', request.picking_ids)]],
-            {'fields': ['id', 'name', 'state'], 'limit': len(request.picking_ids)}
+            [[('id', '=', transfer_id)]],
+            {'fields': ['id', 'name', 'state', 'picking_type_code'], 'limit': 1}
         )
         
-        if len(existing_transfers) != len(request.picking_ids):
-            found_ids = [t['id'] for t in existing_transfers]
-            missing_ids = set(request.picking_ids) - set(found_ids)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Transferts non trouvés: {list(missing_ids)}"
-            )
+        if not transfer:
+            raise HTTPException(status_code=404, detail=f"Transfert {transfer_id} non trouvé")
         
-        # Préparer les résultats
-        results = []
-        errors = []
+        transfer = transfer[0]
+        transfer_name = transfer['name']
+        current_state = transfer['state']
         
-        # Traiter chaque transfert selon l'action demandée
-        for transfer in existing_transfers:
-            transfer_id = transfer['id']
-            transfer_name = transfer['name']
-            current_state = transfer['state']
+        logger.info(f"🔄 Mise à jour transfert {transfer_name} (ID: {transfer_id}): {current_state} → action '{request.action}'")
+        
+        try:
+            success = False
+            new_state = current_state
             
-            try:
-                success = False
-                new_state = current_state
-                
-                if request.action == "confirm":
-                    # Confirmer le transfert
-                    if current_state == 'draft':
-                        client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
-                        success = True
-                        new_state = 'waiting'
-                    elif request.force:
-                        client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
-                        success = True
-                    else:
-                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la confirmation")
-                
-                elif request.action == "assign":
-                    # Réserver les produits
-                    if current_state in ['waiting', 'confirmed']:
-                        client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
-                        success = True
-                        new_state = 'assigned'
-                    elif request.force:
-                        client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
-                        success = True
-                    else:
-                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la réservation")
-                
-                elif request.action == "done":
-                    # Terminer le transfert
-                    if current_state in ['assigned', 'confirmed'] or request.force:
-                        try:
-                            # Étape 1 : Réserver les produits si nécessaire
-                            if current_state != 'assigned':
-                                client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
-                            
-                            # Étape 2 : Définir les quantités réalisées pour toutes les move_lines
-                            # D'abord récupérer les mouvements pour connaître les quantités demandées
-                            moves = client.execute_kw(
-                                'stock.move',
-                                'search_read',
-                                [[('picking_id', '=', transfer_id)]],
-                                {'fields': ['id', 'product_uom_qty', 'state']}
-                            )
-                            
-                            # Créer un mapping des quantités par mouvement
-                            move_qty_map = {m['id']: m['product_uom_qty'] for m in moves}
-                            
-                            # Récupérer les move_lines
-                            move_lines = client.execute_kw(
-                                'stock.move.line',
-                                'search_read',
-                                [[('picking_id', '=', transfer_id)]],
-                                {'fields': ['id', 'qty_done', 'quantity', 'move_id']}
-                            )
-                            
-                            # Mettre à jour qty_done avec la quantité demandée du mouvement
-                            for line in move_lines:
-                                if line['qty_done'] == 0:
-                                    # Utiliser la quantité du mouvement parent ou la quantité réservée
-                                    move_id = line['move_id'][0] if line.get('move_id') else None
-                                    target_qty = move_qty_map.get(move_id, line.get('quantity', 0))
-                                    
-                                    if target_qty > 0:
-                                        client.execute_kw(
-                                            'stock.move.line',
-                                            'write',
-                                            [[line['id']], {'qty_done': target_qty}]
-                                        )
-                                        logger.info(f"Défini qty_done={target_qty} pour move_line {line['id']}")
-                            
-                            # Étape 3 : Valider le transfert
-                            # Utiliser button_validate (méthode standard Odoo)
-                            result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                            
-                            # button_validate peut retourner un wizard pour backorder
-                            if isinstance(result, dict) and 'res_model' in result:
-                                wizard_id = result['res_id']
-                                wizard_model = result['res_model']
-                                
-                                if wizard_model == 'stock.backorder.confirmation':
-                                    # Wizard de reliquat - créer un reliquat automatiquement
-                                    logger.info(f"Wizard de reliquat détecté pour le transfert {transfer_id}")
-                                    try:
-                                        # Option 1: Créer un reliquat (bouton "Créer un reliquat")
-                                        client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                                        logger.info(f"Reliquat créé pour le transfert {transfer_id}")
-                                    except Exception as wizard_error:
-                                        logger.warning(f"Erreur avec wizard reliquat: {wizard_error}")
-                                        # Option 2: Ne pas créer de reliquat (bouton "AUCUN RELIQUAT")
-                                        client.execute_kw('stock.backorder.confirmation', 'process_cancel_backorder', [[wizard_id]])
-                                        logger.info(f"Transfert validé sans reliquat pour {transfer_id}")
-                                
-                                elif wizard_model == 'stock.immediate.transfer':
-                                    # Wizard de transfert immédiat
-                                    logger.info(f"Wizard de transfert immédiat pour {transfer_id}")
-                                    client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
-                                
-                                else:
-                                    logger.warning(f"Wizard non géré: {wizard_model} pour le transfert {transfer_id}")
-                                    # Essayer process générique
-                                    try:
-                                        client.execute_kw(wizard_model, 'process', [[wizard_id]])
-                                    except:
-                                        pass
-                            
-                            success = True
-                            new_state = 'done'
-                                
-                        except Exception as e:
-                            logger.error(f"Erreur lors de la validation du transfert {transfer_id}: {e}")
-                            if request.force:
-                                try:
-                                    # En cas d'erreur, forcer avec action_done si force=True
-                                    client.execute_kw('stock.picking', 'write', [[transfer_id], {'state': 'done'}])
-                                    success = True
-                                    new_state = 'done'
-                                    logger.warning(f"Transfert {transfer_id} forcé à l'état 'done'")
-                                except Exception as force_error:
-                                    errors.append(f"{transfer_name}: Impossible de forcer à 'done': {force_error}")
-                            else:
-                                errors.append(f"{transfer_name}: Erreur validation: {e}")
-                    else:
-                        errors.append(f"{transfer_name}: État '{current_state}' ne permet pas la validation (utilisez force=true)")
-                
-                elif request.action == "cancel":
-                    # Annuler le transfert
-                    if current_state != 'done':
-                        client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
-                        success = True
-                        new_state = 'cancel'
-                    elif request.force:
-                        client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
-                        success = True
-                        new_state = 'cancel'
-                    else:
-                        errors.append(f"{transfer_name}: Transfert terminé, impossible d'annuler")
-                
-                if success:
-                    results.append({
-                        'id': transfer_id,
-                        'name': transfer_name,
-                        'previous_state': current_state,
-                        'new_state': new_state,
-                        'success': True
-                    })
-                
-            except Exception as e:
-                error_msg = f"{transfer_name}: Erreur lors de l'action '{request.action}': {str(e)}"
-                errors.append(error_msg)
-                logger.error(f"Erreur transfert {transfer_id}: {e}")
-                
-                results.append({
-                    'id': transfer_id,
-                    'name': transfer_name,
+            if request.action == "confirm":
+                # Confirmer le transfert (draft → waiting/ready)
+                if current_state == 'draft':
+                    client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
+                    success = True
+                    new_state = 'confirmed'
+                    logger.info(f"✅ Transfert {transfer_name} confirmé")
+                elif request.force:
+                    client.execute_kw('stock.picking', 'action_confirm', [[transfer_id]])
+                    success = True
+                    logger.warning(f"⚠️ Transfert {transfer_name} confirmé en mode forcé (état initial: {current_state})")
+                else:
+                    raise ValueError(f"Le transfert doit être en état 'draft' pour être confirmé (état actuel: {current_state})")
+            
+            elif request.action == "assign":
+                # Réserver les produits (waiting → ready)
+                if current_state in ['confirmed', 'waiting', 'partially_available']:
+                    client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
+                    success = True
+                    new_state = 'assigned'
+                    logger.info(f"✅ Transfert {transfer_name} assigné (produits réservés)")
+                elif request.force:
+                    client.execute_kw('stock.picking', 'action_assign', [[transfer_id]])
+                    success = True
+                    logger.warning(f"⚠️ Transfert {transfer_name} assigné en mode forcé (état initial: {current_state})")
+                else:
+                    raise ValueError(f"Le transfert doit être confirmé pour réserver les produits (état actuel: {current_state})")
+            
+            elif request.action == "done":
+                # Valider le transfert (ready/assigned → done)
+                if current_state in ['assigned', 'confirmed']:
+                    # Vérifier si des quantités sont définies
+                    client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                    success = True
+                    new_state = 'done'
+                    logger.info(f"✅ Transfert {transfer_name} validé et terminé")
+                elif request.force:
+                    client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                    success = True
+                    new_state = 'done'
+                    logger.warning(f"⚠️ Transfert {transfer_name} validé en mode forcé (état initial: {current_state})")
+                else:
+                    raise ValueError(f"Le transfert doit être assigné pour être validé (état actuel: {current_state})")
+            
+            elif request.action == "cancel":
+                # Annuler le transfert
+                if current_state != 'done':
+                    client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
+                    success = True
+                    new_state = 'cancel'
+                    logger.info(f"✅ Transfert {transfer_name} annulé")
+                elif request.force:
+                    client.execute_kw('stock.picking', 'action_cancel', [[transfer_id]])
+                    success = True
+                    new_state = 'cancel'
+                    logger.warning(f"⚠️ Transfert {transfer_name} annulé en mode forcé (état initial: {current_state})")
+                else:
+                    raise ValueError(f"Impossible d'annuler un transfert terminé (état actuel: {current_state})")
+            
+            # Récupérer l'état mis à jour
+            updated_transfer = client.execute_kw(
+                'stock.picking',
+                'read',
+                [[transfer_id]],
+                {'fields': ['id', 'name', 'state']}
+            )
+            
+            if updated_transfer:
+                new_state = updated_transfer[0]['state']
+            
+            logger.info(f"📊 Résultat: {transfer_name} - {current_state} → {new_state} (succès: {success})")
+            
+            return ApiResponse(
+                success=True,
+                data={
+                    'transfer_id': transfer_id,
+                    'transfer_name': transfer_name,
+                    'action': request.action,
                     'previous_state': current_state,
-                    'new_state': current_state,
-                    'success': False,
-                    'error': str(e)
-                })
-        
-        # Préparer la réponse
-        success_count = len([r for r in results if r.get('success', False)])
-        error_count = len(errors)
-        
-        message = f"Action '{request.action}' : {success_count} succès"
-        if error_count > 0:
-            message += f", {error_count} erreur(s)"
-        
-        logger.info(f"Mise à jour état transferts PDV {pos_config['name']}: {message}")
-        
-        return ApiResponse(
-            success=error_count == 0,
-            data={
-                'pos_info': {
-                    'id': pos_id,
-                    'name': pos_config['name']
+                    'new_state': new_state,
+                    'state_changed': new_state != current_state
                 },
-                'action': request.action,
-                'results': results,
-                'summary': {
-                    'total_processed': len(request.picking_ids),
-                    'success_count': success_count,
-                    'error_count': error_count
-                },
-                'errors': errors if errors else None
-            },
-            message=message
-        )
+                message=f"Action '{request.action}' effectuée sur le transfert {transfer_name}: {current_state} → {new_state}"
+            )
+            
+        except ValueError as ve:
+            logger.error(f"❌ Erreur validation: {ve}")
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(f"❌ Erreur lors de l'action '{request.action}' sur transfert {transfer_id}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erreur lors de l'action '{request.action}': {str(e)}"
+            )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de la mise à jour des transferts: {e}")
+        logger.error(f"Erreur lors de la mise à jour du transfert {transfer_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la mise à jour: {str(e)}"
