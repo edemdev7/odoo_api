@@ -1704,6 +1704,9 @@ async def get_pos_inventory_transfers(
             'user_id', 'company_id', 'products_availability', 'products_availability_state',
             'move_ids', 'pos_session_id', 'pos_order_id', 'note',
             
+            # Champ personnalisé pour le code du transfert
+            'x_studio_code',
+            
             # Champs détaillés supplémentaires
             'picking_type_id', 'priority', 'date', 'date_deadline',
             'move_type', 'group_id', 'has_scrap_move', 'has_packages', 
@@ -1735,17 +1738,38 @@ async def get_pos_inventory_transfers(
             'delay_alert_date', 'quality_check_todo', 'quality_check_fail'
         ]
         
-        transfers = client.execute_kw(
-            'stock.picking',
-            'search_read',
-            [domain],
-            {
-                'fields': fields,
-                'limit': page_size,
-                'offset': offset,
-                'order': 'date desc, id desc'
-            }
-        )
+        # Essayer d'abord avec le champ personnalisé x_studio_code
+        transfers = None
+        try:
+            transfers = client.execute_kw(
+                'stock.picking',
+                'search_read',
+                [domain],
+                {
+                    'fields': fields,
+                    'limit': page_size,
+                    'offset': offset,
+                    'order': 'date desc, id desc'
+                }
+            )
+        except Exception as e:
+            # Si x_studio_code n'existe pas, retirer ce champ et réessayer
+            if 'x_studio_code' in str(e):
+                logger.debug(f"Champ x_studio_code non disponible, récupération sans ce champ")
+                fields.remove('x_studio_code')
+                transfers = client.execute_kw(
+                    'stock.picking',
+                    'search_read',
+                    [domain],
+                    {
+                        'fields': fields,
+                        'limit': page_size,
+                        'offset': offset,
+                        'order': 'date desc, id desc'
+                    }
+                )
+            else:
+                raise
         
         # Enrichir chaque transfert avec les détails des mouvements
         for transfer in transfers:
@@ -1868,6 +1892,7 @@ async def get_pos_inventory_transfers(
                     # Champs de base
                     'id': transfer['id'],
                     'name': transfer.get('name', ''),
+                    'code': clean_odoo_value(transfer.get('x_studio_code')),
                     'origin': clean_odoo_value(transfer.get('origin')),
                     'state': transfer.get('state', 'draft'),
                     'picking_type_code': clean_odoo_value(transfer.get('picking_type_code')),
@@ -2018,6 +2043,7 @@ async def get_pos_inventory_transfers(
 @router.get("/inventory/transfers/by-truck", response_model=ApiResponse)
 async def get_transfers_by_truck(
     truck_name: str = Query(..., description="Nom du camion (recherche partielle)"),
+    transfer_type: Optional[str] = Query(None, description="Type de transfert (internal/incoming/outgoing ou all)"),
     state: Optional[str] = Query(None, description="État du transfert"),
     date_from: Optional[str] = Query(None, description="Date de début (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Date de fin (YYYY-MM-DD)"),
@@ -2026,75 +2052,186 @@ async def get_transfers_by_truck(
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Récupérer les transferts internes filtrés par nom de camion
+    Récupérer les transferts (internes, livraisons, réceptions) filtrés par nom de camion
     
-    Cette route permet de rechercher tous les transferts internes (internal)
-    associés à un camion spécifique, identifié par son nom.
+    Cette route permet de rechercher tous les types de transferts associés à un camion spécifique :
+    - **Transferts internes** (internal) : Inventaires/Opérations/Transferts/Interne
+    - **Livraisons** (outgoing) : Inventaires/Opérations/Transferts/Livraisons
+    - **Réceptions** (incoming) : Inventaires/Opérations/Transferts/Réceptions
     
     **Paramètres :**
     - **truck_name** : Nom du camion (recherche partielle, insensible à la casse)
+    - **transfer_type** : Type de transfert à filtrer :
+      - `internal` : Transferts internes uniquement
+      - `incoming` : Réceptions uniquement
+      - `outgoing` : Livraisons uniquement
+      - `all` ou null : Tous les types (défaut)
     - **state** : Filtrer par état (draft/waiting/ready/done/cancel)
     - **date_from/date_to** : Période de recherche
     - **page** : Numéro de page (défaut: 1)
     - **page_size** : Éléments par page (défaut: 50, max: 200)
     
-    **Note:** Le nom du camion est recherché dans le champ personnalisé `x_studio_camionchauffeur`.
-    C'est le champ many2one qui référence le camion dans Odoo.
+    **Note:** La recherche se fait sur plusieurs champs :
+    - Champ personnalisé `x_studio_camion` (si disponible)
+    - Champs standards `origin` et `name`
     
     **Requires:** Authentification JWT avec scope 'pos'
     """
     try:
         client = get_odoo_client(current_user)
         
-        # D'abord, rechercher les IDs des camions correspondant au nom
-        truck_ids = client.execute_kw(
-            'res.partner',  # Les camions sont généralement des partenaires
-            'search',
-            [[('name', 'ilike', truck_name)]]
-        )
-        
-        # Construire le domaine de recherche
-        domain = [
-            ('picking_type_code', '=', 'internal'),  # Uniquement les transferts internes
-        ]
-        
-        # Ajouter le filtre sur le camion si des IDs ont été trouvés
-        if truck_ids:
-            domain.append(('x_studio_camionchauffeur', 'in', truck_ids))
+        # Déterminer le(s) type(s) de transfert à rechercher
+        transfer_types = []
+        if transfer_type and transfer_type != 'all':
+            # Un seul type spécifique
+            if transfer_type in ['internal', 'incoming', 'outgoing']:
+                transfer_types = [transfer_type]
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Type de transfert invalide: {transfer_type}. Utilisez 'internal', 'incoming', 'outgoing' ou 'all'"
+                )
         else:
-            # Si aucun camion trouvé, chercher aussi dans origin comme fallback
-            domain.append(('origin', 'ilike', truck_name))
+            # Par défaut, chercher dans tous les types
+            transfer_types = ['internal', 'incoming', 'outgoing']
         
-        # Ajouter les filtres optionnels
-        if state:
-            domain.append(('state', '=', state))
+        logger.info(f"Recherche transferts de type(s): {transfer_types} pour camion '{truck_name}'")
         
-        if date_from:
-            domain.append(('date', '>=', f"{date_from} 00:00:00"))
+        # STRATÉGIE: Chercher dans plusieurs champs possibles
+        # Pour chaque stratégie, on cherche TOUS les types de transferts demandés
         
-        if date_to:
-            domain.append(('date', '<=', f"{date_to} 23:59:59"))
+        # Fonction helper pour créer un domaine multi-types
+        def create_multi_type_domain(base_conditions):
+            """Crée un domaine qui combine tous les types de transferts avec OU logique"""
+            if len(transfer_types) == 1:
+                # Un seul type : domaine simple
+                return [('picking_type_code', '=', transfer_types[0])] + base_conditions
+            else:
+                # Plusieurs types : utiliser 'in'
+                return [('picking_type_code', 'in', transfer_types)] + base_conditions
         
-        # Filtrer par base de données (si transfer_type_code est défini)
+        # Liste des stratégies à essayer (dans l'ordre de priorité)
+        search_strategies = []
+        
+        # Stratégie 0: Chercher via le champ personnalisé x_studio_camion (many2one vers res.partner)
+        try:
+            truck_ids_from_partner = client.execute_kw(
+                'res.partner',
+                'search',
+                [[('name', 'ilike', truck_name)]]
+            )
+            
+            if truck_ids_from_partner:
+                logger.info(f"Trouvé {len(truck_ids_from_partner)} partenaire(s) correspondant à '{truck_name}': {truck_ids_from_partner}")
+                # Essayer d'abord avec x_studio_camion
+                try:
+                    search_strategies.append(('x_studio_camion', [('x_studio_camion', 'in', truck_ids_from_partner)]))
+                except Exception as e:
+                    logger.debug(f"Champ x_studio_camion non disponible: {e}")
+                # Puis fallback sur partner_id
+                search_strategies.append(('partner_id', [('partner_id', 'in', truck_ids_from_partner)]))
+        except Exception as e:
+            logger.debug(f"Recherche dans res.partner échouée: {e}")
+        
+        # Stratégie 2: Chercher dans location_id ou location_dest_id (emplacements du camion)
+        try:
+            # Chercher les emplacements qui contiennent le nom du camion
+            location_ids = client.execute_kw(
+                'stock.location',
+                'search',
+                [[('name', 'ilike', truck_name)]]
+            )
+            
+            if location_ids:
+                logger.info(f"Trouvé {len(location_ids)} emplacement(s) correspondant à '{truck_name}': {location_ids}")
+                search_strategies.append(('location', [
+                    '|',
+                    ('location_id', 'in', location_ids),
+                    ('location_dest_id', 'in', location_ids)
+                ]))
+        except Exception as e:
+            logger.debug(f"Recherche dans stock.location échouée: {e}")
+        
+        # Stratégie 3: Chercher dans origin (référence du transfert)
+        search_strategies.append(('origin', [('origin', 'ilike', truck_name)]))
+        
+        # Stratégie 4: Chercher dans name (numéro du transfert)
+        search_strategies.append(('name', [('name', 'ilike', truck_name)]))
+        
+        # Essayer chaque stratégie jusqu'à trouver des résultats
+        domain = []
+        total_count = 0
+        
+        for strategy_name, base_conditions in search_strategies:
+            try:
+                # Créer le domaine pour tous les types de transferts
+                test_domain = create_multi_type_domain(base_conditions)
+                
+                # Ajouter les filtres optionnels
+                if state:
+                    test_domain.append(('state', '=', state))
+                
+                if date_from:
+                    test_domain.append(('date', '>=', f"{date_from} 00:00:00"))
+                
+                if date_to:
+                    test_domain.append(('date', '<=', f"{date_to} 23:59:59"))
+                
+                # Tester ce domaine
+                count = client.execute_kw(
+                    'stock.picking',
+                    'search_count',
+                    [test_domain]
+                )
+                
+                logger.info(f"Stratégie '{strategy_name}': {count} résultat(s)")
+                
+                if count > 0:
+                    domain = test_domain
+                    total_count = count
+                    logger.info(f"✅ Utilisation de la stratégie '{strategy_name}': {count} transfert(s) trouvé(s)")
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Erreur avec stratégie '{strategy_name}': {e}")
+                continue
+        
+        # Si aucun résultat trouvé avec toutes les options
+        if total_count == 0:
+            # Construire un domaine de base pour le message (avec tous les types demandés)
+            if len(transfer_types) == 1:
+                domain = [('picking_type_code', '=', transfer_types[0])]
+            else:
+                domain = [('picking_type_code', 'in', transfer_types)]
+            
+            if state:
+                domain.append(('state', '=', state))
+            if date_from:
+                domain.append(('date', '>=', f"{date_from} 00:00:00"))
+            if date_to:
+                domain.append(('date', '<=', f"{date_to} 23:59:59"))
+        
+        # Récupérer le nom de la base de données
         from core.security import get_odoo_config_from_user
-        
         db_config = get_odoo_config_from_user(current_user)
         db_name = db_config.get('name', 'Base par défaut') if db_config else 'Base par défaut'
         
-        logger.info(f"Recherche transferts par camion '{truck_name}' (IDs: {truck_ids}) avec domaine: {domain}")
+        # Créer un message descriptif des types de transferts
+        type_labels = {
+            'internal': 'Transferts internes',
+            'incoming': 'Réceptions',
+            'outgoing': 'Livraisons'
+        }
+        types_str = ' + '.join([type_labels.get(t, t) for t in transfer_types])
         
-        # Compter le total d'éléments
-        total_count = client.execute_kw(
-            'stock.picking',
-            'search_count',
-            [domain]
-        )
+        logger.info(f"Recherche finale: domaine={domain}, total_count={total_count}, types={types_str}")
         
         if total_count == 0:
             return ApiResponse(
                 success=True,
                 data={
                     'truck_name': truck_name,
+                    'transfer_types': transfer_types,
                     'transfers': [],
                     'pagination': {
                         'total_count': 0,
@@ -2105,22 +2242,19 @@ async def get_transfers_by_truck(
                     }
                 },
                 count=0,
-                message=f"Aucun transfert trouvé pour le camion '{truck_name}'"
+                message=f"Aucun transfert ({types_str}) trouvé pour le camion '{truck_name}'"
             )
         
         # Calculer l'offset
         offset = (page - 1) * page_size
         
-        # Champs à récupérer
-        fields = [
+        # Champs à récupérer (on essaiera avec x_studio_code, sinon sans)
+        fields_base = [
             # Champs de base
             'id', 'name', 'origin', 'state', 'picking_type_code', 'partner_id',
             'location_id', 'location_dest_id', 'scheduled_date', 'date_done',
             'user_id', 'company_id', 'products_availability', 'products_availability_state',
             'move_ids', 'pos_session_id', 'pos_order_id', 'note',
-            
-            # Champs personnalisés pour le camion et chauffeur
-            'x_studio_camionchauffeur', 'x_studio_chauffeur', 'x_studio_code',
             
             # Champs détaillés
             'picking_type_id', 'priority', 'date', 'date_deadline',
@@ -2133,18 +2267,38 @@ async def get_transfers_by_truck(
             'create_date', 'write_date', 'create_uid', 'write_uid'
         ]
         
-        # Récupérer les transferts
-        transfers = client.execute_kw(
-            'stock.picking',
-            'search_read',
-            [domain],
-            {
-                'fields': fields,
-                'limit': page_size,
-                'offset': offset,
-                'order': 'date desc, id desc'
-            }
-        )
+        # Essayer d'abord avec le champ personnalisé x_studio_code
+        transfers = None
+        try:
+            fields = fields_base + ['x_studio_code']
+            transfers = client.execute_kw(
+                'stock.picking',
+                'search_read',
+                [domain],
+                {
+                    'fields': fields,
+                    'limit': page_size,
+                    'offset': offset,
+                    'order': 'date desc, id desc'
+                }
+            )
+        except Exception as e:
+            # Si x_studio_code n'existe pas, réessayer sans
+            if 'x_studio_code' in str(e):
+                logger.debug(f"Champ x_studio_code non disponible, récupération sans ce champ")
+                transfers = client.execute_kw(
+                    'stock.picking',
+                    'search_read',
+                    [domain],
+                    {
+                        'fields': fields_base,
+                        'limit': page_size,
+                        'offset': offset,
+                        'order': 'date desc, id desc'
+                    }
+                )
+            else:
+                raise
         
         # Enrichir chaque transfert avec les détails des mouvements
         for transfer in transfers:
@@ -2244,21 +2398,6 @@ async def get_transfers_by_truck(
         formatted_transfers = []
         for transfer in transfers:
             try:
-                # Extraire les informations du camion et chauffeur
-                truck_info = None
-                if transfer.get('x_studio_camionchauffeur'):
-                    truck_info = {
-                        'id': transfer['x_studio_camionchauffeur'][0] if isinstance(transfer['x_studio_camionchauffeur'], list) else transfer['x_studio_camionchauffeur'],
-                        'name': transfer['x_studio_camionchauffeur'][1] if isinstance(transfer['x_studio_camionchauffeur'], list) and len(transfer['x_studio_camionchauffeur']) > 1 else 'N/A'
-                    }
-                
-                driver_info = None
-                if transfer.get('x_studio_chauffeur'):
-                    driver_info = {
-                        'id': transfer['x_studio_chauffeur'][0] if isinstance(transfer['x_studio_chauffeur'], list) else transfer['x_studio_chauffeur'],
-                        'name': transfer['x_studio_chauffeur'][1] if isinstance(transfer['x_studio_chauffeur'], list) and len(transfer['x_studio_chauffeur']) > 1 else 'N/A'
-                    }
-                
                 formatted_transfer = {
                     # Champs de base
                     'id': transfer['id'],
@@ -2268,10 +2407,8 @@ async def get_transfers_by_truck(
                     'state': transfer.get('state', 'draft'),
                     'picking_type_code': clean_odoo_value(transfer.get('picking_type_code')),
                     
-                    # Informations camion et chauffeur
-                    'truck': truck_info,
-                    'truck_name': truck_info['name'] if truck_info else clean_odoo_value(transfer.get('origin')),
-                    'driver': driver_info,
+                    # Informations de référence (le nom du camion est dans origin)
+                    'truck_name': clean_odoo_value(transfer.get('origin')),
                     
                     'partner_id': clean_odoo_value(transfer.get('partner_id')),
                     'location_id': clean_odoo_value(transfer.get('location_id')),
@@ -2337,16 +2474,19 @@ async def get_transfers_by_truck(
         # Calculer le nombre total de pages
         total_pages = (total_count + page_size - 1) // page_size
         
-        logger.info(f"Trouvé {len(transfers)} transfert(s) pour le camion '{truck_name}' sur {total_count} au total")
+        logger.info(f"Trouvé {len(transfers)} transfert(s) ({types_str}) pour le camion '{truck_name}' sur {total_count} au total")
         
         return ApiResponse(
             success=True,
             data={
                 'truck_name': truck_name,
+                'transfer_types': transfer_types,
+                'transfer_types_labels': types_str,
                 'database': db_name,
                 'transfers': formatted_transfers,
                 'filters_applied': {
                     'truck_name': truck_name,
+                    'transfer_type': transfer_type or 'all',
                     'state': state,
                     'date_from': date_from,
                     'date_to': date_to
@@ -2360,7 +2500,7 @@ async def get_transfers_by_truck(
                 }
             },
             count=total_count,
-            message=f"Trouvé {len(transfers)} transfert(s) sur {total_count} pour le camion '{truck_name}' (page {page}/{total_pages})"
+            message=f"Trouvé {len(transfers)} transfert(s) ({types_str}) sur {total_count} pour le camion '{truck_name}' (page {page}/{total_pages})"
         )
         
     except HTTPException:
@@ -2711,7 +2851,7 @@ async def get_my_trucks(
                 'fields': [
                     'id', 'name', 'license_plate', 'model_id', 'brand_id', 
                     'vin_sn', 'state_id', 'odometer', 'fuel_type', 
-                    'driver_id', 'x_studio_camion'
+                    'driver_id'
                 ],
                 'order': 'name asc'
             }
@@ -2740,7 +2880,7 @@ async def get_my_trucks(
                         'fields': [
                             'id', 'name', 'license_plate', 'model_id', 'brand_id', 
                             'vin_sn', 'state_id', 'odometer', 'fuel_type', 
-                            'driver_id', 'x_studio_camion'
+                            'driver_id'
                         ],
                         'order': 'name asc'
                     }
@@ -2780,8 +2920,7 @@ async def get_my_trucks(
                 'chassis_number': truck.get('vin_sn'),
                 'state': truck['state_id'][1] if truck.get('state_id') and isinstance(truck['state_id'], list) else 'N/A',
                 'odometer': truck.get('odometer', 0),
-                'fuel_type': truck.get('fuel_type', 'N/A'),
-                'custom_name': truck.get('x_studio_camion')
+                'fuel_type': truck.get('fuel_type', 'N/A')
             }
             trucks_list.append(truck_data)
         
@@ -2821,7 +2960,7 @@ async def get_trucks_by_driver(
     """
     Récupérer les camions associés à un chauffeur via les transferts
     
-    Cette route récupère tous les camions (x_studio_camionchauffeur) 
+    Cette route récupère tous les camions (x_studio_camion) 
     qui ont été utilisés dans des transferts par un chauffeur spécifique.
     
     **Paramètres :**
@@ -2863,7 +3002,7 @@ async def get_trucks_by_driver(
                 'fields': [
                     'id', 'name', 'license_plate', 'model_id', 'brand_id',
                     'vin_sn', 'state_id', 'odometer', 'fuel_type',
-                    'driver_id', 'x_studio_camion', 'category_id',
+                    'driver_id', 'category_id',
                     'acquisition_date', 'color'
                 ],
                 'order': 'name asc'
@@ -2893,7 +3032,7 @@ async def get_trucks_by_driver(
                         'fields': [
                             'id', 'name', 'license_plate', 'model_id', 'brand_id',
                             'vin_sn', 'state_id', 'odometer', 'fuel_type',
-                            'driver_id', 'x_studio_camion', 'category_id',
+                            'driver_id', 'category_id',
                             'acquisition_date', 'color'
                         ],
                         'order': 'name asc'
@@ -2936,7 +3075,6 @@ async def get_trucks_by_driver(
                 'category': truck['category_id'][1] if truck.get('category_id') and isinstance(truck['category_id'], list) else None,
                 'odometer': truck.get('odometer', 0),
                 'fuel_type': truck.get('fuel_type', 'N/A'),
-                'custom_name': truck.get('x_studio_camion'),
                 'acquisition_date': truck.get('acquisition_date'),
                 'color': truck.get('color')
             }
@@ -3026,7 +3164,7 @@ async def get_all_trucks(
                 'fields': [
                     'id', 'name', 'license_plate', 'model_id', 'brand_id',
                     'vin_sn', 'state_id', 'odometer', 'fuel_type',
-                    'driver_id', 'x_studio_camion', 'category_id',
+                    'driver_id', 'category_id',
                     'acquisition_date', 'color', 'seats', 'doors',
                     'transmission', 'horsepower', 'power', 'co2',
                     'model_year', 'frame_type', 'frame_size',
@@ -3070,7 +3208,6 @@ async def get_all_trucks(
                 'category_id': truck['category_id'][0] if truck.get('category_id') and isinstance(truck['category_id'], list) else None,
                 'odometer': truck.get('odometer', 0),
                 'fuel_type': truck.get('fuel_type', 'N/A'),
-                'custom_name': truck.get('x_studio_camion'),
                 'acquisition_date': truck.get('acquisition_date'),
                 'color': truck.get('color'),
                 'seats': truck.get('seats'),
@@ -5083,4 +5220,363 @@ async def validate_pump_indexes(
             pump_validations=[],
             is_valid=False,
             validation_errors=[f"Erreur de validation: {str(e)}"]
+        )
+
+
+# ===== GESTION DES ENTREPRISES / COMPANIES =====
+
+@router.get("/companies", response_model=ApiResponse)
+async def get_companies(
+    page: int = Query(1, ge=1, description="Numéro de page"),
+    page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
+    search: Optional[str] = Query(None, description="Recherche par nom, IFU, RCCM, email"),
+    is_customer: Optional[bool] = Query(None, description="Filtrer par clients (True) ou non"),
+    is_supplier: Optional[bool] = Query(None, description="Filtrer par fournisseurs (True) ou non"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer la liste des entreprises (res.partner avec is_company=True)
+    
+    Retourne toutes les informations disponibles dans Odoo pour les entreprises.
+    
+    **Paramètres :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Éléments par page (défaut: 50, max: 200)
+    - **search** : Recherche textuelle (nom, IFU, RCCM, email)
+    - **is_customer** : Filtrer uniquement les clients
+    - **is_supplier** : Filtrer uniquement les fournisseurs
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Construire le domaine de recherche
+        domain = [('is_company', '=', True)]
+        
+        if search:
+            domain.append('|')
+            domain.append('|')
+            domain.append('|')
+            domain.append('|')
+            domain.append(('name', 'ilike', search))
+            domain.append(('vat', 'ilike', search))  # IFU/NIF
+            domain.append(('email', 'ilike', search))
+            domain.append(('phone', 'ilike', search))
+            domain.append(('ref', 'ilike', search))  # RCCM peut être dans ref
+        
+        if is_customer is not None:
+            domain.append(('customer_rank', '>', 0) if is_customer else ('customer_rank', '=', 0))
+        
+        if is_supplier is not None:
+            domain.append(('supplier_rank', '>', 0) if is_supplier else ('supplier_rank', '=', 0))
+        
+        # Compter le total
+        total_count = client.execute_kw(
+            'res.partner',
+            'search_count',
+            [domain]
+        )
+        
+        if total_count == 0:
+            return ApiResponse(
+                success=True,
+                data={
+                    'companies': [],
+                    'pagination': {
+                        'total_count': 0,
+                        'page': page,
+                        'page_size': page_size,
+                        'total_pages': 0,
+                        'current_count': 0
+                    }
+                },
+                count=0,
+                message="Aucune entreprise trouvée"
+            )
+        
+        # Calculer l'offset
+        offset = (page - 1) * page_size
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        # Champs à récupérer
+        fields = [
+            'id', 'name', 'display_name', 'ref', 'vat', 'email', 'phone', 'mobile',
+            'street', 'street2', 'city', 'state_id', 'country_id', 'zip',
+            'website', 'function', 'type', 'is_company', 'company_type',
+            'customer_rank', 'supplier_rank', 'user_id', 'category_id',
+            'comment', 'parent_id', 'child_ids', 'commercial_partner_id',
+            'company_id', 'industry_id', 'active', 'employee',
+            'create_date', 'write_date', 'create_uid', 'write_uid',
+            # Champs personnalisés possibles
+            'property_payment_term_id', 'property_supplier_payment_term_id',
+            'property_account_position_id', 'credit_limit', 'lang', 'tz',
+            'barcode', 'color', 'image_1920', 'image_512', 'image_256', 'image_128'
+        ]
+        
+        # Récupérer les entreprises
+        companies = client.execute_kw(
+            'res.partner',
+            'search_read',
+            [domain],
+            {
+                'fields': fields,
+                'limit': page_size,
+                'offset': offset,
+                'order': 'name asc'
+            }
+        )
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'companies': companies,
+                'pagination': {
+                    'total_count': total_count,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': total_pages,
+                    'current_count': len(companies)
+                },
+                'filters_applied': {
+                    'search': search,
+                    'is_customer': is_customer,
+                    'is_supplier': is_supplier
+                }
+            },
+            count=len(companies),
+            message=f"Trouvé {len(companies)} entreprise(s) sur {total_count} (page {page}/{total_pages})"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des entreprises: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des entreprises: {str(e)}"
+        )
+
+
+@router.get("/companies/formatted", response_model=ApiResponse)
+async def get_companies_formatted(
+    page: int = Query(1, ge=1, description="Numéro de page"),
+    page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
+    search: Optional[str] = Query(None, description="Recherche par nom, IFU, RCCM, email"),
+    status: Optional[str] = Query(None, description="Filtrer par statut (PENDING/APPROVED/REJECTED)"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer la liste des entreprises avec format standardisé
+    
+    Retourne les entreprises dans un format structuré avec mapping des champs Odoo
+    vers votre structure personnalisée.
+    
+    **Mapping des champs:**
+    - id → id (converti en string)
+    - ref → rccm (Registre de Commerce)
+    - vat → ifu (Identifiant Fiscal Unique)
+    - name → companyName
+    - industry_id → segment
+    - email → companyEmail
+    - x_rejection_reason → rejectionReason (champ personnalisé si existe)
+    - Adresse complète → companyAddress
+    - Contact principal → representativeFullname/Email/Phone
+    - x_status → status (PENDING/APPROVED/REJECTED)
+    - active → enabled
+    - create_date → createdAt
+    - write_date → updatedAt
+    
+    **Paramètres :**
+    - **page** : Numéro de page (défaut: 1)
+    - **page_size** : Éléments par page (défaut: 50, max: 200)
+    - **search** : Recherche textuelle
+    - **status** : Filtrer par statut (PENDING/APPROVED/REJECTED)
+    
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Construire le domaine de recherche
+        domain = [('is_company', '=', True)]
+        
+        if search:
+            domain.append('|')
+            domain.append('|')
+            domain.append('|')
+            domain.append('|')
+            domain.append(('name', 'ilike', search))
+            domain.append(('vat', 'ilike', search))
+            domain.append(('email', 'ilike', search))
+            domain.append(('phone', 'ilike', search))
+            domain.append(('ref', 'ilike', search))
+        
+        # Compter le total
+        total_count = client.execute_kw(
+            'res.partner',
+            'search_count',
+            [domain]
+        )
+        
+        if total_count == 0:
+            return ApiResponse(
+                success=True,
+                data={
+                    'companies': [],
+                    'pagination': {
+                        'total_count': 0,
+                        'page': page,
+                        'page_size': page_size,
+                        'total_pages': 0,
+                        'current_count': 0
+                    }
+                },
+                count=0,
+                message="Aucune entreprise trouvée"
+            )
+        
+        # Calculer l'offset
+        offset = (page - 1) * page_size
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        # Champs de base à récupérer
+        fields = [
+            'id', 'name', 'ref', 'vat', 'email', 'phone', 'mobile',
+            'street', 'street2', 'city', 'state_id', 'country_id', 'zip',
+            'industry_id', 'active', 'child_ids', 'parent_id',
+            'create_date', 'write_date', 'comment'
+        ]
+        
+        # Essayer d'ajouter des champs personnalisés s'ils existent
+        try:
+            # Tester si les champs personnalisés existent
+            test_fields = fields + [
+                'x_status', 'x_rejection_reason', 
+                'x_file_carte_professionnelle', 'x_file_rccm', 'x_file_ifu'
+            ]
+            companies_raw = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [domain],
+                {
+                    'fields': test_fields,
+                    'limit': page_size,
+                    'offset': offset,
+                    'order': 'create_date desc, id desc'
+                }
+            )
+        except Exception as e:
+            # Si les champs personnalisés n'existent pas, utiliser seulement les champs de base
+            logger.debug(f"Champs personnalisés non disponibles, utilisation des champs de base: {e}")
+            companies_raw = client.execute_kw(
+                'res.partner',
+                'search_read',
+                [domain],
+                {
+                    'fields': fields,
+                    'limit': page_size,
+                    'offset': offset,
+                    'order': 'create_date desc, id desc'
+                }
+            )
+        
+        # Formater les données
+        companies_formatted = []
+        for company in companies_raw:
+            # Construire l'adresse complète
+            address_parts = []
+            if company.get('street'):
+                address_parts.append(company['street'])
+            if company.get('street2'):
+                address_parts.append(company['street2'])
+            if company.get('city'):
+                address_parts.append(company['city'])
+            if company.get('zip'):
+                address_parts.append(company['zip'])
+            if company.get('state_id') and isinstance(company['state_id'], list):
+                address_parts.append(company['state_id'][1])
+            if company.get('country_id') and isinstance(company['country_id'], list):
+                address_parts.append(company['country_id'][1])
+            
+            company_address = ', '.join(address_parts) if address_parts else None
+            
+            # Récupérer les informations du contact principal (premier enfant ou parent)
+            representative_fullname = None
+            representative_email = None
+            representative_phone = None
+            
+            if company.get('child_ids'):
+                # Récupérer le premier contact
+                try:
+                    contacts = client.execute_kw(
+                        'res.partner',
+                        'read',
+                        [company['child_ids'][:1]],
+                        {'fields': ['name', 'email', 'phone', 'mobile', 'function']}
+                    )
+                    if contacts:
+                        contact = contacts[0]
+                        representative_fullname = contact.get('name')
+                        representative_email = contact.get('email')
+                        representative_phone = contact.get('phone') or contact.get('mobile')
+                except Exception as e:
+                    logger.debug(f"Erreur récupération contact pour {company['id']}: {e}")
+            
+            # Déterminer le statut (mapper depuis x_status ou utiliser active)
+            company_status = company.get('x_status', '').upper() if company.get('x_status') else None
+            if not company_status:
+                # Mapper depuis active si x_status n'existe pas
+                company_status = "APPROVED" if company.get('active', True) else "REJECTED"
+            
+            # Filtrer par statut si demandé (le paramètre 'status' vient de la requête)
+            if status and company_status.upper() != status.upper():
+                continue
+            
+            formatted_company = {
+                "id": str(company['id']),
+                "rccm": company.get('ref') or "",
+                "ifu": company.get('vat') or "",
+                "companyName": company.get('name') or "",
+                "segment": company['industry_id'][1] if company.get('industry_id') and isinstance(company['industry_id'], list) else "",
+                "companyEmail": company.get('email') or "",
+                "rejectionReason": company.get('x_rejection_reason') or company.get('comment') or "",
+                "companyAddress": company_address or "",
+                "representativeFullname": representative_fullname or "",
+                "representativeEmail": representative_email or "",
+                "representativePhone": representative_phone or "",
+                "fileCarteProfessionnelleId": str(company.get('x_file_carte_professionnelle')) if company.get('x_file_carte_professionnelle') else "",
+                "fileRccmId": str(company.get('x_file_rccm')) if company.get('x_file_rccm') else "",
+                "fileIfuId": str(company.get('x_file_ifu')) if company.get('x_file_ifu') else "",
+                "status": company_status,
+                "enabled": company.get('active', True),
+                "createdAt": company.get('create_date') or datetime.now().isoformat(),
+                "updatedAt": company.get('write_date') or company.get('create_date') or datetime.now().isoformat()
+            }
+            
+            companies_formatted.append(formatted_company)
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'companies': companies_formatted,
+                'pagination': {
+                    'total_count': len(companies_formatted),
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': (len(companies_formatted) + page_size - 1) // page_size if len(companies_formatted) > 0 else 0,
+                    'current_count': len(companies_formatted)
+                },
+                'filters_applied': {
+                    'search': search,
+                    'status': status
+                }
+            },
+            count=len(companies_formatted),
+            message=f"Trouvé {len(companies_formatted)} entreprise(s) formatée(s)"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des entreprises formatées: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des entreprises: {str(e)}"
         )

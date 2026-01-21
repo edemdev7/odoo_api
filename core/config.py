@@ -21,10 +21,10 @@ REVOKED_TOKENS = set()
 # DB1: Base Test JNP Directe (Transferts internes)
 ODOO_DB1_CONFIG = {
     "name": "jnp_directe",
-    "url": os.getenv("ODOO_DB1_URL", "https://sandbox-erp.dagbehamiithiel.com"),
-    "db": os.getenv("ODOO_DB1_NAME", "sandbox.dagbehamiithiel.com"),
+    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-statging-012026-27069493.dev.odoo.com"),
+    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-statging-012026-27069493"),
     "username": os.getenv("ODOO_DB1_USERNAME", "api@jnpgroupe.com"),
-    "api_key": os.getenv("ODOO_DB1_API_KEY", "863271b496f59c7bf01ff2e58995a311784ffc35"),
+    "api_key": os.getenv("ODOO_DB1_API_KEY", "3c9b926990c7cf6eaa2fe583fb1667e40410e854"),
     "transfer_type": "internal",  # Transferts internes
     "transfer_type_code": "internal"
 }
@@ -32,10 +32,10 @@ ODOO_DB1_CONFIG = {
 # DB2: Base Test Franchise (Transferts réceptions)
 ODOO_DB2_CONFIG = {
     "name": "franchise",
-    "url": os.getenv("ODOO_DB2_URL", "https://sandbox.perfect-erp.com"),
-    "db": os.getenv("ODOO_DB2_NAME", "sandbox"),
-    "username": os.getenv("ODOO_DB2_USERNAME", "api-rest@odoo.com"),
-    "api_key": os.getenv("ODOO_DB2_API_KEY", "95ba6d2425dc735f3ad9c624e41a946a8a94ca42"),
+    "url": os.getenv("ODOO_DB2_URL", "https://staging-apps.perfect-erp.com"),
+    "db": os.getenv("ODOO_DB2_NAME", "staging-apps.perfect-erp.com"),
+    "username": os.getenv("ODOO_DB2_USERNAME", "api@odoo.com"),
+    "api_key": os.getenv("ODOO_DB2_API_KEY", "1ba8793e151954c349bf8511fd2bfee068338205"),
     "transfer_type": "reception",  # Transferts réceptions
     "transfer_type_code": "incoming"
 }
