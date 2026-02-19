@@ -5310,7 +5310,7 @@ async def get_companies(
             'create_date', 'write_date', 'create_uid', 'write_uid',
             # Champs personnalisés possibles
             'property_payment_term_id', 'property_supplier_payment_term_id',
-            'property_account_position_id', 'credit_limit', 'lang', 'tz',
+            'property_account_position_id', 'credit', 'lang', 'tz',
             'barcode', 'color', 'image_1920', 'image_512', 'image_256', 'image_128'
         ]
         
