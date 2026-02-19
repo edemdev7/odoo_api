@@ -1,501 +1,1269 @@
 {
   "success": true,
   "data": {
-    "truck_name": "BA6505RB/BA7622RB",
-    "database": "jnp_directe",
-    "transfers": [
-      {
-        "id": 82534,
-        "name": "MGPK6/INT/00048",
-        "code": "25015949311220",
-        "origin": null,
-        "state": "assigned",
-        "picking_type_code": "internal",
-        "truck": {
-          "id": 11446,
-          "name": "SBTF SARL, BA6505RB/BA7622RB"
-        },
-        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
-        "driver": null,
-        "partner_id": [
-          9,
-          "JNP SA"
-        ],
-        "location_id": [
-          1633,
-          "MGPK6/Stock"
-        ],
-        "location_dest_id": [
-          1199,
-          "CAM/Stock"
-        ],
-        "scheduled_date": "2025-12-20 14:31:00",
-        "date_done": null,
-        "date": "2025-12-20 14:31:48",
-        "user_id": [
-          546,
-          "API User"
-        ],
-        "company_id": [
-          2,
-          "JNP SA"
-        ],
-        "products_availability": null,
-        "products_availability_state": null,
-        "note": null,
-        "picking_type_id": [
-          1482,
-          "JNP SA - MAGASIN PK6: Transferts internes"
-        ],
-        "priority": "0",
-        "date_deadline": null,
-        "move_type": "direct",
-        "group_id": null,
-        "has_packages": null,
-        "is_locked": true,
-        "move_ids": [
-          99502
-        ],
-        "move_line_ids": [
-          99134
-        ],
-        "create_date": "2025-12-20 14:31:48",
-        "write_date": "2025-12-20 14:31:52",
-        "create_uid": [
-          546,
-          "API User"
-        ],
-        "write_uid": [
-          546,
-          "API User"
-        ],
-        "move_details": [
-          {
-            "id": 99502,
-            "name": "ENOC ACTIVE SYN OEM 12X 1L",
-            "product_id": [
-              2432,
-              "ENOC ACTIVE SYN OEM 12X 1L"
-            ],
-            "product_uom_qty": 15,
-            "product_qty": 15,
-            "product_uom": [
-              1,
-              "Units"
-            ],
-            "state": "assigned",
-            "location_id": [
-              1633,
-              "MGPK6/Stock"
-            ],
-            "location_dest_id": [
-              1199,
-              "CAM/Stock"
-            ],
-            "date": "2025-12-20 14:31:00",
-            "origin": false,
-            "reference": "MGPK6/INT/00048",
-            "description_picking": "ENOC ACTIVE SYN OEM 12X 1L",
-            "product_details": {
-              "id": 2432,
-              "name": "ENOC ACTIVE SYN OEM 12X 1L",
-              "display_name": "ENOC ACTIVE SYN OEM 12X 1L",
-              "default_code": false,
-              "barcode": false,
-              "uom_id": [
-                1,
-                "Units"
-              ],
-              "type": "product",
-              "tracking": "none",
-              "list_price": 8500,
-              "standard_price": 3239
-            }
-          }
-        ],
-        "move_line_details": [
-          {
-            "id": 99134,
-            "move_id": [
-              99502,
-              "Stock>Stock"
-            ],
-            "product_id": [
-              2432,
-              "ENOC ACTIVE SYN OEM 12X 1L"
-            ],
-            "product_uom_id": [
-              1,
-              "Units"
-            ],
-            "qty_done": 0,
-            "quantity": 15,
-            "lot_id": false,
-            "lot_name": false,
-            "location_id": [
-              1633,
-              "MGPK6/Stock"
-            ],
-            "location_dest_id": [
-              1199,
-              "CAM/Stock"
-            ],
-            "picking_id": [
-              82534,
-              "MGPK6/INT/00048"
-            ],
-            "state": "assigned",
-            "reference": "MGPK6/INT/00048"
-          }
-        ],
-        "picking_type_details": {
-          "id": 1482,
-          "name": "Transferts internes",
-          "code": "internal",
-          "warehouse_id": [
-            168,
-            "JNP SA - MAGASIN PK6"
-          ],
-          "default_location_src_id": [
-            1633,
-            "MGPK6/Stock"
-          ],
-          "default_location_dest_id": [
-            1633,
-            "MGPK6/Stock"
-          ],
-          "sequence_code": "INT"
-        },
-        "product_summary": [
-          {
-            "product_name": "ENOC ACTIVE SYN OEM 12X 1L",
-            "product_code": false,
-            "quantity": 15,
-            "uom": "Units"
-          }
-        ]
-      },
-      {
-        "id": 82533,
-        "name": "DEPOT/INT/00287",
-        "code": "25015626301220",
-        "origin": null,
-        "state": "confirmed",
-        "picking_type_code": "internal",
-        "truck": {
-          "id": 11446,
-          "name": "SBTF SARL, BA6505RB/BA7622RB"
-        },
-        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
-        "driver": null,
-        "partner_id": [
-          9,
-          "JNP SA"
-        ],
-        "location_id": [
-          1183,
-          "DEPOT/Stock"
-        ],
-        "location_dest_id": [
-          1199,
-          "CAM/Stock"
-        ],
-        "scheduled_date": "2025-12-20 14:29:42",
-        "date_done": null,
-        "date": "2025-12-20 14:30:26",
-        "user_id": [
-          546,
-          "API User"
-        ],
-        "company_id": [
-          2,
-          "JNP SA"
-        ],
-        "products_availability": null,
-        "products_availability_state": null,
-        "note": null,
-        "picking_type_id": [
-          1238,
-          "JNP SA - DEPOT SOMMIER: Transferts internes"
-        ],
-        "priority": "0",
-        "date_deadline": null,
-        "move_type": "direct",
-        "group_id": null,
-        "has_packages": null,
-        "is_locked": true,
-        "move_ids": [
-          99501
-        ],
-        "move_line_ids": [],
-        "create_date": "2025-12-20 14:30:26",
-        "write_date": "2025-12-20 14:30:28",
-        "create_uid": [
-          546,
-          "API User"
-        ],
-        "write_uid": [
-          546,
-          "API User"
-        ],
-        "move_details": [
-          {
-            "id": 99501,
-            "name": "[DIESEL] GASOIL",
-            "product_id": [
-              3014,
-              "[DIESEL] GAS-OIL"
-            ],
-            "product_uom_qty": 5000,
-            "product_qty": 5000,
-            "product_uom": [
-              10,
-              "L"
-            ],
-            "state": "confirmed",
-            "location_id": [
-              1183,
-              "DEPOT/Stock"
-            ],
-            "location_dest_id": [
-              1199,
-              "CAM/Stock"
-            ],
-            "date": "2025-12-20 14:29:42",
-            "origin": false,
-            "reference": "DEPOT/INT/00287",
-            "description_picking": "Pour les transfert internes, les produits doivent être pris dans l'emplacement Stock de l'entrepôt pour les camions et ensuite des camions pour les Point de vente gérance directe",
-            "product_details": {
-              "id": 3014,
-              "name": "GAS-OIL",
-              "display_name": "[DIESEL] GAS-OIL",
-              "default_code": "DIESEL",
-              "barcode": false,
-              "uom_id": [
-                10,
-                "L"
-              ],
-              "type": "product",
-              "tracking": "none",
-              "list_price": 720,
-              "standard_price": 539.7148000000001
-            }
-          }
-        ],
-        "move_line_details": [],
-        "picking_type_details": {
-          "id": 1238,
-          "name": "Transferts internes",
-          "code": "internal",
-          "warehouse_id": [
-            141,
-            "JNP SA - DEPOT SOMMIER"
-          ],
-          "default_location_src_id": [
-            1183,
-            "DEPOT/Stock"
-          ],
-          "default_location_dest_id": [
-            1183,
-            "DEPOT/Stock"
-          ],
-          "sequence_code": "INT"
-        },
-        "product_summary": [
-          {
-            "product_name": "GAS-OIL",
-            "product_code": "DIESEL",
-            "quantity": 5000,
-            "uom": "L"
-          }
-        ]
-      },
-      {
-        "id": 82532,
-        "name": "DEPOT/INT/00286",
-        "code": "25015353201220",
-        "origin": null,
-        "state": "done",
-        "picking_type_code": "internal",
-        "truck": {
-          "id": 11446,
-          "name": "SBTF SARL, BA6505RB/BA7622RB"
-        },
-        "truck_name": "SBTF SARL, BA6505RB/BA7622RB",
-        "driver": null,
-        "partner_id": [
-          9,
-          "JNP SA"
-        ],
-        "location_id": [
-          1183,
-          "DEPOT/Stock"
-        ],
-        "location_dest_id": [
-          1199,
-          "CAM/Stock"
-        ],
-        "scheduled_date": "2025-12-20 14:15:59",
-        "date_done": "2025-12-20 14:28:00",
-        "date": "2025-12-20 14:20:53",
-        "user_id": [
-          546,
-          "API User"
-        ],
-        "company_id": [
-          2,
-          "JNP SA"
-        ],
-        "products_availability": null,
-        "products_availability_state": null,
-        "note": null,
-        "picking_type_id": [
-          1238,
-          "JNP SA - DEPOT SOMMIER: Transferts internes"
-        ],
-        "priority": "0",
-        "date_deadline": null,
-        "move_type": "direct",
-        "group_id": null,
-        "has_packages": null,
-        "is_locked": true,
-        "move_ids": [
-          99500
-        ],
-        "move_line_ids": [
-          99133
-        ],
-        "create_date": "2025-12-20 14:20:53",
-        "write_date": "2025-12-20 14:28:00",
-        "create_uid": [
-          546,
-          "API User"
-        ],
-        "write_uid": [
-          546,
-          "API User"
-        ],
-        "move_details": [
-          {
-            "id": 99500,
-            "name": "[SUPER] ESSENCE",
-            "product_id": [
-              2998,
-              "[SUPER] ESSENCE"
-            ],
-            "product_uom_qty": 1000,
-            "product_qty": 1000,
-            "product_uom": [
-              10,
-              "L"
-            ],
-            "state": "done",
-            "location_id": [
-              1183,
-              "DEPOT/Stock"
-            ],
-            "location_dest_id": [
-              1199,
-              "CAM/Stock"
-            ],
-            "date": "2025-12-20 14:28:00",
-            "origin": false,
-            "reference": "DEPOT/INT/00286",
-            "description_picking": "ESSENCE",
-            "product_details": {
-              "id": 2998,
-              "name": "ESSENCE",
-              "display_name": "[SUPER] ESSENCE",
-              "default_code": "SUPER",
-              "barcode": false,
-              "uom_id": [
-                10,
-                "L"
-              ],
-              "type": "product",
-              "tracking": "none",
-              "list_price": 695,
-              "standard_price": 515.5006000000001
-            }
-          }
-        ],
-        "move_line_details": [
-          {
-            "id": 99133,
-            "move_id": [
-              99500,
-              "SUPER: Stock>Stock"
-            ],
-            "product_id": [
-              2998,
-              "[SUPER] ESSENCE"
-            ],
-            "product_uom_id": [
-              10,
-              "L"
-            ],
-            "qty_done": 1000,
-            "quantity": 1000,
-            "lot_id": false,
-            "lot_name": false,
-            "location_id": [
-              1183,
-              "DEPOT/Stock"
-            ],
-            "location_dest_id": [
-              1199,
-              "CAM/Stock"
-            ],
-            "picking_id": [
-              82532,
-              "DEPOT/INT/00286"
-            ],
-            "state": "done",
-            "reference": "DEPOT/INT/00286"
-          }
-        ],
-        "picking_type_details": {
-          "id": 1238,
-          "name": "Transferts internes",
-          "code": "internal",
-          "warehouse_id": [
-            141,
-            "JNP SA - DEPOT SOMMIER"
-          ],
-          "default_location_src_id": [
-            1183,
-            "DEPOT/Stock"
-          ],
-          "default_location_dest_id": [
-            1183,
-            "DEPOT/Stock"
-          ],
-          "sequence_code": "INT"
-        },
-        "product_summary": [
-          {
-            "product_name": "ESSENCE",
-            "product_code": "SUPER",
-            "quantity": 1000,
-            "uom": "L"
-          }
-        ]
-      }
-    ],
-    "filters_applied": {
-      "truck_name": "BA6505RB/BA7622RB",
-      "state": null,
-      "date_from": null,
-      "date_to": null
+    "is_seo_optimized": {
+      "required": false,
+      "string": "SEO optimized",
+      "type": "boolean"
     },
-    "pagination": {
-      "total_count": 3,
-      "page": 1,
-      "page_size": 50,
-      "total_pages": 1,
-      "current_count": 3
+    "website_meta_title": {
+      "required": false,
+      "string": "Website meta title",
+      "type": "char"
+    },
+    "website_meta_description": {
+      "required": false,
+      "string": "Website meta description",
+      "type": "text"
+    },
+    "website_meta_keywords": {
+      "required": false,
+      "string": "Website meta keywords",
+      "type": "char"
+    },
+    "website_meta_og_img": {
+      "required": false,
+      "string": "Website opengraph image",
+      "type": "char"
+    },
+    "seo_name": {
+      "required": false,
+      "string": "Seo name",
+      "type": "char"
+    },
+    "website_id": {
+      "help": "Restrict publishing to this website.",
+      "required": false,
+      "string": "Website",
+      "type": "many2one"
+    },
+    "website_published": {
+      "required": false,
+      "string": "Visible on current website",
+      "type": "boolean"
+    },
+    "is_published": {
+      "required": false,
+      "string": "Is Published",
+      "type": "boolean"
+    },
+    "can_publish": {
+      "required": false,
+      "string": "Can Publish",
+      "type": "boolean"
+    },
+    "website_url": {
+      "help": "The full URL to access the document through the website.",
+      "required": false,
+      "string": "Website URL",
+      "type": "char"
+    },
+    "message_is_follower": {
+      "required": false,
+      "string": "Is Follower",
+      "type": "boolean"
+    },
+    "message_follower_ids": {
+      "required": false,
+      "string": "Followers",
+      "type": "one2many"
+    },
+    "message_partner_ids": {
+      "required": false,
+      "string": "Followers (Partners)",
+      "type": "many2many"
+    },
+    "message_ids": {
+      "required": false,
+      "string": "Messages",
+      "type": "one2many"
+    },
+    "has_message": {
+      "required": false,
+      "string": "Has Message",
+      "type": "boolean"
+    },
+    "message_needaction": {
+      "help": "If checked, new messages require your attention.",
+      "required": false,
+      "string": "Action Needed",
+      "type": "boolean"
+    },
+    "message_needaction_counter": {
+      "help": "Number of messages requiring action",
+      "required": false,
+      "string": "Number of Actions",
+      "type": "integer"
+    },
+    "message_has_error": {
+      "help": "If checked, some messages have a delivery error.",
+      "required": false,
+      "string": "Message Delivery error",
+      "type": "boolean"
+    },
+    "message_has_error_counter": {
+      "help": "Number of messages with delivery error",
+      "required": false,
+      "string": "Number of errors",
+      "type": "integer"
+    },
+    "message_attachment_count": {
+      "required": false,
+      "string": "Attachment Count",
+      "type": "integer"
+    },
+    "rating_ids": {
+      "required": false,
+      "string": "Ratings",
+      "type": "one2many"
+    },
+    "website_message_ids": {
+      "help": "Website communication history",
+      "required": false,
+      "string": "Website Messages",
+      "type": "one2many"
+    },
+    "message_has_sms_error": {
+      "help": "If checked, some messages have a delivery error.",
+      "required": false,
+      "string": "SMS Delivery error",
+      "type": "boolean"
+    },
+    "email_normalized": {
+      "help": "This field is used to search on email address as the primary email field can contain more than strictly an email address.",
+      "required": false,
+      "string": "Normalized Email",
+      "type": "char"
+    },
+    "is_blacklisted": {
+      "help": "If the email address is on the blacklist, the contact won't receive mass mailing anymore, from any list",
+      "required": false,
+      "string": "Blacklist",
+      "type": "boolean"
+    },
+    "message_bounce": {
+      "help": "Counter of the number of bounced emails for this contact",
+      "required": false,
+      "string": "Bounce",
+      "type": "integer"
+    },
+    "activity_ids": {
+      "required": false,
+      "string": "Activities",
+      "type": "one2many"
+    },
+    "activity_state": {
+      "help": "Status based on activities\nOverdue: Due date is already passed\nToday: Activity date is today\nPlanned: Future activities.",
+      "required": false,
+      "string": "Activity State",
+      "type": "selection"
+    },
+    "activity_user_id": {
+      "required": false,
+      "string": "Responsible User",
+      "type": "many2one"
+    },
+    "activity_type_id": {
+      "required": false,
+      "string": "Next Activity Type",
+      "type": "many2one"
+    },
+    "activity_type_icon": {
+      "help": "Font awesome icon e.g. fa-tasks",
+      "required": false,
+      "string": "Activity Type Icon",
+      "type": "char"
+    },
+    "activity_date_deadline": {
+      "required": false,
+      "string": "Next Activity Deadline",
+      "type": "date"
+    },
+    "my_activity_date_deadline": {
+      "required": false,
+      "string": "My Activity Deadline",
+      "type": "date"
+    },
+    "activity_summary": {
+      "required": false,
+      "string": "Next Activity Summary",
+      "type": "char"
+    },
+    "activity_exception_decoration": {
+      "help": "Type of the exception activity on record.",
+      "required": false,
+      "string": "Activity Exception Decoration",
+      "type": "selection"
+    },
+    "activity_exception_icon": {
+      "help": "Icon to indicate an exception activity.",
+      "required": false,
+      "string": "Icon",
+      "type": "char"
+    },
+    "activity_calendar_event_id": {
+      "required": false,
+      "string": "Next Activity Calendar Event",
+      "type": "many2one"
+    },
+    "image_1920": {
+      "required": false,
+      "string": "Image",
+      "type": "binary"
+    },
+    "image_1024": {
+      "required": false,
+      "string": "Image 1024",
+      "type": "binary"
+    },
+    "image_512": {
+      "required": false,
+      "string": "Image 512",
+      "type": "binary"
+    },
+    "image_256": {
+      "required": false,
+      "string": "Image 256",
+      "type": "binary"
+    },
+    "image_128": {
+      "required": false,
+      "string": "Image 128",
+      "type": "binary"
+    },
+    "avatar_1920": {
+      "required": false,
+      "string": "Avatar",
+      "type": "binary"
+    },
+    "avatar_1024": {
+      "required": false,
+      "string": "Avatar 1024",
+      "type": "binary"
+    },
+    "avatar_512": {
+      "required": false,
+      "string": "Avatar 512",
+      "type": "binary"
+    },
+    "avatar_256": {
+      "required": false,
+      "string": "Avatar 256",
+      "type": "binary"
+    },
+    "avatar_128": {
+      "required": false,
+      "string": "Avatar 128",
+      "type": "binary"
+    },
+    "name": {
+      "required": false,
+      "string": "Name",
+      "type": "char"
+    },
+    "complete_name": {
+      "required": false,
+      "string": "Complete Name",
+      "type": "char"
+    },
+    "date": {
+      "required": false,
+      "string": "Date",
+      "type": "date"
+    },
+    "title": {
+      "required": false,
+      "string": "Title",
+      "type": "many2one"
+    },
+    "parent_id": {
+      "required": false,
+      "string": "Related Company",
+      "type": "many2one"
+    },
+    "parent_name": {
+      "required": false,
+      "string": "Parent name",
+      "type": "char"
+    },
+    "child_ids": {
+      "required": false,
+      "string": "Contact",
+      "type": "one2many"
+    },
+    "ref": {
+      "required": false,
+      "string": "Reference",
+      "type": "char"
+    },
+    "lang": {
+      "help": "All the emails and documents sent to this contact will be translated in this language.",
+      "required": false,
+      "string": "Language",
+      "type": "selection"
+    },
+    "active_lang_count": {
+      "required": false,
+      "string": "Active Lang Count",
+      "type": "integer"
+    },
+    "tz": {
+      "help": "When printing documents and exporting/importing data, time values are computed according to this timezone.\nIf the timezone is not set, UTC (Coordinated Universal Time) is used.\nAnywhere else, time values are computed according to the time offset of your web client.",
+      "required": false,
+      "string": "Timezone",
+      "type": "selection"
+    },
+    "tz_offset": {
+      "required": false,
+      "string": "Timezone offset",
+      "type": "char"
+    },
+    "user_id": {
+      "help": "The internal user in charge of this contact.",
+      "required": false,
+      "string": "Salesperson",
+      "type": "many2one"
+    },
+    "vat": {
+      "help": "The Tax Identification Number. Values here will be validated based on the country format. You can use '/' to indicate that the partner is not subject to tax.",
+      "required": false,
+      "string": "Tax ID",
+      "type": "char"
+    },
+    "same_vat_partner_id": {
+      "required": false,
+      "string": "Partner with same Tax ID",
+      "type": "many2one"
+    },
+    "same_company_registry_partner_id": {
+      "required": false,
+      "string": "Partner with same Company Registry",
+      "type": "many2one"
+    },
+    "company_registry": {
+      "help": "The registry number of the company. Use it if it is different from the Tax ID. It must be unique across all partners of a same country",
+      "required": false,
+      "string": "Company ID",
+      "type": "char"
+    },
+    "bank_ids": {
+      "required": false,
+      "string": "Banks",
+      "type": "one2many"
+    },
+    "website": {
+      "required": false,
+      "string": "Website Link",
+      "type": "char"
+    },
+    "comment": {
+      "required": false,
+      "string": "Notes",
+      "type": "html"
+    },
+    "category_id": {
+      "required": false,
+      "string": "Tags",
+      "type": "many2many"
+    },
+    "active": {
+      "required": false,
+      "string": "Active",
+      "type": "boolean"
+    },
+    "employee": {
+      "help": "Check this box if this contact is an Employee.",
+      "required": false,
+      "string": "Employee",
+      "type": "boolean"
+    },
+    "function": {
+      "required": false,
+      "string": "Job Position",
+      "type": "char"
+    },
+    "type": {
+      "help": "- Contact: Use this to organize the contact details of employees of a given company (e.g. CEO, CFO, ...).\n- Invoice Address: Preferred address for all invoices. Selected by default when you invoice an order that belongs to this company.\n- Delivery Address: Preferred address for all deliveries. Selected by default when you deliver an order that belongs to this company.\n- Private: Private addresses are only visible by authorized users and contain sensitive data (employee home addresses, ...).\n- Follow-up Address: Preferred address for follow-up reports. Selected by default when you send reminders about overdue invoices.\n- Other: Other address for the company (e.g. subsidiary, ...)",
+      "required": false,
+      "string": "Address Type",
+      "type": "selection"
+    },
+    "street": {
+      "required": false,
+      "string": "Street",
+      "type": "char"
+    },
+    "street2": {
+      "required": false,
+      "string": "Street2",
+      "type": "char"
+    },
+    "zip": {
+      "required": false,
+      "string": "Zip",
+      "type": "char"
+    },
+    "city": {
+      "required": false,
+      "string": "City",
+      "type": "char"
+    },
+    "state_id": {
+      "required": false,
+      "string": "State",
+      "type": "many2one"
+    },
+    "country_id": {
+      "required": false,
+      "string": "Country",
+      "type": "many2one"
+    },
+    "country_code": {
+      "help": "The ISO country code in two chars. \nYou can use this field for quick search.",
+      "required": false,
+      "string": "Country Code",
+      "type": "char"
+    },
+    "partner_latitude": {
+      "required": false,
+      "string": "Geo Latitude",
+      "type": "float"
+    },
+    "partner_longitude": {
+      "required": false,
+      "string": "Geo Longitude",
+      "type": "float"
+    },
+    "email": {
+      "required": false,
+      "string": "Email",
+      "type": "char"
+    },
+    "email_formatted": {
+      "help": "Format email address \"Name <email@domain>\"",
+      "required": false,
+      "string": "Formatted Email",
+      "type": "char"
+    },
+    "phone": {
+      "required": false,
+      "string": "Phone",
+      "type": "char"
+    },
+    "mobile": {
+      "required": false,
+      "string": "Mobile",
+      "type": "char"
+    },
+    "is_company": {
+      "help": "Check if the contact is a company, otherwise it is a person",
+      "required": false,
+      "string": "Is a Company",
+      "type": "boolean"
+    },
+    "is_public": {
+      "required": false,
+      "string": "Is Public",
+      "type": "boolean"
+    },
+    "industry_id": {
+      "required": false,
+      "string": "Industry",
+      "type": "many2one"
+    },
+    "company_type": {
+      "required": false,
+      "string": "Company Type",
+      "type": "selection"
+    },
+    "company_id": {
+      "required": false,
+      "string": "Company",
+      "type": "many2one"
+    },
+    "color": {
+      "required": false,
+      "string": "Color Index",
+      "type": "integer"
+    },
+    "user_ids": {
+      "required": false,
+      "string": "Users",
+      "type": "one2many"
+    },
+    "partner_share": {
+      "help": "Either customer (not a user), either shared user. Indicated the current partner is a customer without access or with a limited access created for sharing data.",
+      "required": false,
+      "string": "Share Partner",
+      "type": "boolean"
+    },
+    "contact_address": {
+      "required": false,
+      "string": "Complete Address",
+      "type": "char"
+    },
+    "commercial_partner_id": {
+      "required": false,
+      "string": "Commercial Entity",
+      "type": "many2one"
+    },
+    "commercial_company_name": {
+      "required": false,
+      "string": "Company Name Entity",
+      "type": "char"
+    },
+    "company_name": {
+      "required": false,
+      "string": "Company Name",
+      "type": "char"
+    },
+    "barcode": {
+      "help": "Use a barcode to identify this contact.",
+      "required": false,
+      "string": "Barcode",
+      "type": "char"
+    },
+    "self": {
+      "required": false,
+      "string": "Self",
+      "type": "many2one"
+    },
+    "id": {
+      "required": false,
+      "string": "ID",
+      "type": "integer"
+    },
+    "display_name": {
+      "required": false,
+      "string": "Display Name",
+      "type": "char"
+    },
+    "create_uid": {
+      "required": false,
+      "string": "Created by",
+      "type": "many2one"
+    },
+    "create_date": {
+      "required": false,
+      "string": "Created on",
+      "type": "datetime"
+    },
+    "write_uid": {
+      "required": false,
+      "string": "Last Updated by",
+      "type": "many2one"
+    },
+    "write_date": {
+      "required": false,
+      "string": "Last Updated on",
+      "type": "datetime"
+    },
+    "im_status": {
+      "required": false,
+      "string": "IM Status",
+      "type": "char"
+    },
+    "date_localization": {
+      "required": false,
+      "string": "Geolocation Date",
+      "type": "date"
+    },
+    "channel_ids": {
+      "required": false,
+      "string": "Channels",
+      "type": "many2many"
+    },
+    "contact_address_inline": {
+      "required": false,
+      "string": "Inlined Complete Address",
+      "type": "char"
+    },
+    "starred_message_ids": {
+      "required": false,
+      "string": "Starred Message",
+      "type": "many2many"
+    },
+    "contact_address_complete": {
+      "required": false,
+      "string": "Contact Address Complete",
+      "type": "char"
+    },
+    "signup_token": {
+      "required": false,
+      "string": "Signup Token",
+      "type": "char"
+    },
+    "signup_type": {
+      "required": false,
+      "string": "Signup Token Type",
+      "type": "char"
+    },
+    "signup_expiration": {
+      "required": false,
+      "string": "Signup Expiration",
+      "type": "datetime"
+    },
+    "signup_valid": {
+      "required": false,
+      "string": "Signup Token is Valid",
+      "type": "boolean"
+    },
+    "signup_url": {
+      "required": false,
+      "string": "Signup URL",
+      "type": "char"
+    },
+    "meeting_count": {
+      "required": false,
+      "string": "# Meetings",
+      "type": "integer"
+    },
+    "meeting_ids": {
+      "required": false,
+      "string": "Meetings",
+      "type": "many2many"
+    },
+    "calendar_last_notif_ack": {
+      "required": false,
+      "string": "Last notification marked as read from base Calendar",
+      "type": "datetime"
+    },
+    "plan_to_change_car": {
+      "required": false,
+      "string": "Plan To Change Car",
+      "type": "boolean"
+    },
+    "plan_to_change_bike": {
+      "required": false,
+      "string": "Plan To Change Bike",
+      "type": "boolean"
+    },
+    "property_product_pricelist": {
+      "help": "This pricelist will be used, instead of the default one, for sales to the current partner",
+      "required": false,
+      "string": "Pricelist",
+      "type": "many2one"
+    },
+    "team_id": {
+      "help": "If set, this Sales Team will be used for sales and assignments related to this partner",
+      "required": false,
+      "string": "Sales Team",
+      "type": "many2one"
+    },
+    "image_medium": {
+      "required": false,
+      "string": "Medium-sized image",
+      "type": "binary"
+    },
+    "employee_ids": {
+      "help": "Related employees based on their private address",
+      "required": false,
+      "string": "Employees",
+      "type": "one2many"
+    },
+    "employees_count": {
+      "required": false,
+      "string": "Employees Count",
+      "type": "integer"
+    },
+    "loyalty_card_count": {
+      "required": false,
+      "string": "Active loyalty cards",
+      "type": "integer"
+    },
+    "partner_gid": {
+      "required": false,
+      "string": "Company database ID",
+      "type": "integer"
+    },
+    "additional_info": {
+      "required": false,
+      "string": "Additional info",
+      "type": "char"
+    },
+    "phone_sanitized": {
+      "help": "Field used to store sanitized phone number. Helps speeding up searches and comparisons.",
+      "required": false,
+      "string": "Sanitized Number",
+      "type": "char"
+    },
+    "phone_sanitized_blacklisted": {
+      "help": "If the sanitized phone number is on the blacklist, the contact won't receive mass mailing sms anymore, from any list",
+      "required": false,
+      "string": "Phone Blacklisted",
+      "type": "boolean"
+    },
+    "phone_blacklisted": {
+      "help": "Indicates if a blacklisted sanitized phone number is a phone number. Helps distinguish which number is blacklisted             when there is both a mobile and phone field in a model.",
+      "required": false,
+      "string": "Blacklisted Phone is Phone",
+      "type": "boolean"
+    },
+    "mobile_blacklisted": {
+      "help": "Indicates if a blacklisted sanitized phone number is a mobile number. Helps distinguish which number is blacklisted             when there is both a mobile and phone field in a model.",
+      "required": false,
+      "string": "Blacklisted Phone Is Mobile",
+      "type": "boolean"
+    },
+    "phone_mobile_search": {
+      "required": false,
+      "string": "Phone/Mobile",
+      "type": "char"
+    },
+    "certifications_count": {
+      "required": false,
+      "string": "Certifications Count",
+      "type": "integer"
+    },
+    "certifications_company_count": {
+      "required": false,
+      "string": "Company Certifications Count",
+      "type": "integer"
+    },
+    "event_count": {
+      "required": false,
+      "string": "# Events",
+      "type": "integer"
+    },
+    "static_map_url": {
+      "required": false,
+      "string": "Static Map Url",
+      "type": "char"
+    },
+    "static_map_url_is_valid": {
+      "required": false,
+      "string": "Static Map Url Is Valid",
+      "type": "boolean"
+    },
+    "ocn_token": {
+      "help": "Used for sending notification to registered devices",
+      "required": false,
+      "string": "OCN Token",
+      "type": "char"
+    },
+    "payment_token_ids": {
+      "required": false,
+      "string": "Payment Tokens",
+      "type": "one2many"
+    },
+    "payment_token_count": {
+      "required": false,
+      "string": "Payment Token Count",
+      "type": "integer"
+    },
+    "signature_count": {
+      "required": false,
+      "string": "# Signatures",
+      "type": "integer"
+    },
+    "fiscal_country_codes": {
+      "required": false,
+      "string": "Fiscal Country Codes",
+      "type": "char"
+    },
+    "credit": {
+      "help": "Total amount this customer owes you.",
+      "required": false,
+      "string": "Total Receivable",
+      "type": "monetary"
+    },
+    "credit_to_invoice": {
+      "required": false,
+      "string": "Credit To Invoice",
+      "type": "monetary"
+    },
+    "credit_limit": {
+      "help": "Credit limit specific to this partner.",
+      "required": false,
+      "string": "Credit Limit",
+      "type": "float"
+    },
+    "use_partner_credit_limit": {
+      "help": "Set a value greater than 0.0 to activate a credit limit check",
+      "required": false,
+      "string": "Partner Limit",
+      "type": "boolean"
+    },
+    "show_credit_limit": {
+      "required": false,
+      "string": "Show Credit Limit",
+      "type": "boolean"
+    },
+    "days_sales_outstanding": {
+      "help": "[(Total Receivable/Total Revenue) * number of days since the first invoice] for this customer",
+      "required": false,
+      "string": "Days Sales Outstanding (DSO)",
+      "type": "float"
+    },
+    "debit": {
+      "help": "Total amount you have to pay to this vendor.",
+      "required": false,
+      "string": "Total Payable",
+      "type": "monetary"
+    },
+    "debit_limit": {
+      "required": false,
+      "string": "Payable Limit",
+      "type": "monetary"
+    },
+    "total_invoiced": {
+      "required": false,
+      "string": "Total Invoiced",
+      "type": "monetary"
+    },
+    "currency_id": {
+      "required": false,
+      "string": "Currency",
+      "type": "many2one"
+    },
+    "journal_item_count": {
+      "required": false,
+      "string": "Journal Items",
+      "type": "integer"
+    },
+    "property_account_payable_id": {
+      "help": "This account will be used instead of the default one as the payable account for the current partner",
+      "required": true,
+      "string": "Account Payable",
+      "type": "many2one"
+    },
+    "property_account_receivable_id": {
+      "help": "This account will be used instead of the default one as the receivable account for the current partner",
+      "required": true,
+      "string": "Account Receivable",
+      "type": "many2one"
+    },
+    "property_account_position_id": {
+      "help": "The fiscal position determines the taxes/accounts used for this contact.",
+      "required": false,
+      "string": "Fiscal Position",
+      "type": "many2one"
+    },
+    "property_payment_term_id": {
+      "help": "This payment term will be used instead of the default one for sales orders and customer invoices",
+      "required": false,
+      "string": "Customer Payment Terms",
+      "type": "many2one"
+    },
+    "property_supplier_payment_term_id": {
+      "help": "This payment term will be used instead of the default one for purchase orders and vendor bills",
+      "required": false,
+      "string": "Vendor Payment Terms",
+      "type": "many2one"
+    },
+    "ref_company_ids": {
+      "required": false,
+      "string": "Companies that refers to partner",
+      "type": "one2many"
+    },
+    "supplier_invoice_count": {
+      "required": false,
+      "string": "# Vendor Bills",
+      "type": "integer"
+    },
+    "has_unreconciled_entries": {
+      "help": "The partner has at least one unreconciled debit and credit since last time the invoices & payments matching was performed.",
+      "required": false,
+      "string": "Has Unreconciled Entries",
+      "type": "boolean"
+    },
+    "last_time_entries_checked": {
+      "help": "Last time the invoices & payments matching was performed for this partner. It is set either if there's not at least an unreconciled debit and an unreconciled credit or if you click the \"Done\" button.",
+      "required": false,
+      "string": "Latest Invoices & Payments Matching Date",
+      "type": "datetime"
+    },
+    "invoice_ids": {
+      "required": false,
+      "string": "Invoices",
+      "type": "one2many"
+    },
+    "contract_ids": {
+      "required": false,
+      "string": "Partner Contracts",
+      "type": "one2many"
+    },
+    "bank_account_count": {
+      "required": false,
+      "string": "Bank",
+      "type": "integer"
+    },
+    "trust": {
+      "required": false,
+      "string": "Degree of trust you have in this debtor",
+      "type": "selection"
+    },
+    "invoice_warn": {
+      "help": "Selecting the \"Warning\" option will notify user with the message, Selecting \"Blocking Message\" will throw an exception with the message and block the flow. The Message has to be written in the next field.",
+      "required": false,
+      "string": "Invoice",
+      "type": "selection"
+    },
+    "invoice_warn_msg": {
+      "required": false,
+      "string": "Message for Invoice",
+      "type": "text"
+    },
+    "supplier_rank": {
+      "required": false,
+      "string": "Supplier Rank",
+      "type": "integer"
+    },
+    "customer_rank": {
+      "required": false,
+      "string": "Customer Rank",
+      "type": "integer"
+    },
+    "duplicated_bank_account_partners_count": {
+      "required": false,
+      "string": "Duplicated Bank Account Partners Count",
+      "type": "integer"
+    },
+    "is_coa_installed": {
+      "required": false,
+      "string": "Is Coa Installed",
+      "type": "boolean"
+    },
+    "opportunity_ids": {
+      "required": false,
+      "string": "Opportunities",
+      "type": "one2many"
+    },
+    "opportunity_count": {
+      "required": false,
+      "string": "Opportunity",
+      "type": "integer"
+    },
+    "document_count": {
+      "required": false,
+      "string": "Document Count",
+      "type": "integer"
+    },
+    "ticket_count": {
+      "required": false,
+      "string": "Tickets",
+      "type": "integer"
+    },
+    "sla_ids": {
+      "help": "SLA Policies that will automatically apply to the tickets submitted by this customer.",
+      "required": false,
+      "string": "SLA Policies",
+      "type": "many2many"
+    },
+    "user_livechat_username": {
+      "required": false,
+      "string": "User Livechat Username",
+      "type": "char"
+    },
+    "project_ids": {
+      "required": false,
+      "string": "Projects",
+      "type": "one2many"
+    },
+    "task_ids": {
+      "required": false,
+      "string": "Tasks",
+      "type": "one2many"
+    },
+    "task_count": {
+      "required": false,
+      "string": "# Tasks",
+      "type": "integer"
+    },
+    "property_stock_customer": {
+      "help": "The stock location used as destination when sending goods to this contact.",
+      "required": false,
+      "string": "Customer Location",
+      "type": "many2one"
+    },
+    "property_stock_supplier": {
+      "help": "The stock location used as source when receiving goods from this contact.",
+      "required": false,
+      "string": "Vendor Location",
+      "type": "many2one"
+    },
+    "picking_warn": {
+      "help": "Selecting the \"Warning\" option will notify user with the message, Selecting \"Blocking Message\" will throw an exception with the message and block the flow. The Message has to be written in the next field.",
+      "required": false,
+      "string": "Stock Picking",
+      "type": "selection"
+    },
+    "picking_warn_msg": {
+      "required": false,
+      "string": "Message for Stock Picking",
+      "type": "text"
+    },
+    "visitor_ids": {
+      "required": false,
+      "string": "Visitors",
+      "type": "one2many"
+    },
+    "property_payment_method_id": {
+      "help": "Preferred payment method when paying this vendor. This is used to filter vendor bills by preferred payment method to register payments in mass. Use cases: create bank files for batch wires, check runs.",
+      "required": false,
+      "string": "Payment Method",
+      "type": "many2one"
+    },
+    "ubl_cii_format": {
+      "required": false,
+      "string": "Format",
+      "type": "selection"
+    },
+    "peppol_endpoint": {
+      "help": "Unique identifier used by the BIS Billing 3.0 and its derivatives, also known as 'Endpoint ID'.",
+      "required": false,
+      "string": "Peppol Endpoint",
+      "type": "char"
+    },
+    "peppol_eas": {
+      "help": "Code used to identify the Endpoint for BIS Billing 3.0 and its derivatives.\n             List available at https://docs.peppol.eu/poacc/billing/3.0/codelist/eas/",
+      "required": false,
+      "string": "Peppol e-address (EAS)",
+      "type": "selection"
+    },
+    "hide_peppol_fields": {
+      "required": false,
+      "string": "Hide Peppol Fields",
+      "type": "boolean"
+    },
+    "vies_valid": {
+      "help": "European VAT numbers are automatically checked on the VIES database.",
+      "required": false,
+      "string": "Intra-Community Valid",
+      "type": "boolean"
+    },
+    "perform_vies_validation": {
+      "required": false,
+      "string": "Perform Vies Validation",
+      "type": "boolean"
+    },
+    "vies_vat_to_check": {
+      "required": false,
+      "string": "Vies Vat To Check",
+      "type": "char"
+    },
+    "property_purchase_currency_id": {
+      "help": "This currency will be used, instead of the default one, for purchases from the current partner",
+      "required": false,
+      "string": "Supplier Currency",
+      "type": "many2one"
+    },
+    "purchase_order_count": {
+      "required": false,
+      "string": "Purchase Order Count",
+      "type": "integer"
+    },
+    "purchase_warn": {
+      "help": "Selecting the \"Warning\" option will notify user with the message, Selecting \"Blocking Message\" will throw an exception with the message and block the flow. The Message has to be written in the next field.",
+      "required": false,
+      "string": "Purchase Order Warning",
+      "type": "selection"
+    },
+    "purchase_warn_msg": {
+      "required": false,
+      "string": "Message for Purchase Order",
+      "type": "text"
+    },
+    "receipt_reminder_email": {
+      "help": "Automatically send a confirmation email to the vendor X days before the expected receipt date, asking him to confirm the exact date.",
+      "required": false,
+      "string": "Receipt Reminder",
+      "type": "boolean"
+    },
+    "reminder_date_before_receipt": {
+      "help": "Number of days to send reminder email before the promised receipt date",
+      "required": false,
+      "string": "Days Before Receipt",
+      "type": "integer"
+    },
+    "buyer_id": {
+      "required": false,
+      "string": "Buyer",
+      "type": "many2one"
+    },
+    "website_description": {
+      "required": false,
+      "string": "Website Partner Full Description",
+      "type": "html"
+    },
+    "website_short_description": {
+      "required": false,
+      "string": "Website Partner Short Description",
+      "type": "text"
+    },
+    "online_partner_information": {
+      "required": false,
+      "string": "Online Partner Information",
+      "type": "char"
+    },
+    "account_represented_company_ids": {
+      "required": false,
+      "string": "Account Represented Company",
+      "type": "one2many"
+    },
+    "property_stock_subcontractor": {
+      "help": "The stock location used as source and destination when sending        goods to this contact during a subcontracting process.",
+      "required": false,
+      "string": "Subcontractor Location",
+      "type": "many2one"
+    },
+    "is_subcontractor": {
+      "required": false,
+      "string": "Subcontractor",
+      "type": "boolean"
+    },
+    "bom_ids": {
+      "required": false,
+      "string": "BoMs for which the Partner is one of the subcontractors",
+      "type": "many2many"
+    },
+    "production_ids": {
+      "required": false,
+      "string": "MRP Productions for which the Partner is the subcontractor",
+      "type": "many2many"
+    },
+    "picking_ids": {
+      "required": false,
+      "string": "Stock Pickings for which the Partner is the subcontractor",
+      "type": "many2many"
+    },
+    "pos_order_count": {
+      "help": "The number of point of sales orders related to this customer",
+      "required": false,
+      "string": "Pos Order Count",
+      "type": "integer"
+    },
+    "pos_order_ids": {
+      "required": false,
+      "string": "Pos Order",
+      "type": "one2many"
+    },
+    "purchase_line_ids": {
+      "required": false,
+      "string": "Purchase Lines",
+      "type": "one2many"
+    },
+    "on_time_rate": {
+      "help": "Over the past x days; the number of products received on time divided by the number of ordered products.x is either the System Parameter purchase_stock.on_time_delivery_days or the default 365",
+      "required": false,
+      "string": "On-Time Delivery Rate",
+      "type": "float"
+    },
+    "sale_order_count": {
+      "required": false,
+      "string": "Sale Order Count",
+      "type": "integer"
+    },
+    "sale_order_ids": {
+      "required": false,
+      "string": "Sales Order",
+      "type": "one2many"
+    },
+    "sale_warn": {
+      "help": "Selecting the \"Warning\" option will notify user with the message, Selecting \"Blocking Message\" will throw an exception with the message and block the flow. The Message has to be written in the next field.",
+      "required": false,
+      "string": "Sales Warnings",
+      "type": "selection"
+    },
+    "sale_warn_msg": {
+      "required": false,
+      "string": "Message for Sales Order",
+      "type": "text"
+    },
+    "followup_next_action_date": {
+      "help": "No follow-up action will be taken before this date.\n                Sending a reminder will set this date depending on the levels configuration, and you can change it manually.",
+      "required": false,
+      "string": "Next reminder",
+      "type": "date"
+    },
+    "unreconciled_aml_ids": {
+      "required": false,
+      "string": "Unreconciled Aml",
+      "type": "one2many"
+    },
+    "unpaid_invoice_ids": {
+      "required": false,
+      "string": "Unpaid Invoice",
+      "type": "one2many"
+    },
+    "unpaid_invoices_count": {
+      "required": false,
+      "string": "Unpaid Invoices Count",
+      "type": "integer"
+    },
+    "total_due": {
+      "required": false,
+      "string": "Total Due",
+      "type": "monetary"
+    },
+    "total_overdue": {
+      "required": false,
+      "string": "Total Overdue",
+      "type": "monetary"
+    },
+    "followup_status": {
+      "required": false,
+      "string": "Follow-up Status",
+      "type": "selection"
+    },
+    "followup_line_id": {
+      "required": false,
+      "string": "Follow-up Level",
+      "type": "many2one"
+    },
+    "followup_reminder_type": {
+      "required": false,
+      "string": "Reminders",
+      "type": "selection"
+    },
+    "followup_responsible_id": {
+      "help": "The responsible assigned to manual followup activities, if defined in the level.",
+      "required": false,
+      "string": "Responsible",
+      "type": "many2one"
+    },
+    "property_delivery_carrier_id": {
+      "help": "Default delivery method used in sales orders.",
+      "required": false,
+      "string": "Delivery Method",
+      "type": "many2one"
+    },
+    "l10n_din5008_template_data": {
+      "required": false,
+      "string": "L10N Din5008 Template Data",
+      "type": "binary"
+    },
+    "l10n_din5008_document_title": {
+      "required": false,
+      "string": "L10N Din5008 Document Title",
+      "type": "char"
+    },
+    "last_website_so_id": {
+      "required": false,
+      "string": "Last Online Sales Order",
+      "type": "many2one"
+    },
+    "x_studio_rccm": {
+      "required": false,
+      "string": "Nouveau Texte",
+      "type": "char"
+    },
+    "x_studio_contrats_commerciaux": {
+      "required": false,
+      "string": "Nouveau Many2Many",
+      "type": "many2many"
+    },
+    "x_studio_many2one_field_6nt_1iv8lgsal": {
+      "required": false,
+      "string": "Contrat",
+      "type": "many2one"
+    },
+    "x_studio_transport_pb": {
+      "required": false,
+      "string": "Transport PB",
+      "type": "monetary"
     }
   },
-  "message": "Trouvé 3 transfert(s) sur 3 pour le camion 'BA6505RB/BA7622RB' (page 1/1)",
-  "count": 3
+  "message": "Trouvé 239 champs pour le modèle res.partner",
+  "count": 239
 }

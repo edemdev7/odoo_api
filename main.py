@@ -13,6 +13,8 @@ from api.auth import router as auth_router
 from api.pos import router as pos_router
 from api.odoo import router as odoo_router
 from api.utils import router as utils_router
+from api.fuel_monitor import router as fuel_monitor_router
+from api.accounting import router as accounting_router
 from core.config import logger
 
 # Configuration et création de l'application FastAPI
@@ -52,6 +54,14 @@ app = FastAPI(
             "description": "Utilitaires et informations sur les modèles Odoo"
         },
         {
+            "name": "Fuel Account Monitor",
+            "description": "Surveillance des comptes fuel et webhooks de recharge"
+        },
+        {
+            "name": "Accounting",
+            "description": "Gestion des écritures comptables (endpoints sécurisés par encryption)"
+        },
+        {
             "name": "Système",
             "description": "Endpoints système (état, versions, etc.)"
         }
@@ -72,6 +82,8 @@ app.include_router(auth_router)
 app.include_router(pos_router)
 app.include_router(odoo_router)
 app.include_router(utils_router)
+app.include_router(fuel_monitor_router)
+app.include_router(accounting_router)
 
 logger.info("Application Odoo API Gateway démarrée")
 
