@@ -416,3 +416,90 @@ async def configure_webhook_url(
             status_code=500,
             detail=f"Erreur: {str(e)}"
         )
+
+
+@router.delete("/cache/clear", response_model=ApiResponse)
+async def clear_cache(
+    partner_id: Optional[int] = None,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Vider le cache de crédit
+    
+    **Paramètres:**
+    - **partner_id**: ID du partenaire spécifique (optionnel, sinon tout le cache)
+    
+    **Retourne:**
+    - Confirmation du vidage du cache
+    """
+    try:
+        global credit_cache
+        
+        if partner_id:
+            # Vider uniquement pour un partenaire spécifique
+            if partner_id in credit_cache:
+                del credit_cache[partner_id]
+                logger.info(f"🗑️  Cache vidé pour partner_id: {partner_id}")
+                message = f"Cache vidé pour le partenaire {partner_id}"
+            else:
+                message = f"Aucun cache trouvé pour le partenaire {partner_id}"
+        else:
+            # Vider tout le cache
+            cache_size = len(credit_cache)
+            credit_cache = {}
+            logger.info(f"🗑️  Cache complet vidé ({cache_size} entrées)")
+            message = f"Cache complet vidé ({cache_size} entrées)"
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'cache_size': len(credit_cache),
+                'partner_id_cleared': partner_id
+            },
+            message=message
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du vidage du cache: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
+
+
+@router.get("/cache/status", response_model=ApiResponse)
+async def get_cache_status(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Obtenir le statut du cache
+    
+    **Retourne:**
+    - Informations sur le cache actuel
+    """
+    try:
+        cache_info = []
+        
+        for partner_id, info in credit_cache.items():
+            cache_info.append({
+                'partner_id': partner_id,
+                'credit': info.get('credit'),
+                'last_check': info.get('last_check').isoformat() if info.get('last_check') else None
+            })
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'cache_size': len(credit_cache),
+                'entries': cache_info
+            },
+            count=len(credit_cache),
+            message=f"Cache contient {len(credit_cache)} entrée(s)"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du statut du cache: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
