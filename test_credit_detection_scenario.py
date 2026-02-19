@@ -106,7 +106,7 @@ def main():
     # Étape 0: Authentification
     print("📍 ÉTAPE 0: Authentification")
     print("-" * 80)
-    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlbXBsb3llZV81MjMiLCJzY29wZXMiOlsicmVhZCIsInBvcyJdLCJpYXQiOjE3NzE0OTk4OTAsImVtcGxveWVlX2lkIjo1MjMsImVtcGxveWVlX25hbWUiOiJBS1BBTiBNYXJpZSBFbHZpcmUiLCJlbXBsb3llZV9tYXRyaWN1bGUiOiJKMDEyNTciLCJwYXJ0bmVyX2lkIjo5ODAyLCJvZG9vX2RiIjoiam5wX2RpcmVjdGUiLCJleHAiOjE3NzE1Mjg2OTB9.SC_1NUUmtBILsHOBd44X8VbLv8kMcM8cb2UkqmMDfaE"
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlbXBsb3llZV81MjMiLCJzY29wZXMiOlsicmVhZCIsInBvcyJdLCJpYXQiOjE3NzE1MDUzMTUsImVtcGxveWVlX2lkIjo1MjMsImVtcGxveWVlX25hbWUiOiJBS1BBTiBNYXJpZSBFbHZpcmUiLCJlbXBsb3llZV9tYXRyaWN1bGUiOiJKMDEyNTciLCJwYXJ0bmVyX2lkIjo5ODAyLCJvZG9vX2RiIjoiam5wX2RpcmVjdGUiLCJleHAiOjE3NzE1MzQxMTV9.5BhB8RRMdtPdRfrwXOq-XzknkxgLT2jLVTP4KqAlcVc"
     if not token:
         print("❌ Impossible d'obtenir un token. Test sans authentification...")
         token = None

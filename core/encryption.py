@@ -9,11 +9,13 @@ import os
 import base64
 import json
 import logging
+import zlib
 from typing import Dict, Any
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 logger = logging.getLogger(__name__)
 
@@ -61,64 +63,116 @@ class RSAEncryption:
             raise
     
     def load_private_key(self, key_path: str):
-        """Charger la clé privée depuis un fichier PEM"""
+        """Charger la clé privée depuis un fichier PEM (supporte PKCS#1 et PKCS#8)"""
         try:
             with open(key_path, 'rb') as key_file:
+                key_data = key_file.read()
+                
+            # Essayer de charger comme PKCS#8 (BEGIN PRIVATE KEY)
+            try:
                 self.private_key = serialization.load_pem_private_key(
-                    key_file.read(),
+                    key_data,
                     password=None,
                     backend=default_backend()
                 )
-            logger.info(f"✅ Clé privée RSA chargée: {key_path}")
+                logger.info(f"✅ Clé privée RSA chargée (PKCS#8): {key_path}")
+                return
+            except Exception as e1:
+                logger.debug(f"Échec chargement PKCS#8: {e1}")
+            
+            # Si échec, essayer de la convertir de PKCS#1 à PKCS#8
+            # Format PKCS#1: BEGIN RSA PRIVATE KEY
+            if b'BEGIN RSA PRIVATE KEY' in key_data:
+                logger.info("Détection format PKCS#1, conversion en cours...")
+                
+                # Utiliser openssl pour convertir
+                import subprocess
+                import tempfile
+                
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.pem') as tmp_in:
+                    tmp_in.write(key_data)
+                    tmp_in_path = tmp_in.name
+                
+                with tempfile.NamedTemporaryFile(mode='rb', delete=False, suffix='.pem') as tmp_out:
+                    tmp_out_path = tmp_out.name
+                
+                try:
+                    # Convertir PKCS#1 vers PKCS#8
+                    result = subprocess.run(
+                        ['openssl', 'pkcs8', '-topk8', '-inform', 'PEM', '-outform', 'PEM', 
+                         '-nocrypt', '-in', tmp_in_path, '-out', tmp_out_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        with open(tmp_out_path, 'rb') as f:
+                            converted_key = f.read()
+                        
+                        self.private_key = serialization.load_pem_private_key(
+                            converted_key,
+                            password=None,
+                            backend=default_backend()
+                        )
+                        logger.info(f"✅ Clé privée RSA chargée (PKCS#1 converti): {key_path}")
+                        return
+                    else:
+                        logger.error(f"Erreur conversion openssl: {result.stderr}")
+                finally:
+                    # Nettoyer les fichiers temporaires
+                    try:
+                        os.unlink(tmp_in_path)
+                        os.unlink(tmp_out_path)
+                    except:
+                        pass
+            
+            raise ValueError(f"Impossible de charger la clé privée. Format non reconnu.")
+            
         except Exception as e:
             logger.error(f"❌ Erreur chargement clé privée: {e}")
             raise
     
-    def encrypt_data(self, data: Dict[str, Any]) -> str:
+    def encrypt_data(self, data: Dict[str, Any], use_compression: bool = True) -> str:
         """
-        Encrypter des données avec chiffrement hybride RSA + AES
+        Encrypter des données avec RSA pur + compression optionnelle
         
-        Pour contourner la limitation de taille de RSA, on utilise:
-        1. AES-256 pour encrypter les données (symétrique, rapide, pas de limite)
-        2. RSA pour encrypter la clé AES (seulement 32 bytes)
+        Compatible avec Node.js crypto.publicEncrypt avec OAEP padding
         
         Args:
             data: Dictionnaire de données à encrypter
+            use_compression: Si True, compresse les données avec zlib avant encryption
             
         Returns:
-            String base64 contenant: clé_aes_encryptée + iv + données_encryptées
+            String base64 des données encryptées
         """
         if self.public_key is None:
             raise ValueError("Clé publique non chargée")
         
         try:
             # Convertir les données en JSON
-            json_data = json.dumps(data, ensure_ascii=False)
+            json_data = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
             plaintext = json_data.encode('utf-8')
             
-            # 1. Générer une clé AES-256 aléatoire (32 bytes)
-            aes_key = os.urandom(32)
+            # Compresser si demandé (réduit la taille pour RSA)
+            if use_compression:
+                compressed = zlib.compress(plaintext, level=9)
+                # Préfixe pour indiquer que c'est compressé
+                to_encrypt = b'ZLIB:' + compressed
+                logger.debug(f"Compression: {len(plaintext)} bytes -> {len(compressed)} bytes")
+            else:
+                to_encrypt = plaintext
             
-            # 2. Générer un IV aléatoire (16 bytes pour AES)
-            iv = os.urandom(16)
+            # Vérifier la taille (RSA 2048 avec OAEP SHA256 = max ~190 bytes)
+            max_size = (self.public_key.key_size // 8) - 2 * 32 - 2  # ~190 bytes pour 2048 bits
+            if len(to_encrypt) > max_size:
+                raise ValueError(
+                    f"Données trop grandes pour RSA ({len(to_encrypt)} bytes, max {max_size} bytes). "
+                    f"Original: {len(plaintext)} bytes. Activez la compression ou réduisez les données."
+                )
             
-            # 3. Encrypter les données avec AES
-            cipher = Cipher(
-                algorithms.AES(aes_key),
-                modes.CBC(iv),
-                backend=default_backend()
-            )
-            encryptor = cipher.encryptor()
-            
-            # Padding PKCS7 pour que la taille soit multiple de 16
-            pad_length = 16 - (len(plaintext) % 16)
-            padded_plaintext = plaintext + bytes([pad_length] * pad_length)
-            
-            encrypted_data = encryptor.update(padded_plaintext) + encryptor.finalize()
-            
-            # 4. Encrypter la clé AES avec RSA
-            encrypted_aes_key = self.public_key.encrypt(
-                aes_key,
+            # Encrypter avec RSA + OAEP padding (compatible Node.js)
+            encrypted = self.public_key.encrypt(
+                to_encrypt,
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
@@ -126,14 +180,10 @@ class RSAEncryption:
                 )
             )
             
-            # 5. Combiner: [longueur_clé_rsa(2 bytes)][clé_aes_encryptée][iv][données_encryptées]
-            key_length = len(encrypted_aes_key).to_bytes(2, byteorder='big')
-            combined = key_length + encrypted_aes_key + iv + encrypted_data
+            # Encoder en base64 pour transmission
+            encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
             
-            # 6. Encoder en base64 pour transmission
-            encrypted_b64 = base64.b64encode(combined).decode('utf-8')
-            
-            logger.debug(f"✅ Données encryptées avec AES+RSA (taille: {len(encrypted_b64)} chars)")
+            logger.debug(f"✅ Données encryptées avec RSA+OAEP (taille: {len(encrypted_b64)} chars)")
             
             return encrypted_b64
             
@@ -147,10 +197,10 @@ class RSAEncryption:
         
         Inverse du processus d'encryption:
         1. Extraire et décrypter la clé AES avec RSA
-        2. Décrypter les données avec AES
+        Décryptage RSA pur (compatible Node.js)
         
         Args:
-            encrypted_data: String base64 contenant: clé_aes_encryptée + iv + données_encryptées
+            encrypted_data: String base64 contenant les données encryptées avec RSA
             
         Returns:
             Dictionnaire des données décryptées
@@ -160,19 +210,11 @@ class RSAEncryption:
         
         try:
             # 1. Décoder le base64
-            combined = base64.b64decode(encrypted_data)
+            encrypted_bytes = base64.b64decode(encrypted_data)
             
-            # 2. Extraire la longueur de la clé RSA encryptée (2 premiers bytes)
-            key_length = int.from_bytes(combined[0:2], byteorder='big')
-            
-            # 3. Extraire les composants
-            encrypted_aes_key = combined[2:2+key_length]
-            iv = combined[2+key_length:2+key_length+16]
-            encrypted_payload = combined[2+key_length+16:]
-            
-            # 4. Décrypter la clé AES avec RSA
-            aes_key = self.private_key.decrypt(
-                encrypted_aes_key,
+            # 2. Décrypter avec RSA-OAEP
+            decrypted = self.private_key.decrypt(
+                encrypted_bytes,
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
@@ -180,23 +222,18 @@ class RSAEncryption:
                 )
             )
             
-            # 5. Décrypter les données avec AES
-            cipher = Cipher(
-                algorithms.AES(aes_key),
-                modes.CBC(iv),
-                backend=default_backend()
-            )
-            decryptor = cipher.decryptor()
-            padded_plaintext = decryptor.update(encrypted_payload) + decryptor.finalize()
+            # 3. Vérifier si les données sont compressées (préfixe ZLIB:)
+            if decrypted.startswith(b'ZLIB:'):
+                compressed = decrypted[5:]  # Retirer le préfixe 'ZLIB:'
+                plaintext = zlib.decompress(compressed)
+                logger.debug(f"✅ Données décompressées: {len(compressed)} -> {len(plaintext)} bytes")
+            else:
+                plaintext = decrypted
             
-            # 6. Retirer le padding PKCS7
-            pad_length = padded_plaintext[-1]
-            plaintext = padded_plaintext[:-pad_length]
-            
-            # 7. Convertir JSON en dictionnaire
+            # 4. Convertir JSON en dictionnaire
             data = json.loads(plaintext.decode('utf-8'))
             
-            logger.debug(f"✅ Données décryptées avec AES+RSA")
+            logger.debug(f"✅ Données décryptées avec RSA pur")
             
             return data
             
@@ -229,18 +266,19 @@ def get_rsa_encryption(with_private: bool = False) -> RSAEncryption:
         return _rsa_encryption
 
 
-def encrypt_webhook_data(data: Dict[str, Any]) -> str:
+def encrypt_webhook_data(data: Dict[str, Any], use_compression: bool = False) -> str:
     """
     Fonction helper pour encrypter les données de webhook
     
     Args:
         data: Données à encrypter
+        use_compression: Si True, compresse avec zlib (désactivé par défaut pour compatibilité Node.js)
         
     Returns:
         String base64 encryptée
     """
     rsa = get_rsa_encryption()
-    return rsa.encrypt_data(data)
+    return rsa.encrypt_data(data, use_compression=use_compression)
 
 
 def decrypt_webhook_data(encrypted_data: str) -> Dict[str, Any]:
