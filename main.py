@@ -16,6 +16,7 @@ from api.utils import router as utils_router
 from api.fuel_monitor import router as fuel_monitor_router
 from api.accounting import router as accounting_router
 from core.config import logger
+from core.background_scheduler import start_credit_monitor, stop_credit_monitor
 
 # Configuration et création de l'application FastAPI
 app = FastAPI(
@@ -85,7 +86,24 @@ app.include_router(utils_router)
 app.include_router(fuel_monitor_router)
 app.include_router(accounting_router)
 
-logger.info("Application Odoo API Gateway démarrée")
+
+# Events de démarrage et arrêt
+@app.on_event("startup")
+async def startup_event():
+    """Démarrage de l'application"""
+    logger.info("🚀 Application Odoo API Gateway démarrée")
+    logger.info("🔄 Démarrage de la surveillance automatique des crédits...")
+    await start_credit_monitor()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Arrêt de l'application"""
+    logger.info("🛑 Arrêt de l'application...")
+    await stop_credit_monitor()
+
+
+logger.info("Application Odoo API Gateway configurée")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)

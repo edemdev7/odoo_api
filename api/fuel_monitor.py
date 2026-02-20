@@ -17,6 +17,7 @@ from core.security import require_scope
 from core.odoo_client import get_odoo_client
 from core.encryption import encrypt_webhook_data
 from models.responses import ApiResponse
+from core.background_scheduler import get_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -503,3 +504,136 @@ async def get_cache_status(
             status_code=500,
             detail=f"Erreur: {str(e)}"
         )
+
+
+@router.get("/scheduler/status", response_model=ApiResponse)
+async def get_scheduler_status(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Obtenir le statut du scheduler de surveillance automatique
+    
+    **Retourne:**
+    - État du scheduler (actif/inactif)
+    - Nombre d'entrées dans le cache
+    - Configuration actuelle
+    """
+    try:
+        scheduler = get_scheduler()
+        
+        return ApiResponse(
+            success=True,
+            data={
+                'is_running': scheduler.is_running,
+                'cache_size': len(scheduler.cache),
+                'webhook_url': WEBHOOK_URL,
+                'check_interval_seconds': os.getenv("CREDIT_CHECK_INTERVAL", "60")
+            },
+            message=f"Scheduler {'actif' if scheduler.is_running else 'inactif'}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération du statut: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
+
+
+@router.post("/scheduler/start", response_model=ApiResponse)
+async def start_scheduler_manually(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Démarrer manuellement le scheduler de surveillance
+    
+    **Note:** Le scheduler se lance normalement automatiquement au démarrage de l'application.
+    Utilisez cette route uniquement si vous l'avez arrêté manuellement.
+    """
+    try:
+        scheduler = get_scheduler()
+        
+        if scheduler.is_running:
+            return ApiResponse(
+                success=True,
+                message="Le scheduler est déjà en cours d'exécution"
+            )
+        
+        scheduler.start()
+        
+        return ApiResponse(
+            success=True,
+            message="Scheduler de surveillance démarré avec succès"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du démarrage du scheduler: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
+
+
+@router.post("/scheduler/stop", response_model=ApiResponse)
+async def stop_scheduler_manually(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Arrêter manuellement le scheduler de surveillance
+    
+    **Attention:** Cela désactive la surveillance automatique des crédits.
+    Les webhooks ne seront plus envoyés automatiquement.
+    """
+    try:
+        scheduler = get_scheduler()
+        
+        if not scheduler.is_running:
+            return ApiResponse(
+                success=True,
+                message="Le scheduler est déjà arrêté"
+            )
+        
+        scheduler.stop()
+        
+        return ApiResponse(
+            success=True,
+            message="Scheduler de surveillance arrêté"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de l'arrêt du scheduler: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
+
+
+@router.post("/scheduler/check-now", response_model=ApiResponse)
+async def trigger_check_now(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Déclencher manuellement une vérification immédiate des crédits
+    
+    Cette route force une vérification immédiate sans attendre le prochain cycle du scheduler.
+    Utile pour tester ou forcer une vérification après une opération spécifique.
+    """
+    try:
+        scheduler = get_scheduler()
+        
+        # Lancer une vérification immédiate en arrière-plan
+        import asyncio
+        asyncio.create_task(scheduler.check_credits_once())
+        
+        return ApiResponse(
+            success=True,
+            message="Vérification des crédits déclenchée"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du déclenchement de la vérification: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur: {str(e)}"
+        )
+
