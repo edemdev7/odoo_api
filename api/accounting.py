@@ -4,7 +4,7 @@ Module de gestion des écritures comptables
 Permet de créer des écritures comptables via API avec encryption RSA.
 """
 
-from fastapi import APIRouter, HTTPException, Request, Header
+from fastapi import APIRouter, HTTPException, Request, Header, BackgroundTasks
 from typing import Optional
 from datetime import datetime
 import logging
@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from core.encryption import decrypt_webhook_data
 from core.odoo_client import OdooClient
 from models.responses import ApiResponse
+from core.background_scheduler import get_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ DEFAULT_DEBIT_ACCOUNT = "411100"   # Compte de contrepartie à débiter
 @router.post("/credit-account", response_model=ApiResponse)
 async def credit_customer_account(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_encrypted_data: Optional[str] = Header(None, description="Données encryptées en base64")
 ):
     """
@@ -276,6 +278,25 @@ async def credit_customer_account(
         new_credit = updated_partner[0]['credit'] if updated_partner else None
         
         logger.info(f"💰 Nouveau solde client: {new_credit}")
+        
+        # ===== WEBHOOK ET MISE À JOUR DU CACHE =====
+        # Mettre à jour le cache du scheduler pour éviter la double détection
+        scheduler = get_scheduler()
+        if new_credit is not None:
+            scheduler.cache[credit_request.partner_id] = {
+                'credit': new_credit,
+                'last_check': datetime.now()
+            }
+            logger.info(f"📝 Cache scheduler mis à jour pour partner {credit_request.partner_id}")
+        
+        # Envoyer le webhook en arrière-plan (notre API connaît le montant exact)
+        from api.fuel_monitor import send_recharge_webhook
+        background_tasks.add_task(
+            send_recharge_webhook,
+            partner_id=str(credit_request.partner_id),
+            amount=credit_request.amount
+        )
+        logger.info(f"📤 Webhook planifié pour envoi en arrière-plan")
         
         return ApiResponse(
             success=True,

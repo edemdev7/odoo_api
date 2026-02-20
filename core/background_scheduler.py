@@ -13,6 +13,7 @@ import httpx
 
 from core.odoo_client import OdooClient
 from core.encryption import encrypt_webhook_data
+from core.config import ODOO_DB1_CONFIG  # Import de la config par défaut
 import os
 
 logger = logging.getLogger(__name__)
@@ -41,21 +42,30 @@ class CreditMonitorScheduler:
     async def check_credits_once(self):
         """Vérifier les crédits une seule fois"""
         try:
-            # Connexion Odoo avec les credentials par défaut
-            odoo_url = os.getenv("ODOO_URL")
-            odoo_db = os.getenv("ODOO_DB")
-            odoo_username = os.getenv("ODOO_USERNAME")
-            odoo_password = os.getenv("ODOO_PASSWORD")
+            # Utiliser la configuration Odoo par défaut (DB1)
+            config = {
+                'url': ODOO_DB1_CONFIG['url'],
+                'db': ODOO_DB1_CONFIG['db'],
+                'username': ODOO_DB1_CONFIG['username'],
+                'api_key': ODOO_DB1_CONFIG['api_key']
+            }
             
-            if not all([odoo_url, odoo_db, odoo_username, odoo_password]):
-                logger.warning("⚠️ Configuration Odoo incomplète pour le scheduler")
-                return
+            # Créer un client Odoo avec la configuration
+            client = OdooClient(custom_config=config)
             
-            # Créer un client Odoo
-            client = OdooClient(odoo_url, odoo_db, odoo_username, odoo_password)
-            
-            if not client.authenticate():
-                logger.error("❌ Échec authentification Odoo pour le scheduler")
+            # Authentifier (sera fait automatiquement lors du premier appel)
+            # Tester avec un appel simple
+            try:
+                # Test de connexion en récupérant un partenaire au hasard
+                test = client.execute_kw(
+                    'res.partner',
+                    'search',
+                    [[]],
+                    {'limit': 1}
+                )
+                logger.debug(f"✅ [SCHEDULER] Connexion Odoo réussie")
+            except Exception as e:
+                logger.error(f"❌ [SCHEDULER] Échec authentification Odoo: {e}")
                 return
             
             # Récupérer tous les clients actifs
