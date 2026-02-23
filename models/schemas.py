@@ -105,6 +105,7 @@ class PosSessionResponse(BaseModel):
     is_station: bool
     state: str
     message: str
+    balance_summary: Optional[Dict[str, Any]] = Field(None, description="Résumé des soldes et vérification de cohérence")
 
 class PosPump(BaseModel):
     id: int
@@ -151,6 +152,7 @@ class PosCloseSessionRequest(BaseModel):
     starting_balance: Optional[float] = Field(None, description="Solde d'ouverture (pour vérification cohérence)")
     ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
     closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
+    forced: bool = Field(False, description="Forcer la fermeture même si le solde de fermeture ne correspond pas (starting_balance + total ventes)")
     pump_indexes: Optional[List[StationPumpData]] = Field(None, description="Index de fin des pompes avec données complètes (pour stations-service)")
     pump_end_indexes: Optional[List[Dict[str, Any]]] = Field(None, description="[OBSOLÈTE] Utilisez pump_indexes à la place")
 

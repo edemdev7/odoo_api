@@ -4431,6 +4431,7 @@ async def close_pos_session(
       "session_id": 123,
       "starting_balance": 1000.00,
       "ending_balance": 5000.00,
+      "forced": false,
       "pump_indexes": [
         {
           "id": "pump_001",
@@ -4445,10 +4446,17 @@ async def close_pos_session(
     }
     ```
     
+    **Vérification de cohérence:**
+    Le système vérifie que `ending_balance == starting_balance + total_ventes`.
+    Si le solde ne correspond pas, la fermeture est **refusée** avec le détail de l'écart.
+    
+    Pour forcer la fermeture malgré un écart, envoyez `"forced": true`.
+    
     **Paramètres:**
     - **session_id**: ID de la session à fermer (optionnel si détection auto)
     - **starting_balance**: Solde d'ouverture pour vérification de cohérence (optionnel)
     - **ending_balance**: Solde de fermeture déclaré (optionnel)
+    - **forced**: Forcer la fermeture même si ending_balance ≠ starting_balance + total ventes (défaut: false)
     - **closing_notes**: Notes de fermeture (optionnel)  
     - **pump_indexes**: Données complètes des pompes avec index de fin (optionnel, active le mode station)
     
@@ -4561,12 +4569,12 @@ async def close_pos_session(
                     detail=f"Erreur lors de la validation des pompes: {str(e)}"
                 )
         
-        # Vérifier l'état de la session
+        # Vérifier l'état de la session et récupérer les données financières
         session_data = client.execute_kw(
             'pos.session',
             'read',
             [session_id],
-            {'fields': ['state', 'cash_register_balance_start']}
+            {'fields': ['state', 'cash_register_balance_start', 'cash_register_total_entry_encoding', 'order_count']}
         )
         
         if not session_data:
@@ -4574,15 +4582,79 @@ async def close_pos_session(
         
         session = session_data[0]
         
+        # Récupérer le solde d'ouverture depuis Odoo
+        odoo_starting_balance = float(session.get('cash_register_balance_start', 0.0) or 0.0)
+        
+        # Récupérer le total des ventes cash de la session
+        # cash_register_total_entry_encoding = total des mouvements cash enregistrés
+        odoo_total_cash_entries = float(session.get('cash_register_total_entry_encoding', 0.0) or 0.0)
+        order_count = int(session.get('order_count', 0) or 0)
+        
+        # Calculer aussi le total via les commandes POS de la session
+        try:
+            pos_orders = client.execute_kw(
+                'pos.order',
+                'search_read',
+                [[['session_id', '=', session_id], ['state', 'in', ['paid', 'done', 'invoiced']]]],
+                {'fields': ['amount_total', 'amount_paid']}
+            )
+            total_sales_from_orders = sum(float(o.get('amount_paid', 0.0) or 0.0) for o in pos_orders)
+            order_count = len(pos_orders)
+            logger.info(f"Session {session_id}: {order_count} commande(s), total ventes={total_sales_from_orders}")
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer les commandes POS: {e}")
+            total_sales_from_orders = odoo_total_cash_entries
+            order_count = session.get('order_count', 0)
+        
+        # Utiliser le total le plus fiable
+        total_sales = total_sales_from_orders if total_sales_from_orders > 0 else odoo_total_cash_entries
+        
         # Vérification de cohérence du solde d'ouverture si fourni
         if request.starting_balance is not None:
-            odoo_starting_balance = session.get('cash_register_balance_start', 0.0)
-            if odoo_starting_balance and abs(request.starting_balance - odoo_starting_balance) > 0.01:
+            if abs(request.starting_balance - odoo_starting_balance) > 0.01:
                 logger.warning(
                     f"Incohérence solde d'ouverture: Reçu={request.starting_balance}, "
                     f"Odoo={odoo_starting_balance}"
                 )
-                # Note : On log l'incohérence mais on ne bloque pas la fermeture
+        
+        # === VÉRIFICATION DE COHÉRENCE : ending_balance == starting_balance + total_ventes ===
+        if request.ending_balance is not None:
+            expected_balance = odoo_starting_balance + total_sales
+            difference = abs(request.ending_balance - expected_balance)
+            
+            logger.info(
+                f"Vérification solde: starting={odoo_starting_balance}, "
+                f"total_ventes={total_sales}, expected_ending={expected_balance}, "
+                f"declared_ending={request.ending_balance}, diff={difference}"
+            )
+            
+            # Tolérance de 0.01 pour les arrondis
+            if difference > 0.01:
+                if not request.forced:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "balance_mismatch",
+                            "message": (
+                                f"Le solde de fermeture déclaré ({request.ending_balance} FCFA) ne correspond pas "
+                                f"au solde attendu ({expected_balance} FCFA). "
+                                f"Détail: solde ouverture ({odoo_starting_balance}) + total ventes ({total_sales}) "
+                                f"= {expected_balance}. Différence: {difference} FCFA. "
+                                f"Envoyez forced=true pour forcer la fermeture."
+                            ),
+                            "starting_balance": odoo_starting_balance,
+                            "total_sales": total_sales,
+                            "expected_ending_balance": expected_balance,
+                            "declared_ending_balance": request.ending_balance,
+                            "difference": difference,
+                            "order_count": order_count
+                        }
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ FERMETURE FORCÉE - Décalage de {difference} FCFA. "
+                        f"Attendu={expected_balance}, Déclaré={request.ending_balance}"
+                    )
         
         if session['state'] not in ['opened', 'opening_control']:
             raise HTTPException(
@@ -4623,12 +4695,13 @@ async def close_pos_session(
                 final_state = 'closing_control'
         
         # Construire le message de réponse
+        forced_msg = " (FORCÉE)" if request.forced else ""
         if is_station_mode:
-            message = f"Session fermée avec succès - Mode station-service - {len(pump_data_list)} pompe(s) validée(s)"
+            message = f"Session fermée avec succès{forced_msg} - Mode station-service - {len(pump_data_list)} pompe(s) validée(s)"
             if request.ending_balance is not None:
                 message += f" - Solde final: {request.ending_balance} FCFA"
         else:
-            message = f"Session fermée avec succès - Mode standard"
+            message = f"Session fermée avec succès{forced_msg} - Mode standard"
             if request.ending_balance is not None:
                 message += f" - Solde final: {request.ending_balance} FCFA"
         
@@ -4638,7 +4711,15 @@ async def close_pos_session(
             'pos_name': pos_config['name'],
             'is_station': is_station_mode,
             'state': final_state,
-            'message': message
+            'message': message,
+            'balance_summary': {
+                'starting_balance': odoo_starting_balance,
+                'total_sales': total_sales,
+                'expected_ending_balance': odoo_starting_balance + total_sales,
+                'declared_ending_balance': request.ending_balance,
+                'order_count': order_count,
+                'forced': request.forced
+            }
         }
         
         # Ajouter les résultats de validation si mode station
