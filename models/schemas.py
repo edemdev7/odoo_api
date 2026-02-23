@@ -147,9 +147,12 @@ class PosOpenSessionWithPumpsRequest(BaseModel):
     pump_indexes: List[StationPumpData] = Field(..., description="Données des pompes avec leurs index")
 
 class PosCloseSessionRequest(BaseModel):
+    session_id: Optional[int] = Field(None, description="ID de la session à fermer (optionnel si session active détectée)")
+    starting_balance: Optional[float] = Field(None, description="Solde d'ouverture (pour vérification cohérence)")
     ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
     closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
-    pump_end_indexes: Optional[List[Dict[str, Any]]] = Field(None, description="Index de fin des pompes (pour stations-service)")
+    pump_indexes: Optional[List[StationPumpData]] = Field(None, description="Index de fin des pompes avec données complètes (pour stations-service)")
+    pump_end_indexes: Optional[List[Dict[str, Any]]] = Field(None, description="[OBSOLÈTE] Utilisez pump_indexes à la place")
 
 # Classe obsolète - utilisez PosCloseSessionRequest à la place
 class CashRegisterCloseRequest(BaseModel):

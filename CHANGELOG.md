@@ -1,6 +1,141 @@
 # 📋 Résumé des Modifications - Architecture Multi-Base de Données
 
-## 🎯 Objectif
+## � Version 2.3.0 - Payload Unifié Ouverture/Fermeture Session (23 février 2026)
+
+### �🎯 Objectif
+Unifier le format des payloads d'ouverture et de fermeture de session POS pour assurer une cohérence totale des données et faciliter l'intégration.
+
+### 🔄 Changements Apportés
+
+#### 1. Modèle `PosCloseSessionRequest` enrichi (`models/schemas.py`)
+
+**Nouveaux champs ajoutés** :
+```python
+class PosCloseSessionRequest(BaseModel):
+    session_id: Optional[int]                      # NOUVEAU - ID de session à fermer
+    starting_balance: Optional[float]              # NOUVEAU - Vérification cohérence
+    ending_balance: Optional[float]
+    closing_notes: Optional[str]
+    pump_indexes: Optional[List[StationPumpData]]  # NOUVEAU - Format unifié
+    pump_end_indexes: Optional[List[Dict]]         # OBSOLÈTE (rétrocompat.)
+```
+
+**Bénéfices** :
+- ✅ Structure identique entre ouverture et fermeture
+- ✅ Vérification automatique de cohérence des soldes
+- ✅ Format unifié pour les données de pompes
+- ✅ Rétrocompatibilité avec l'ancien format
+
+#### 2. Endpoint `/pos/{pos_id}/close-session` mis à jour (`api/pos.py`)
+
+**Nouvelles fonctionnalités** :
+- Support du format unifié `pump_indexes` (identique à l'ouverture)
+- Vérification de cohérence du `starting_balance` avec Odoo
+- Enregistrement des `closing_notes` dans Odoo (`note_closing`)
+- Support dual : nouveau format ET ancien format (`pump_end_indexes`)
+
+**Exemple de payload** :
+```json
+{
+  "session_id": 123,
+  "starting_balance": 1000.00,
+  "ending_balance": 5432.10,
+  "pump_indexes": [
+    {
+      "id": "pump_001",
+      "name": "J1_E1",
+      "stationId": "station_001",
+      "type": "PETROL",
+      "start_index": 1234.56,
+      "end_index": 2345.67
+    }
+  ],
+  "closing_notes": "Fermeture normale"
+}
+```
+
+**Logique de vérification** :
+```python
+# Vérification cohérence solde d'ouverture (non bloquante)
+if request.starting_balance != odoo_starting_balance:
+    logger.warning("Incohérence détectée")
+    # Continue quand même (warning seulement)
+```
+
+#### 3. Documentation complète
+
+**Nouveaux fichiers** :
+- `CLOSE_SESSION_UNIFIED.md` : Documentation détaillée du payload unifié
+- `PAYLOAD_COMPARISON.md` : Comparaison avant/après avec exemples
+- `test_close_session_unified.py` : Script de test complet
+
+#### 4. Avantages de cette mise à jour
+
+| Aspect | Avant | Après |
+|--------|-------|-------|
+| Structure payload | ❌ Différente ouverture/fermeture | ✅ Identique |
+| Cohérence données | ⚠️ Vérification manuelle | ✅ Automatique |
+| Traçabilité | ⚠️ Partielle | ✅ Complète |
+| Format pompes | ⚠️ `pump_end_indexes` basique | ✅ `pump_indexes` riche |
+| Notes fermeture | ❌ Non persistées | ✅ Enregistrées dans Odoo |
+| Intégration | ❌ Transformations nécessaires | ✅ Directe |
+
+### 🧪 Tests
+
+**Commande** :
+```bash
+python test_close_session_unified.py
+```
+
+**Tests couverts** :
+- ✅ Fermeture station-service avec payload complet
+- ✅ Fermeture standard sans pompes
+- ✅ Vérification cohérence des soldes
+- ✅ Validation des index de pompes
+- ✅ Rétrocompatibilité avec ancien format
+
+### 📚 Fichiers Modifiés
+
+1. **`models/schemas.py`** : 
+   - Ajout de `session_id`, `starting_balance`, `pump_indexes`
+   - Marquage de `pump_end_indexes` comme obsolète
+
+2. **`api/pos.py`** :
+   - Support dual format (nouveau + ancien)
+   - Vérification cohérence `starting_balance`
+   - Enregistrement `closing_notes` dans Odoo
+   - Messages enrichis avec solde final
+
+3. **Documentation** :
+   - `CLOSE_SESSION_UNIFIED.md` : Guide complet
+   - `PAYLOAD_COMPARISON.md` : Comparaison détaillée
+   - `test_close_session_unified.py` : Tests automatisés
+
+### 🔄 Migration
+
+**Rétrocompatibilité complète** : L'ancien format continue de fonctionner.
+
+**Format recommandé** (nouveau) :
+```json
+{
+  "session_id": 123,
+  "starting_balance": 1000.00,
+  "ending_balance": 5432.10,
+  "pump_indexes": [/* données complètes */]
+}
+```
+
+**Format legacy** (toujours supporté) :
+```json
+{
+  "ending_balance": 5432.10,
+  "pump_end_indexes": [{"pump_id": "x", "end_index": 123}]
+}
+```
+
+---
+
+## 🎯 Version 2.2.0 - Architecture Multi-Base de Données
 
 Supporter **deux instances Odoo distinctes** avec authentification en cascade et filtrage automatique des transferts par type.
 

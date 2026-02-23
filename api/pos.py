@@ -3913,6 +3913,7 @@ async def open_pos_session(
     ```json
     {
       "session_id": 123,
+      "starting_balance": 1000.00,
       "pump_indexes": [
         {
           "id": "pump_001",
@@ -3924,6 +3925,9 @@ async def open_pos_session(
       ]
     }
     ```
+    
+    **Note:** Le champ `starting_balance` est optionnel en mode station-service.
+    Il permet de définir le solde de caisse initial pour le contrôle de trésorerie.
     
     **Mode Standard (caisse normale):**
     ```json
@@ -3940,18 +3944,12 @@ async def open_pos_session(
         
         # Détecter le mode selon les données fournies
         is_pump_mode = request.pump_indexes is not None and len(request.pump_indexes) > 0
-        is_standard_mode = request.starting_balance is not None or request.opening_notes is not None
-        
-        if is_pump_mode and is_standard_mode:
-            raise HTTPException(
-                status_code=400, 
-                detail="Données ambiguës: utilisez soit les données de pompes soit les données standard, pas les deux"
-            )
+        is_standard_mode = not is_pump_mode and (request.starting_balance is not None or request.opening_notes is not None)
         
         if not is_pump_mode and not is_standard_mode:
             raise HTTPException(
                 status_code=400,
-                detail="Données manquantes: fournissez soit pump_indexes soit starting_balance/opening_notes"
+                detail="Données manquantes: fournissez pump_indexes pour station-service ou starting_balance/opening_notes pour caisse standard"
             )
         
         # === MODE STATION-SERVICE (avec pompes) ===
@@ -4000,8 +3998,13 @@ async def open_pos_session(
                 for pump in request.pump_indexes:
                     logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
                 
-                # Ouvrir la session dans Odoo
-                client.execute_kw('pos.session', 'write', [[request.session_id], {'state': 'opened'}])
+                # Mettre à jour la session dans Odoo avec le solde de départ (si fourni)
+                session_update = {'state': 'opened'}
+                if request.starting_balance is not None:
+                    session_update['cash_register_balance_start'] = request.starting_balance
+                    logger.info(f"Solde de départ caisse: {request.starting_balance}")
+                
+                client.execute_kw('pos.session', 'write', [[request.session_id], session_update])
                 
                 # Récupérer les informations du PDV
                 pos_config = client.execute_kw(
@@ -4011,6 +4014,11 @@ async def open_pos_session(
                     {'fields': ['name']}
                 )[0]
                 
+                # Message avec infos du solde
+                message_parts = [f"{len(request.pump_indexes)} pompes initialisées et sauvegardées"]
+                if request.starting_balance is not None:
+                    message_parts.append(f"Solde départ: {request.starting_balance}")
+                
                 logger.info(f"Session {request.session_id} ouverte avec {len(request.pump_indexes)} pompes sauvegardées")
                 
                 return PosSessionResponse(
@@ -4019,7 +4027,7 @@ async def open_pos_session(
                     pos_name=pos_config['name'],
                     is_station=True,
                     state='opened',
-                    message=f"Session station-service ouverte - {len(request.pump_indexes)} pompes initialisées et sauvegardées"
+                    message=f"Session station-service ouverte - {', '.join(message_parts)}"
                 )
                 
             except HTTPException:
@@ -4408,28 +4416,59 @@ async def close_pos_session(
     
     Cette route ferme la session POS active sur un point de vente avec deux modes :
     
-    **Mode Simple** (sans pump_end_indexes):
+    **Mode Simple** (sans pump_indexes):
     - Fermeture standard pour PDV classiques
     - Validation basique du solde
     
-    **Mode Station-Service** (avec pump_end_indexes):
+    **Mode Station-Service** (avec pump_indexes):
     - Fermeture avec validation des pompes
     - Contrôle de cohérence index vs ventes
     - Tolérance de 1% ou 1L pour les différences
     
+    **Payload unifié (identique à l'ouverture):**
+    ```json
+    {
+      "session_id": 123,
+      "starting_balance": 1000.00,
+      "ending_balance": 5000.00,
+      "pump_indexes": [
+        {
+          "id": "pump_001",
+          "name": "J1_E1", 
+          "stationId": "station_001",
+          "type": "PETROL",
+          "start_index": 1234.56,
+          "end_index": 2345.67
+        }
+      ],
+      "closing_notes": "Fermeture normale"
+    }
+    ```
+    
     **Paramètres:**
+    - **session_id**: ID de la session à fermer (optionnel si détection auto)
+    - **starting_balance**: Solde d'ouverture pour vérification de cohérence (optionnel)
     - **ending_balance**: Solde de fermeture déclaré (optionnel)
     - **closing_notes**: Notes de fermeture (optionnel)  
-    - **pump_end_indexes**: Index de fin des pompes (optionnel, active le mode station)
+    - **pump_indexes**: Données complètes des pompes avec index de fin (optionnel, active le mode station)
     
     **Requires:** Authentification JWT avec scope 'pos' + Profil gérant
     """
     try:
         client = get_odoo_client(current_user)
         
+        # Support du nouveau format pump_indexes et de l'ancien pump_end_indexes
+        pump_data_list = request.pump_indexes if request.pump_indexes else request.pump_end_indexes
+        
         # Déterminer le mode de fermeture
-        is_station_mode = request.pump_end_indexes is not None and len(request.pump_end_indexes) > 0
+        is_station_mode = pump_data_list is not None and len(pump_data_list) > 0
         logger.info(f"Mode de fermeture: {'Station-Service' if is_station_mode else 'Standard'}")
+        
+        # Log des données reçues pour debug
+        if request.starting_balance is not None:
+            logger.info(f"Solde d'ouverture (vérification): {request.starting_balance}")
+        if request.ending_balance is not None:
+            logger.info(f"Solde de fermeture déclaré: {request.ending_balance}")
         
         # Vérifier si l'employé est gérant
         if not verify_manager_role(current_user, client):
@@ -4458,14 +4497,20 @@ async def close_pos_session(
         # Mode Station-Service : Validation des pompes avec notre gestionnaire
         validation_result = None
         if is_station_mode:
-            logger.info(f"Mode station activé - Validation de {len(request.pump_end_indexes)} pompe(s)")
+            logger.info(f"Mode station activé - Validation de {len(pump_data_list)} pompe(s)")
             
             try:
                 # Mettre à jour les index finaux des pompes
                 update_errors = []
-                for pump_data in request.pump_end_indexes:
-                    pump_id = pump_data.get('pump_id') or pump_data.get('id')
-                    end_index = pump_data.get('end_index') or pump_data.get('current_index')
+                for pump_data in pump_data_list:
+                    # Support des deux formats
+                    if isinstance(pump_data, dict):
+                        pump_id = pump_data.get('pump_id') or pump_data.get('id')
+                        end_index = pump_data.get('end_index') or pump_data.get('current_index')
+                    else:
+                        # Format StationPumpData
+                        pump_id = pump_data.id
+                        end_index = getattr(pump_data, 'end_index', None) or getattr(pump_data, 'current_index', None)
                     
                     if not pump_id or end_index is None:
                         update_errors.append(f"Données manquantes pour pompe: {pump_data}")
@@ -4521,13 +4566,23 @@ async def close_pos_session(
             'pos.session',
             'read',
             [session_id],
-            {'fields': ['state']}
+            {'fields': ['state', 'cash_register_balance_start']}
         )
         
         if not session_data:
             raise HTTPException(status_code=404, detail="Session non trouvée")
         
         session = session_data[0]
+        
+        # Vérification de cohérence du solde d'ouverture si fourni
+        if request.starting_balance is not None:
+            odoo_starting_balance = session.get('cash_register_balance_start', 0.0)
+            if odoo_starting_balance and abs(request.starting_balance - odoo_starting_balance) > 0.01:
+                logger.warning(
+                    f"Incohérence solde d'ouverture: Reçu={request.starting_balance}, "
+                    f"Odoo={odoo_starting_balance}"
+                )
+                # Note : On log l'incohérence mais on ne bloque pas la fermeture
         
         if session['state'] not in ['opened', 'opening_control']:
             raise HTTPException(
@@ -4545,6 +4600,7 @@ async def close_pos_session(
         
         # Ajouter les notes de fermeture s'il y en a
         if request.closing_notes:
+            closing_data['note_closing'] = request.closing_notes
             logger.info(f"Notes de fermeture: {request.closing_notes}")
         
         # Fermer la session (passer en closing_control d'abord)
@@ -4568,9 +4624,13 @@ async def close_pos_session(
         
         # Construire le message de réponse
         if is_station_mode:
-            message = f"Session fermée avec succès - Mode station-service - {len(request.pump_end_indexes)} pompe(s) validée(s)"
+            message = f"Session fermée avec succès - Mode station-service - {len(pump_data_list)} pompe(s) validée(s)"
+            if request.ending_balance is not None:
+                message += f" - Solde final: {request.ending_balance} FCFA"
         else:
             message = f"Session fermée avec succès - Mode standard"
+            if request.ending_balance is not None:
+                message += f" - Solde final: {request.ending_balance} FCFA"
         
         response_data = {
             'session_id': session_id,
