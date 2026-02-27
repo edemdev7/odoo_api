@@ -153,24 +153,23 @@ class CreditMonitorScheduler:
                 inv_id = inv['id']
                 payment_state = inv.get('payment_state', '')
 
-                # Vérifier si la facture a été payée (paid ou in_payment)
-                if payment_state in ('paid', 'in_payment'):
+                # Vérifier si la facture a été payée (paid = rapprochement bancaire fait par l'admin)
+                if payment_state == 'paid':
                     pending_info = self.pending_invoices[inv_id]
                     partner_id = pending_info['partner_id']
                     amount = pending_info['amount']
+                    supply_id = pending_info.get('supply_id', '')
                     invoice_number = inv.get('name', pending_info.get('invoice_number', ''))
 
                     logger.info(
                         f"💰 [SCHEDULER] Facture {invoice_number} payée ! "
-                        f"Partner: {partner_id}, Montant: {amount}"
+                        f"Partner: {partner_id}, Montant: {amount}, supplyId: {supply_id}"
                     )
 
-                    # Envoyer le webhook TVPASS_RECHARGE
-                    await self.send_tvpass_webhook(
-                        partner_id=str(partner_id),
-                        amount=amount,
-                        invoice_id=inv_id,
-                        invoice_number=invoice_number
+                    # Envoyer le webhook COMPANY_SUPPLY_VALIDATION
+                    await self.send_supply_validation_webhook(
+                        supply_id=supply_id,
+                        invoice_id=inv_id
                     )
 
                     # Mettre à jour le cache credit du partner
@@ -240,26 +239,23 @@ class CreditMonitorScheduler:
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur envoi webhook: {e}")
 
-    async def send_tvpass_webhook(self, partner_id: str, amount: float,
-                                   invoice_id: int, invoice_number: str):
-        """Envoyer le webhook TVPASS_RECHARGE quand une facture bank est payée"""
+    async def send_supply_validation_webhook(self, supply_id: str, invoice_id: int):
+        """Envoyer le webhook COMPANY_SUPPLY_VALIDATION quand une facture bank est payée"""
         try:
             webhook_data = {
-                "action": "TVPASS_RECHARGE",
-                "companyExternalId": partner_id,
-                "amount": amount,
-                "invoice_id": invoice_id,
-                "invoice_number": invoice_number
+                "action": "COMPANY_SUPPLY_VALIDATION",
+                "supplyId": supply_id,
+                "invoiceId": str(invoice_id)
             }
 
-            logger.info(f"📤 [SCHEDULER] Préparation webhook TVPASS_RECHARGE pour partner {partner_id}")
-            logger.info(f"   Facture: {invoice_number} (ID: {invoice_id}), Montant: {amount}")
+            logger.info(f"📤 [SCHEDULER] Préparation webhook COMPANY_SUPPLY_VALIDATION")
+            logger.info(f"   supplyId: {supply_id}, invoiceId: {invoice_id}")
 
             try:
                 encrypted_data = encrypt_webhook_data(webhook_data, use_compression=False)
                 logger.info(f"🔐 [SCHEDULER] Données encryptées (taille: {len(encrypted_data)} chars)")
             except Exception as e:
-                logger.error(f"❌ [SCHEDULER] Erreur encryption TVPASS: {e}")
+                logger.error(f"❌ [SCHEDULER] Erreur encryption: {e}")
                 return
 
             async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as http_client:
@@ -273,17 +269,17 @@ class CreditMonitorScheduler:
 
                 if response.status_code in [200, 201, 204]:
                     logger.info(
-                        f"✅ [SCHEDULER] Webhook TVPASS_RECHARGE envoyé pour partner {partner_id} "
-                        f"- Facture: {invoice_number} - Status: {response.status_code}"
+                        f"✅ [SCHEDULER] Webhook COMPANY_SUPPLY_VALIDATION envoyé - "
+                        f"supplyId: {supply_id}, invoiceId: {invoice_id} - Status: {response.status_code}"
                     )
                 else:
                     logger.warning(
-                        f"⚠️ [SCHEDULER] Webhook TVPASS rejeté (HTTP {response.status_code}): "
+                        f"⚠️ [SCHEDULER] Webhook rejeté (HTTP {response.status_code}): "
                         f"{response.text[:200]}"
                     )
 
         except Exception as e:
-            logger.error(f"❌ [SCHEDULER] Erreur envoi webhook TVPASS: {e}")
+            logger.error(f"❌ [SCHEDULER] Erreur envoi webhook COMPANY_SUPPLY_VALIDATION: {e}")
     
     async def run_scheduler(self):
         """Boucle principale du scheduler"""

@@ -6,11 +6,13 @@ Les écritures comptables sont générées automatiquement par Odoo.
 """
 
 from fastapi import APIRouter, HTTPException, Request, Header, BackgroundTasks
+from fastapi.responses import Response
 from typing import Optional
 from datetime import datetime
 import logging
 import httpx
 import os
+import base64
 from pydantic import BaseModel, Field
 from enum import Enum
 
@@ -29,7 +31,7 @@ router = APIRouter(prefix="/accounting", tags=["Accounting"])
 TVPASS_PRODUCT_CODE = "TVPASS_ESS"          # Référence interne du produit
 TVPASS_PRODUCT_ID = 2999                     # ID du produit (fallback)
 JPASS_JOURNAL_ID = 194                       # Journal PASS GD pour paiement kkiapay
-WEBHOOK_ACTION = "TVPASS_RECHARGE"           # Action webhook pour ce flux
+WEBHOOK_ACTION = "COMPANY_SUPPLY_VALIDATION" # Action webhook quand facture payée
 
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
@@ -46,6 +48,7 @@ class CreditAccountRequest(BaseModel):
     amount: float = Field(..., gt=0, description="Montant à facturer (doit être > 0)")
     reference: str = Field(..., description="Référence de la transaction (ex: KKIAPAY-XXX)")
     payment_method: PaymentMethodEnum = Field(..., description="Méthode de paiement: kkiapay ou bank")
+    supply_id: str = Field(..., description="ID du supply côté appelant (retourné dans le webhook)")
     product_id: Optional[int] = Field(None, description="ID du produit (optionnel, défaut: TVPASS_ESS)")
     date: Optional[str] = Field(None, description="Date de la facture (YYYY-MM-DD)")
     description: Optional[str] = Field(None, description="Description de la facture")
@@ -428,16 +431,11 @@ def register_payment_kkiapay(client: OdooClient, invoice_id: int, amount: float,
                                 logger.info(f"🔗 Lettrage 521007: outstanding={outstanding_line['id']} + transfer={transfer_521007}")
                                 client.execute_kw('account.move.line', 'reconcile',
                                                   [[outstanding_line['id']] + transfer_521007])
-                                logger.info(f"✅ Outstanding 521007 lettré !")
+                                logger.info(f"✅ Outstanding 521007 lettré → facture paid !")
 
-                            # 2. Stmt suspens (471130 crédit) + Transfer (471130 débit)
-                            transfer_471130 = [tl['id'] for tl in transfer_lines
-                                               if (tl['account_id'][0] if isinstance(tl['account_id'], list) else tl['account_id']) == stmt_credit_account_id]
-                            if transfer_471130:
-                                logger.info(f"🔗 Lettrage 471130: stmt={stmt_credit_line['id']} + transfer={transfer_471130}")
-                                client.execute_kw('account.move.line', 'reconcile',
-                                                  [[stmt_credit_line['id']] + transfer_471130])
-                                logger.info(f"✅ Suspens 471130 lettré !")
+                            # Note: le compte suspens 471130 ne permet pas le lettrage dans Odoo,
+                            # mais ce n'est pas nécessaire — seul le lettrage 521007 est requis
+                            # pour que la facture passe de in_payment → paid.
                     else:
                         logger.warning(f"⚠️ Pas de ligne credit dans le relevé bancaire")
                 else:
@@ -468,6 +466,102 @@ def register_payment_kkiapay(client: OdooClient, invoice_id: int, amount: float,
     }
 
 
+def register_payment_bank(client: OdooClient, invoice_id: int, amount: float,
+                           reference: str, date: str) -> dict:
+    """
+    Enregistrer le paiement pour le mode bank.
+    Crée le paiement via le wizard + lettrage receivable → in_payment.
+    PAS de rapprochement bancaire — c'est l'admin qui le fera manuellement.
+    Quand l'admin fera le rapprochement, la facture passera à 'paid'
+    et le scheduler enverra le webhook.
+    """
+    invoice = client.execute_kw(
+        'account.move', 'read', [invoice_id],
+        {'fields': ['id', 'name', 'state', 'amount_residual', 'partner_id']}
+    )
+    if invoice:
+        invoice = invoice[0]
+
+    partner_id_val = invoice['partner_id'][0] if isinstance(invoice.get('partner_id'), list) else invoice.get('partner_id')
+    logger.info(f"🏦 Enregistrement paiement bank: facture={invoice['name']}, montant={amount}")
+
+    # Créer le paiement via le wizard account.payment.register
+    try:
+        wizard_context = {
+            'active_model': 'account.move',
+            'active_ids': [invoice_id],
+        }
+        wizard_vals = {
+            'journal_id': JPASS_JOURNAL_ID,
+            'amount': amount,
+            'payment_date': date,
+            'communication': reference,
+        }
+        wizard_id = client.execute_kw(
+            'account.payment.register', 'create',
+            [wizard_vals], {'context': wizard_context}
+        )
+        logger.info(f"✅ Wizard paiement bank créé: ID={wizard_id}")
+
+        client.execute_kw(
+            'account.payment.register', 'action_create_payments',
+            [[wizard_id]], {'context': wizard_context}
+        )
+        logger.info(f"✅ Paiement bank enregistré via wizard (→ in_payment)")
+
+    except Exception as e:
+        logger.warning(f"⚠️ Erreur wizard paiement bank: {e}")
+        # Fallback: création manuelle
+        logger.info("🔄 Fallback: création manuelle du paiement bank...")
+        payment_vals = {
+            'payment_type': 'inbound',
+            'partner_type': 'customer',
+            'partner_id': partner_id_val,
+            'amount': amount,
+            'journal_id': JPASS_JOURNAL_ID,
+            'ref': reference,
+            'date': date,
+        }
+        payment_id = client.execute_kw('account.payment', 'create', [payment_vals])
+        client.execute_kw('account.payment', 'action_post', [[payment_id]])
+        logger.info(f"✅ Paiement bank créé et validé (fallback): ID={payment_id}")
+
+        # Lettrage manuel des receivable
+        payment_data = client.execute_kw('account.payment', 'read', [payment_id], {'fields': ['move_id']})
+        payment_move_id = payment_data[0]['move_id'][0] if payment_data and isinstance(payment_data[0].get('move_id'), list) else None
+
+        invoice_rec = client.execute_kw('account.move.line', 'search', [[
+            ('move_id', '=', invoice_id), ('account_type', '=', 'asset_receivable'), ('reconciled', '=', False)
+        ]])
+        payment_rec = client.execute_kw('account.move.line', 'search', [[
+            ('move_id', '=', payment_move_id), ('account_type', '=', 'asset_receivable'), ('reconciled', '=', False)
+        ]]) if payment_move_id else []
+
+        if invoice_rec and payment_rec:
+            try:
+                client.execute_kw('account.move.line', 'reconcile', [invoice_rec + payment_rec])
+                logger.info(f"✅ Lettrage receivable effectué (fallback)")
+            except Exception as e2:
+                logger.warning(f"⚠️ Erreur lettrage: {e2}")
+
+    # PAS de rapprochement bancaire — l'admin le fera manuellement
+
+    # Vérifier le résultat
+    updated_invoice = client.execute_kw(
+        'account.move', 'read', [invoice_id],
+        {'fields': ['payment_state', 'amount_residual']}
+    )
+    payment_state = updated_invoice[0]['payment_state'] if updated_invoice else 'unknown'
+    amount_residual = updated_invoice[0]['amount_residual'] if updated_invoice else -1
+
+    logger.info(f"📊 État paiement facture bank: {payment_state}, reste dû: {amount_residual}")
+
+    return {
+        'payment_state': payment_state,
+        'amount_residual': amount_residual
+    }
+
+
 def get_invoice_details(client: OdooClient, invoice_id: int) -> dict:
     """Récupérer les détails d'une facture"""
     invoice = client.execute_kw(
@@ -487,31 +581,26 @@ def get_invoice_details(client: OdooClient, invoice_id: int) -> dict:
 # WEBHOOK
 # ============================================================
 
-async def send_tvpass_webhook(partner_id: str, amount: float,
-                               invoice_id: int, invoice_number: str):
+async def send_supply_validation_webhook(supply_id: str, invoice_id: int):
     """
-    Envoyer le webhook TVPASS_RECHARGE avec les infos de la facture.
+    Envoyer le webhook COMPANY_SUPPLY_VALIDATION quand la facture est payée.
 
     Payload encrypté:
     {
-        "action": "TVPASS_RECHARGE",
-        "companyExternalId": "123",
-        "amount": 50000.0,
-        "invoice_id": 456,
-        "invoice_number": "INV/2026/0001"
+        "action": "COMPANY_SUPPLY_VALIDATION",
+        "supplyId": "abc-123",
+        "invoiceId": "163684"
     }
     """
     try:
         webhook_data = {
             "action": WEBHOOK_ACTION,
-            "companyExternalId": partner_id,
-            "amount": amount,
-            "invoice_id": invoice_id,
-            "invoice_number": invoice_number
+            "supplyId": supply_id,
+            "invoiceId": str(invoice_id)
         }
 
-        logger.info(f"📤 Préparation webhook {WEBHOOK_ACTION} pour partner {partner_id}")
-        logger.info(f"   Montant: {amount} CFA, Facture: {invoice_number} (ID: {invoice_id})")
+        logger.info(f"📤 Préparation webhook {WEBHOOK_ACTION}")
+        logger.info(f"   supplyId: {supply_id}, invoiceId: {invoice_id}")
 
         # Encrypter les données
         try:
@@ -533,8 +622,8 @@ async def send_tvpass_webhook(partner_id: str, amount: float,
 
             if response.status_code in [200, 201, 204]:
                 logger.info(
-                    f"✅ Webhook {WEBHOOK_ACTION} envoyé pour partner {partner_id} "
-                    f"- Facture: {invoice_number} - Status: {response.status_code}"
+                    f"✅ Webhook {WEBHOOK_ACTION} envoyé - "
+                    f"supplyId: {supply_id}, invoiceId: {invoice_id} - Status: {response.status_code}"
                 )
             else:
                 logger.error(
@@ -701,19 +790,26 @@ async def credit_customer_account(
 
             # Envoyer le webhook immédiatement en arrière-plan
             background_tasks.add_task(
-                send_tvpass_webhook,
-                partner_id=str(credit_request.partner_id),
-                amount=credit_request.amount,
-                invoice_id=invoice_id,
-                invoice_number=invoice_number
+                send_supply_validation_webhook,
+                supply_id=credit_request.supply_id,
+                invoice_id=invoice_id
             )
             webhook_sent = True
-            logger.info(f"📤 Webhook {WEBHOOK_ACTION} planifié (kkiapay)")
+            logger.info(f"📤 Webhook {WEBHOOK_ACTION} planifié (kkiapay) - supplyId={credit_request.supply_id}")
 
         else:
-            # MODE BANK: La facture reste posted, l'admin paiera manuellement
-            # Le scheduler détectera le paiement et enverra le webhook
-            logger.info("🏦 Mode BANK: facture posted, en attente de paiement par l'admin")
+            # MODE BANK: Paiement + lettrage receivable → in_payment
+            # PAS de rapprochement bancaire — l'admin le fera manuellement
+            # Quand l'admin fera le rapprochement → paid → scheduler envoie webhook
+            logger.info("🏦 Mode BANK: enregistrement du paiement (sans rapprochement bancaire)...")
+
+            payment_info = register_payment_bank(
+                client=client,
+                invoice_id=invoice_id,
+                amount=credit_request.amount,
+                reference=credit_request.reference,
+                date=move_date
+            )
 
             # Sauvegarder dans le scheduler pour surveillance
             scheduler = get_scheduler()
@@ -724,9 +820,10 @@ async def credit_customer_account(
                 'amount': credit_request.amount,
                 'invoice_number': invoice_number,
                 'reference': credit_request.reference,
+                'supply_id': credit_request.supply_id,
                 'created_at': datetime.now().isoformat()
             }
-            logger.info(f"📝 Facture {invoice_number} ajoutée aux factures en attente")
+            logger.info(f"📝 Facture {invoice_number} en attente de rapprochement bancaire (admin)")
 
         # ===== 9. PRÉPARER LA RÉPONSE =====
         final_partner = client.execute_kw(
@@ -745,6 +842,7 @@ async def credit_customer_account(
             'partner_name': partner['name'],
             'amount': credit_request.amount,
             'reference': credit_request.reference,
+            'supply_id': credit_request.supply_id,
             'payment_method': credit_request.payment_method.value,
             'date': move_date,
             'product': {
@@ -862,4 +960,146 @@ async def get_pending_invoices(
         raise
     except Exception as e:
         logger.error(f"Erreur: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# ENDPOINT TÉLÉCHARGEMENT PDF FACTURE
+# ============================================================
+
+@router.get("/invoice/{invoice_id}/pdf")
+async def download_invoice_pdf(
+    invoice_id: int,
+    x_encrypted_data: Optional[str] = Header(None)
+):
+    """
+    Télécharger le PDF d'une facture par son ID.
+    
+    Retourne le fichier PDF de la facture Odoo.
+    Protégé par encryption.
+    
+    **Paramètres:**
+    - **invoice_id**: ID de la facture (account.move)
+    
+    **Retourne:**
+    - Fichier PDF de la facture
+    """
+    try:
+        if not x_encrypted_data:
+            raise HTTPException(status_code=401, detail="Données encryptées requises")
+
+        try:
+            decrypt_webhook_data(x_encrypted_data)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Encryption invalide")
+
+        client = OdooClient()
+
+        # Vérifier que la facture existe
+        invoice = client.execute_kw(
+            'account.move', 'read', [invoice_id],
+            {'fields': ['id', 'name', 'state', 'move_type']}
+        )
+
+        if not invoice:
+            raise HTTPException(status_code=404, detail=f"Facture {invoice_id} non trouvée")
+
+        invoice_data = invoice[0]
+        invoice_name = invoice_data.get('name', f'INV-{invoice_id}')
+
+        # Vérifier que c'est bien une facture client
+        if invoice_data.get('move_type') not in ('out_invoice', 'out_refund'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Le document {invoice_name} n'est pas une facture client"
+            )
+
+        logger.info(f"📄 Génération PDF pour facture {invoice_name} (ID: {invoice_id})")
+
+        # Générer le PDF via le rapport Odoo
+        report_name = 'account.report_invoice'
+
+        try:
+            # Appel XML-RPC pour générer le rapport PDF
+            pdf_data = client.models.execute_kw(
+                client.db, client.uid, client.api_key,
+                'ir.actions.report',
+                '_render_qweb_pdf',
+                [report_name, [invoice_id]]
+            )
+
+            if pdf_data and isinstance(pdf_data, (list, tuple)) and len(pdf_data) > 0:
+                pdf_content = pdf_data[0]
+
+                # Si c'est en base64, décoder
+                if isinstance(pdf_content, str):
+                    pdf_content = base64.b64decode(pdf_content)
+                elif isinstance(pdf_content, bytes):
+                    try:
+                        pdf_content = base64.b64decode(pdf_content)
+                    except Exception:
+                        pass
+
+                safe_name = invoice_name.replace('/', '_')
+                logger.info(f"✅ PDF généré pour {invoice_name} ({len(pdf_content)} bytes)")
+
+                return Response(
+                    content=pdf_content,
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_name}.pdf"'
+                    }
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Le rapport PDF pour {invoice_name} est vide"
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur rapport _render_qweb_pdf: {e}")
+
+            # Fallback: chercher un attachement PDF existant
+            try:
+                attachments = client.execute_kw(
+                    'ir.attachment', 'search_read',
+                    [[
+                        ('res_model', '=', 'account.move'),
+                        ('res_id', '=', invoice_id),
+                        ('mimetype', '=', 'application/pdf')
+                    ]],
+                    {'fields': ['id', 'name', 'datas'], 'order': 'id desc', 'limit': 1}
+                )
+
+                if attachments and attachments[0].get('datas'):
+                    pdf_content = base64.b64decode(attachments[0]['datas'])
+                    safe_name = invoice_name.replace('/', '_')
+                    logger.info(f"✅ PDF trouvé en pièce jointe pour {invoice_name}")
+
+                    return Response(
+                        content=pdf_content,
+                        media_type="application/pdf",
+                        headers={
+                            "Content-Disposition": f'attachment; filename="{safe_name}.pdf"'
+                        }
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Impossible de générer le PDF pour {invoice_name}: {str(e)}"
+                    )
+            except HTTPException:
+                raise
+            except Exception as e2:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Erreur génération PDF: {str(e)} / {str(e2)}"
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur téléchargement PDF: {e}")
         raise HTTPException(status_code=500, detail=str(e))

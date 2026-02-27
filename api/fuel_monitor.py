@@ -177,6 +177,13 @@ async def send_recharge_webhook(partner_id: str, amount: float):
         "companyExternalId": "123",
         "amount": 50000.0
     }
+    {
+    {
+        "action": "COMPANY_SUPPLY_VALIDATION",
+        "supplyId": "string",
+        "invoiceId": "string"
+    }
+    }    
     ```
     """
     try:
