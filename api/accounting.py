@@ -968,15 +968,11 @@ async def get_pending_invoices(
 # ============================================================
 
 @router.get("/invoice/{invoice_id}/pdf")
-async def download_invoice_pdf(
-    invoice_id: int,
-    x_encrypted_data: Optional[str] = Header(None)
-):
+async def download_invoice_pdf(invoice_id: int):
     """
     Télécharger le PDF d'une facture par son ID.
     
     Retourne le fichier PDF de la facture Odoo.
-    Protégé par encryption.
     
     **Paramètres:**
     - **invoice_id**: ID de la facture (account.move)
@@ -985,14 +981,6 @@ async def download_invoice_pdf(
     - Fichier PDF de la facture
     """
     try:
-        if not x_encrypted_data:
-            raise HTTPException(status_code=401, detail="Données encryptées requises")
-
-        try:
-            decrypt_webhook_data(x_encrypted_data)
-        except Exception:
-            raise HTTPException(status_code=401, detail="Encryption invalide")
-
         client = OdooClient()
 
         # Vérifier que la facture existe
