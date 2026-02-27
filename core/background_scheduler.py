@@ -32,12 +32,13 @@ scheduler_task = None
 
 
 class CreditMonitorScheduler:
-    """Scheduler pour surveiller automatiquement les crédits"""
+    """Scheduler pour surveiller automatiquement les crédits et les factures en attente"""
     
     def __init__(self):
         self.is_running = False
         self.task = None
         self.cache: Dict[int, Dict[str, Any]] = {}
+        self.pending_invoices: Dict[int, Dict[str, Any]] = {}  # Factures bank en attente
         
     async def check_credits_once(self):
         """Vérifier les crédits une seule fois"""
@@ -126,8 +127,72 @@ class CreditMonitorScheduler:
                 f"{changes_detected} changement(s) détecté(s)"
             )
             
+            # Vérifier aussi les factures en attente (mode bank)
+            await self.check_pending_invoices(client)
+            
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur lors de la vérification: {e}")
+
+    async def check_pending_invoices(self, client: OdooClient):
+        """Vérifier si des factures en attente (mode bank) ont été payées"""
+        if not self.pending_invoices:
+            return
+
+        invoice_ids = list(self.pending_invoices.keys())
+        logger.debug(f"🔍 [SCHEDULER] Vérification de {len(invoice_ids)} facture(s) en attente...")
+
+        try:
+            invoices = client.execute_kw(
+                'account.move',
+                'search_read',
+                [[('id', 'in', invoice_ids)]],
+                {'fields': ['id', 'name', 'payment_state', 'amount_total', 'state']}
+            )
+
+            for inv in invoices:
+                inv_id = inv['id']
+                payment_state = inv.get('payment_state', '')
+
+                # Vérifier si la facture a été payée (paid ou in_payment)
+                if payment_state in ('paid', 'in_payment'):
+                    pending_info = self.pending_invoices[inv_id]
+                    partner_id = pending_info['partner_id']
+                    amount = pending_info['amount']
+                    invoice_number = inv.get('name', pending_info.get('invoice_number', ''))
+
+                    logger.info(
+                        f"💰 [SCHEDULER] Facture {invoice_number} payée ! "
+                        f"Partner: {partner_id}, Montant: {amount}"
+                    )
+
+                    # Envoyer le webhook TVPASS_RECHARGE
+                    await self.send_tvpass_webhook(
+                        partner_id=str(partner_id),
+                        amount=amount,
+                        invoice_id=inv_id,
+                        invoice_number=invoice_number
+                    )
+
+                    # Mettre à jour le cache credit du partner
+                    try:
+                        updated_partner = client.execute_kw(
+                            'res.partner', 'read', [partner_id],
+                            {'fields': ['credit']}
+                        )
+                        if updated_partner:
+                            self.cache[partner_id] = {
+                                'credit': updated_partner[0]['credit'],
+                                'last_check': datetime.now()
+                            }
+                    except Exception:
+                        pass
+
+                    # Retirer de la liste des factures en attente
+                    del self.pending_invoices[inv_id]
+                    logger.info(f"✅ [SCHEDULER] Facture {invoice_number} retirée des factures en attente")
+
+        except Exception as e:
+            logger.error(f"❌ [SCHEDULER] Erreur vérification factures en attente: {e}")
     
     async def send_webhook(self, partner_id: str, amount: float):
         """Envoyer le webhook de notification"""
@@ -174,11 +239,56 @@ class CreditMonitorScheduler:
                     
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur envoi webhook: {e}")
+
+    async def send_tvpass_webhook(self, partner_id: str, amount: float,
+                                   invoice_id: int, invoice_number: str):
+        """Envoyer le webhook TVPASS_RECHARGE quand une facture bank est payée"""
+        try:
+            webhook_data = {
+                "action": "TVPASS_RECHARGE",
+                "companyExternalId": partner_id,
+                "amount": amount,
+                "invoice_id": invoice_id,
+                "invoice_number": invoice_number
+            }
+
+            logger.info(f"📤 [SCHEDULER] Préparation webhook TVPASS_RECHARGE pour partner {partner_id}")
+            logger.info(f"   Facture: {invoice_number} (ID: {invoice_id}), Montant: {amount}")
+
+            try:
+                encrypted_data = encrypt_webhook_data(webhook_data, use_compression=False)
+                logger.info(f"🔐 [SCHEDULER] Données encryptées (taille: {len(encrypted_data)} chars)")
+            except Exception as e:
+                logger.error(f"❌ [SCHEDULER] Erreur encryption TVPASS: {e}")
+                return
+
+            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as http_client:
+                response = await http_client.post(
+                    WEBHOOK_URL,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'x-encrypted-data': encrypted_data
+                    }
+                )
+
+                if response.status_code in [200, 201, 204]:
+                    logger.info(
+                        f"✅ [SCHEDULER] Webhook TVPASS_RECHARGE envoyé pour partner {partner_id} "
+                        f"- Facture: {invoice_number} - Status: {response.status_code}"
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ [SCHEDULER] Webhook TVPASS rejeté (HTTP {response.status_code}): "
+                        f"{response.text[:200]}"
+                    )
+
+        except Exception as e:
+            logger.error(f"❌ [SCHEDULER] Erreur envoi webhook TVPASS: {e}")
     
     async def run_scheduler(self):
         """Boucle principale du scheduler"""
         self.is_running = True
-        logger.info(f"🚀 [SCHEDULER] Démarrage de la surveillance automatique des crédits")
+        logger.info(f"🚀 [SCHEDULER] Démarrage de la surveillance (crédits + factures TVPASS)")
         logger.info(f"⏱️  [SCHEDULER] Intervalle de vérification: {CHECK_INTERVAL} secondes")
         logger.info(f"🔗 [SCHEDULER] URL webhook: {WEBHOOK_URL}")
         

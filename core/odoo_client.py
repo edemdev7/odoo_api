@@ -110,6 +110,15 @@ class OdooClient:
             except Exception as e:
                 last_error = str(e)
                 retry_count += 1
+
+                # Si l'erreur est "cannot marshal None", l'action a réussi côté
+                # serveur mais le retour contient None. On ignore cette erreur
+                # pour les méthodes d'action qui ne retournent rien d'utile.
+                if "cannot marshal None" in last_error:
+                    logger.debug(
+                        f"⚠️ {model}.{method} retourne None (action exécutée avec succès côté serveur)"
+                    )
+                    return True
                 
                 # Logger avec modération
                 if self._should_log_error():
