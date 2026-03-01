@@ -971,12 +971,13 @@ async def get_pending_invoices(
 async def download_invoice_pdf(invoice_id: int):
     """
     Télécharger le PDF d'une facture par son ID.
-    
-    Retourne le fichier PDF de la facture Odoo.
-    
+
+    Utilise le wizard account.move.send d'Odoo 17 pour générer le PDF
+    (même mécanisme que le bouton "Envoyer & Imprimer" de l'interface).
+
     **Paramètres:**
     - **invoice_id**: ID de la facture (account.move)
-    
+
     **Retourne:**
     - Fichier PDF de la facture
     """
@@ -1003,34 +1004,18 @@ async def download_invoice_pdf(invoice_id: int):
             )
 
         logger.info(f"📄 Génération PDF pour facture {invoice_name} (ID: {invoice_id})")
+        safe_name = invoice_name.replace('/', '_')
 
-        # Générer le PDF via le rapport Odoo
-        report_name = 'account.report_invoice'
-
+        # ===== Générer le PDF via le wizard account.move.send =====
+        # C'est la seule méthode fiable via XML-RPC sur Odoo 17 :
+        # - _render_qweb_pdf est privée → bloquée par XML-RPC
+        # - /report/pdf/ nécessite un mot de passe (pas API key)
+        # - Le wizard account.move.send + action_send_and_print génère
+        #   le PDF et retourne l'ID de l'attachement créé
         try:
-            # Appel XML-RPC pour générer le rapport PDF
-            pdf_data = client.models.execute_kw(
-                client.db, client.uid, client.api_key,
-                'ir.actions.report',
-                '_render_qweb_pdf',
-                [report_name, [invoice_id]]
-            )
-
-            if pdf_data and isinstance(pdf_data, (list, tuple)) and len(pdf_data) > 0:
-                pdf_content = pdf_data[0]
-
-                # Si c'est en base64, décoder
-                if isinstance(pdf_content, str):
-                    pdf_content = base64.b64decode(pdf_content)
-                elif isinstance(pdf_content, bytes):
-                    try:
-                        pdf_content = base64.b64decode(pdf_content)
-                    except Exception:
-                        pass
-
-                safe_name = invoice_name.replace('/', '_')
+            pdf_content = _generate_pdf_via_wizard(client, invoice_id)
+            if pdf_content:
                 logger.info(f"✅ PDF généré pour {invoice_name} ({len(pdf_content)} bytes)")
-
                 return Response(
                     content=pdf_content,
                     media_type="application/pdf",
@@ -1038,56 +1023,98 @@ async def download_invoice_pdf(invoice_id: int):
                         "Content-Disposition": f'attachment; filename="{safe_name}.pdf"'
                     }
                 )
-            else:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Le rapport PDF pour {invoice_name} est vide"
-                )
-
-        except HTTPException:
-            raise
         except Exception as e:
-            logger.warning(f"⚠️ Erreur rapport _render_qweb_pdf: {e}")
+            logger.warning(f"⚠️ Erreur génération PDF via wizard: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
 
-            # Fallback: chercher un attachement PDF existant
-            try:
-                attachments = client.execute_kw(
-                    'ir.attachment', 'search_read',
-                    [[
-                        ('res_model', '=', 'account.move'),
-                        ('res_id', '=', invoice_id),
-                        ('mimetype', '=', 'application/pdf')
-                    ]],
-                    {'fields': ['id', 'name', 'datas'], 'order': 'id desc', 'limit': 1}
-                )
-
-                if attachments and attachments[0].get('datas'):
-                    pdf_content = base64.b64decode(attachments[0]['datas'])
-                    safe_name = invoice_name.replace('/', '_')
-                    logger.info(f"✅ PDF trouvé en pièce jointe pour {invoice_name}")
-
-                    return Response(
-                        content=pdf_content,
-                        media_type="application/pdf",
-                        headers={
-                            "Content-Disposition": f'attachment; filename="{safe_name}.pdf"'
-                        }
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Impossible de générer le PDF pour {invoice_name}: {str(e)}"
-                    )
-            except HTTPException:
-                raise
-            except Exception as e2:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Erreur génération PDF: {str(e)} / {str(e2)}"
-                )
+        # Aucune méthode n'a fonctionné
+        raise HTTPException(
+            status_code=500,
+            detail=f"Impossible de générer le PDF pour {invoice_name}. La facture existe mais aucun PDF n'est disponible."
+        )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Erreur téléchargement PDF: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _generate_pdf_via_wizard(client: OdooClient, invoice_id: int) -> bytes | None:
+    """
+    Génère le PDF d'une facture via le wizard account.move.send d'Odoo 17.
+
+    Flux :
+    1. Appeler action_invoice_sent sur account.move → récupère le contexte du wizard
+    2. Créer le wizard account.move.send avec checkbox_download=True, checkbox_send_mail=False
+    3. Exécuter action_send_and_print → Odoo génère le PDF et crée un ir.attachment
+    4. Extraire l'ID de l'attachement depuis l'URL retournée (/web/content/<id>)
+    5. Lire les données binaires de l'attachement via ir.attachment.read
+
+    C'est exactement le mécanisme du bouton "Envoyer & Imprimer" dans l'UI Odoo.
+    """
+    import re
+
+    # Étape 1 : Récupérer le contexte du wizard via action_invoice_sent
+    action = client.execute_kw('account.move', 'action_invoice_sent', [[invoice_id]])
+    if not action or not isinstance(action, dict):
+        logger.warning("⚠️ action_invoice_sent n'a pas retourné d'action")
+        return None
+
+    wizard_context = action.get('context', {})
+    wizard_context['active_ids'] = [invoice_id]
+    logger.info(f"📋 Wizard context: template_id={wizard_context.get('default_mail_template_id')}")
+
+    # Étape 2 : Créer le wizard — download uniquement, pas d'envoi email
+    wizard_id = client.execute_kw(
+        'account.move.send', 'create',
+        [{'checkbox_download': True, 'checkbox_send_mail': False}],
+        {'context': wizard_context}
+    )
+    logger.info(f"✅ Wizard account.move.send créé: ID={wizard_id}")
+
+    # Étape 3 : Exécuter le wizard → génère le PDF
+    result = client.execute_kw(
+        'account.move.send', 'action_send_and_print',
+        [[wizard_id]],
+        {'context': wizard_context}
+    )
+    logger.info(f"📋 Résultat wizard: {result}")
+
+    if not result or not isinstance(result, dict):
+        logger.warning("⚠️ action_send_and_print n'a pas retourné de résultat exploitable")
+        return None
+
+    # Étape 4 : Extraire l'ID de l'attachement depuis l'URL
+    # Format attendu: {'type': 'ir.actions.act_url', 'url': '/web/content/111564?download=true'}
+    url = result.get('url', '')
+    match = re.search(r'/web/content/(\d+)', url)
+    if not match:
+        logger.warning(f"⚠️ URL attachement non trouvée dans le résultat: {result}")
+        return None
+
+    attachment_id = int(match.group(1))
+    logger.info(f"📎 Attachement PDF trouvé: ID={attachment_id}")
+
+    # Étape 5 : Lire les données binaires de l'attachement
+    attachment = client.execute_kw(
+        'ir.attachment', 'read', [attachment_id],
+        {'fields': ['datas', 'name', 'file_size']}
+    )
+
+    if not attachment or not attachment[0].get('datas'):
+        logger.warning(f" Attachement {attachment_id} vide ou inaccessible")
+        return None
+
+    pdf_content = base64.b64decode(attachment[0]['datas'])
+    att_name = attachment[0].get('name', '?')
+    att_size = attachment[0].get('file_size', 0)
+    logger.info(f" PDF récupéré: {att_name} ({att_size} bytes)")
+
+    # Vérification que c'est bien un PDF
+    if pdf_content[:4] != b'%PDF':
+        logger.warning(f" Le contenu ne commence pas par %PDF (début: {pdf_content[:20]})")
+        return None
+
+    return pdf_content
