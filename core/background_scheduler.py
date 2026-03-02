@@ -134,61 +134,103 @@ class CreditMonitorScheduler:
             logger.error(f"❌ [SCHEDULER] Erreur lors de la vérification: {e}")
 
     async def check_pending_invoices(self, client: OdooClient):
-        """Vérifier si des factures en attente (mode bank) ont été payées"""
-        if not self.pending_invoices:
-            return
+        """
+        Vérifier si des factures TVPASS en attente ont été payées.
 
-        invoice_ids = list(self.pending_invoices.keys())
-        logger.debug(f"🔍 [SCHEDULER] Vérification de {len(invoice_ids)} facture(s) en attente...")
+        Scanne directement Odoo pour trouver les factures TVPASS (identifiées
+        par le tag [TVPASS_SUPPLY:...] dans la narration) qui sont passées à 'paid'.
+
+        Cette méthode est robuste au redémarrage du serveur car elle ne dépend
+        pas d'un cache en RAM — tout est lu depuis Odoo.
+        """
+        import re
 
         try:
+            # Chercher les factures TVPASS qui viennent de passer à paid
+            # Le tag TVPASS_SUPPLY dans narration identifie nos factures
             invoices = client.execute_kw(
                 'account.move',
                 'search_read',
-                [[('id', 'in', invoice_ids)]],
-                {'fields': ['id', 'name', 'payment_state', 'amount_total', 'state']}
+                [[
+                    ('move_type', '=', 'out_invoice'),
+                    ('narration', 'ilike', 'TVPASS_SUPPLY'),
+                    ('payment_state', '=', 'paid'),
+                ]],
+                {'fields': ['id', 'name', 'narration', 'partner_id', 'amount_total'],
+                 'order': 'id desc', 'limit': 50}
             )
+
+            if not invoices:
+                logger.debug("🔍 [SCHEDULER] Aucune facture TVPASS payée à traiter")
+                return
 
             for inv in invoices:
                 inv_id = inv['id']
-                payment_state = inv.get('payment_state', '')
+                narration = inv.get('narration', '') or ''
 
-                # Vérifier si la facture a été payée (paid = rapprochement bancaire fait par l'admin)
-                if payment_state == 'paid':
-                    pending_info = self.pending_invoices[inv_id]
-                    partner_id = pending_info['partner_id']
-                    amount = pending_info['amount']
-                    supply_id = pending_info.get('supply_id', '')
-                    invoice_number = inv.get('name', pending_info.get('invoice_number', ''))
+                # Extraire supply_id et payment_method du tag
+                match = re.search(r'\[TVPASS_SUPPLY:([^:]+):([^\]]+)\]', narration)
+                if not match:
+                    continue
 
-                    logger.info(
-                        f"💰 [SCHEDULER] Facture {invoice_number} payée ! "
-                        f"Partner: {partner_id}, Montant: {amount}, supplyId: {supply_id}"
+                supply_id = match.group(1)
+                payment_method = match.group(2)
+
+                # Vérifier si c'est une facture bank (les kkiapay ont déjà reçu le webhook)
+                if payment_method != 'bank':
+                    continue
+
+                # Vérifier si on a déjà envoyé le webhook pour cette facture
+                # On marque les factures traitées avec le tag [TVPASS_WEBHOOK_SENT]
+                if 'TVPASS_WEBHOOK_SENT' in narration:
+                    continue
+
+                invoice_number = inv.get('name', f'INV-{inv_id}')
+                partner_id = inv['partner_id'][0] if isinstance(inv.get('partner_id'), list) else inv.get('partner_id')
+                amount = inv.get('amount_total', 0)
+
+                logger.info(
+                    f"💰 [SCHEDULER] Facture {invoice_number} payée ! "
+                    f"Partner: {partner_id}, Montant: {amount}, supplyId: {supply_id}"
+                )
+
+                # Envoyer le webhook COMPANY_SUPPLY_VALIDATION
+                await self.send_supply_validation_webhook(
+                    supply_id=supply_id,
+                    invoice_id=inv_id
+                )
+
+                # Marquer la facture comme traitée dans Odoo (persistent)
+                try:
+                    new_narration = narration + "\n[TVPASS_WEBHOOK_SENT]"
+                    client.execute_kw(
+                        'account.move', 'write',
+                        [[inv_id], {'narration': new_narration}]
                     )
+                    logger.info(f"✅ [SCHEDULER] Facture {invoice_number} marquée WEBHOOK_SENT")
+                except Exception as e:
+                    logger.warning(f"⚠️ [SCHEDULER] Impossible de marquer la facture: {e}")
 
-                    # Envoyer le webhook COMPANY_SUPPLY_VALIDATION
-                    await self.send_supply_validation_webhook(
-                        supply_id=supply_id,
-                        invoice_id=inv_id
-                    )
-
-                    # Mettre à jour le cache credit du partner
-                    try:
-                        updated_partner = client.execute_kw(
-                            'res.partner', 'read', [partner_id],
-                            {'fields': ['credit']}
-                        )
-                        if updated_partner:
-                            self.cache[partner_id] = {
-                                'credit': updated_partner[0]['credit'],
-                                'last_check': datetime.now()
-                            }
-                    except Exception:
-                        pass
-
-                    # Retirer de la liste des factures en attente
+                # Retirer de la liste en mémoire si elle y était
+                if inv_id in self.pending_invoices:
                     del self.pending_invoices[inv_id]
-                    logger.info(f"✅ [SCHEDULER] Facture {invoice_number} retirée des factures en attente")
+
+                # Mettre à jour le cache credit du partner
+                try:
+                    updated_partner = client.execute_kw(
+                        'res.partner', 'read', [partner_id],
+                        {'fields': ['credit']}
+                    )
+                    if updated_partner:
+                        self.cache[partner_id] = {
+                            'credit': updated_partner[0]['credit'],
+                            'last_check': datetime.now()
+                        }
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"❌ [SCHEDULER] Erreur vérification factures en attente: {e}")
 
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur vérification factures en attente: {e}")

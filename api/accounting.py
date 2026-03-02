@@ -577,6 +577,55 @@ def get_invoice_details(client: OdooClient, invoice_id: int) -> dict:
     return invoice[0] if invoice else None
 
 
+# Tag pour identifier les factures TVPASS avec supply_id dans Odoo
+TVPASS_SUPPLY_TAG = "TVPASS_SUPPLY"
+
+
+def _tag_invoice_supply(client: OdooClient, invoice_id: int, supply_id: str, payment_method: str):
+    """
+    Stocker le supply_id et le mode de paiement dans la narration de la facture.
+
+    Format: [TVPASS_SUPPLY:supply_id:payment_method]
+
+    Cela permet au scheduler de retrouver le supply_id même après un
+    redémarrage du serveur (les données sont persistées dans Odoo).
+    """
+    tag = f"[{TVPASS_SUPPLY_TAG}:{supply_id}:{payment_method}]"
+    try:
+        # Lire la narration existante
+        inv = client.execute_kw(
+            'account.move', 'read', [invoice_id],
+            {'fields': ['narration']}
+        )
+        current_narration = inv[0].get('narration', '') or '' if inv else ''
+
+        # Ajouter le tag
+        new_narration = f"{current_narration}\n{tag}" if current_narration else tag
+
+        client.execute_kw(
+            'account.move', 'write',
+            [[invoice_id], {'narration': new_narration}]
+        )
+        logger.info(f"📝 Tag supply_id stocké dans facture {invoice_id}: {tag}")
+    except Exception as e:
+        logger.warning(f"⚠️ Impossible de stocker le tag supply_id: {e}")
+
+
+def _parse_supply_tag(narration: str) -> tuple:
+    """
+    Extraire supply_id et payment_method depuis la narration d'une facture.
+
+    Retourne (supply_id, payment_method) ou (None, None) si non trouvé.
+    """
+    import re
+    if not narration:
+        return None, None
+    match = re.search(rf'\[{TVPASS_SUPPLY_TAG}:([^:]+):([^\]]+)\]', narration)
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
+
+
 # ============================================================
 # WEBHOOK
 # ============================================================
@@ -749,6 +798,10 @@ async def credit_customer_account(
 
         # ===== 7. CRÉER ET VALIDER LA FACTURE =====
         invoice_id = create_invoice_from_order(client, order_id)
+
+        # Stocker le supply_id et le mode de paiement dans la facture Odoo
+        # pour que le scheduler puisse les retrouver même après un redémarrage
+        _tag_invoice_supply(client, invoice_id, credit_request.supply_id, credit_request.payment_method.value)
 
         # Récupérer les détails de la facture
         invoice = get_invoice_details(client, invoice_id)
