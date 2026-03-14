@@ -1,7 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 
-from models.schemas import OdooSearchRequest, OdooCreateRequest, OdooUpdateRequest, OdooDeleteRequest
+from models.schemas import (
+    OdooSearchRequest,
+    OdooCreateRequest,
+    OdooUpdateRequest,
+    OdooDeleteRequest,
+    CompanyCreateRequest,
+)
 from models.responses import ApiResponse
 from core.security import require_scope
 from core.odoo_client import get_odoo_client, default_odoo_client
@@ -287,6 +293,73 @@ async def create_record(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
+
+
+@router.post("/odoo/companies", response_model=ApiResponse, tags=["Odoo - Écriture"])
+async def create_company(
+    request: CompanyCreateRequest,
+    current_user: dict = Depends(require_scope("write"))
+):
+    """Créer une nouvelle entreprise (res.partner) avec les champs essentiels."""
+
+    try:
+        client = get_odoo_client(current_user)
+
+        values = request.model_dump(exclude_none=True)
+
+        category_ids = values.pop("category_ids", None)
+        salesperson_id = values.pop("salesperson_id", None)
+        payment_term_id = values.pop("payment_term_id", None)
+        note = values.pop("note", None)
+
+        values.update(
+            {
+                "is_company": True,
+                "company_type": "company",
+                "customer_rank": values.get("customer_rank", request.customer_rank),
+                "supplier_rank": values.get("supplier_rank", request.supplier_rank),
+            }
+        )
+
+        if salesperson_id:
+            values["user_id"] = salesperson_id
+        if payment_term_id:
+            values["property_payment_term_id"] = payment_term_id
+        if category_ids:
+            values["category_id"] = [(6, 0, category_ids)]
+        if note:
+            values["comment"] = note
+
+        new_partner_id = client.execute_kw("res.partner", "create", [values])
+
+        partner_data = client.execute_kw(
+            "res.partner",
+            "read",
+            [[new_partner_id]],
+            {
+                "fields": [
+                    "name",
+                    "email",
+                    "phone",
+                    "mobile",
+                    "vat",
+                    "website",
+                    "company_registry",
+                    "customer_rank",
+                    "supplier_rank",
+                    "category_id",
+                ]
+            },
+        )
+
+        return ApiResponse(
+            success=True,
+            data={"id": new_partner_id, "partner": partner_data[0] if partner_data else None},
+            message=f"Entreprise créée avec succès (ID {new_partner_id})",
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de l'entreprise: {str(e)}")
 
 @router.post("/odoo/update", response_model=ApiResponse, tags=["Odoo - Écriture"])
 async def update_records(

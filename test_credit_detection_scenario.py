@@ -28,7 +28,7 @@ import time
 # Configuration
 API_HOST = "localhost"
 API_PORT = 8002
-PARTNER_ID = 4708  # JSI VOYAGES
+PARTNER_ID = 11954  # Open SI test
 
 
 def create_tvpass_recharge(amount: float, payment_method: str = "kkiapay", supply_id: str = None):
@@ -81,13 +81,13 @@ def main():
     print("=" * 80)
     print()
 
-    amount = 4000  # 4000 CFA
+    amount = 150000  # 150 000 CFA
     supply_id = f"SUPPLY-TEST-{int(time.time())}"
 
     # ===== ÉTAPE 1: Appel de l'endpoint =====
     print(f"📍 ÉTAPE 1: Appel de /accounting/credit-account (mode {mode})")
     print("-" * 80)
-    print(f"   Partenaire: JSI VOYAGES (ID: {PARTNER_ID})")
+    print(f"   Partenaire: Open SI test (ID: {PARTNER_ID})")
     print(f"   Montant: {amount} CFA")
     print(f"   Méthode: {mode}")
     print(f"   Supply ID: {supply_id}")
@@ -235,6 +235,87 @@ def main():
         print(f"   ❌ Erreur lors de la vérification: {e}")
     print()
 
+    # ===== ÉTAPE 9: Diagnostic Odoo pour lettrage (mode bank) =====
+    if payment_method_used == "bank" and invoice_id:
+        print("📍 ÉTAPE 9: Diagnostic Odoo - Infos pour le lettrage manuel")
+        print("-" * 80)
+        try:
+            from core.odoo_client import OdooClient
+            odoo = OdooClient()
+
+            # Lire la facture dans Odoo
+            inv_data = odoo.execute_kw('account.move', 'read', [invoice_id],
+                {'fields': ['name', 'payment_state', 'amount_residual', 'ref']})
+            if inv_data:
+                inv_info = inv_data[0]
+                print(f"   📄 Facture Odoo: {inv_info['name']} (ID: {invoice_id})")
+                print(f"   📊 payment_state: {inv_info['payment_state']}")
+                print(f"   💰 amount_residual: {inv_info['amount_residual']}")
+                print(f"   🔗 Référence: {inv_info.get('ref', 'N/A')}")
+
+            # Trouver le paiement lié
+            pay_moves = odoo.execute_kw('account.payment', 'search_read',
+                [[('ref', 'ilike', data.get('reference', 'XXXX'))]],
+                {'fields': ['id', 'name', 'move_id', 'amount', 'state'], 'limit': 1})
+            if not pay_moves:
+                # Chercher par move_id associé à la facture
+                pay_moves = odoo.execute_kw('account.payment', 'search_read',
+                    [[('partner_id', '=', PARTNER_ID), ('amount', '=', amount)]],
+                    {'fields': ['id', 'name', 'move_id', 'amount', 'state'],
+                     'order': 'id desc', 'limit': 1})
+
+            if pay_moves:
+                pay = pay_moves[0]
+                pay_move_id = pay['move_id'][0] if isinstance(pay['move_id'], list) else pay['move_id']
+                pay_move_name = pay['move_id'][1] if isinstance(pay['move_id'], list) else pay['move_id']
+                print(f"\n   💳 Paiement: {pay['name']} (ID: {pay['id']})")
+                print(f"   📝 Move: {pay_move_name} (ID: {pay_move_id})")
+
+                # Trouver la ligne 521007 outstanding
+                pay_lines = odoo.execute_kw('account.move.line', 'search_read',
+                    [[('move_id', '=', pay_move_id)]],
+                    {'fields': ['id', 'account_id', 'debit', 'credit', 'reconciled', 'amount_residual']})
+
+                outstanding_line = None
+                for pl in pay_lines:
+                    acc_name = pl['account_id'][1] if isinstance(pl['account_id'], list) else pl['account_id']
+                    status = "✅ lettré" if pl['reconciled'] else "❌ NON lettré"
+                    print(f"      Line {pl['id']}: {acc_name} D={pl['debit']} C={pl['credit']} {status} res={pl['amount_residual']}")
+                    if '521007' in str(acc_name) and not pl['reconciled']:
+                        outstanding_line = pl
+
+                if outstanding_line:
+                    print(f"\n   🎯 LIGNE À LETTRER: ID={outstanding_line['id']} (521007 D={outstanding_line['debit']})")
+                    print()
+                    print("   " + "=" * 60)
+                    print("   📋 INSTRUCTIONS POUR LE LETTRAGE MANUEL:")
+                    print("   " + "=" * 60)
+                    print(f"   Option 1 - Via script fix_reconcile_521007.py:")
+                    print(f"      Modifier les constantes dans le script:")
+                    print(f"        INVOICE_ID = {invoice_id}")
+                    print(f"        PAYMENT_MOVE_ID = {pay_move_id}")
+                    print(f"        OUTSTANDING_LINE_ID = {outstanding_line['id']}")
+                    print(f"        PARTNER_ID = {PARTNER_ID}")
+                    print(f"        REFERENCE = \"{inv_info.get('ref', data.get('reference', 'N/A'))}\"")
+                    print(f"        AMOUNT = {amount}.0")
+                    print(f"      Puis: python3 fix_reconcile_521007.py")
+                    print()
+                    print(f"   Option 2 - Via Odoo UI:")
+                    print(f"      1. Aller dans Comptabilité → Journal PASS GD")
+                    print(f"      2. Rapprochement bancaire")
+                    print(f"      3. Créer un relevé bancaire de {amount} CFA")
+                    print(f"      4. Matcher avec le paiement outstanding {pay_move_name}")
+                    print(f"      5. Valider le rapprochement")
+                    print("   " + "=" * 60)
+                else:
+                    print("\n   ✅ Toutes les lignes 521007 sont déjà lettrées")
+            else:
+                print("\n   ⚠️  Paiement non trouvé dans Odoo")
+
+        except Exception as e:
+            print(f"   ❌ Erreur diagnostic Odoo: {e}")
+        print()
+
     # ===== RÉSUMÉ =====
     print("=" * 80)
     print(f"📋 RÉSUMÉ DU FLUX (MODE {payment_method_used.upper()})")
@@ -284,6 +365,8 @@ if __name__ == "__main__":
                 print("🎉 TEST RÉUSSI ! Flux kkiapay OK (facture paid + webhook COMPANY_SUPPLY_VALIDATION envoyé).")
             else:
                 print("🎉 TEST RÉUSSI ! Flux bank OK (facture in_payment, en attente admin).")
+                print("   📝 Suivez les instructions de l'étape 9 pour faire le lettrage.")
+                print("   📝 Après lettrage → payment_state=paid → scheduler envoie le webhook.")
         else:
             print("❌ TEST ÉCHOUÉ - Vérifiez les logs du serveur pour plus de détails")
         print("=" * 80)

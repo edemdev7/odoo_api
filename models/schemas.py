@@ -66,6 +66,30 @@ class OdooDeleteRequest(BaseModel):
     model: str = Field(..., description="Nom du modèle Odoo")
     ids: List[int] = Field(..., description="IDs des enregistrements à supprimer")
 
+
+class CompanyCreateRequest(BaseModel):
+    """Modèle de création simplifiée d'une entreprise (res.partner)."""
+
+    name: str = Field(..., description="Nom légal de l'entreprise", min_length=2, max_length=255)
+    email: Optional[str] = Field(None, description="Adresse email principale", max_length=255)
+    phone: Optional[str] = Field(None, description="Téléphone fixe", max_length=50)
+    mobile: Optional[str] = Field(None, description="Téléphone mobile", max_length=50)
+    street: Optional[str] = Field(None, description="Rue / adresse", max_length=255)
+    street2: Optional[str] = Field(None, description="Complément d'adresse", max_length=255)
+    zip: Optional[str] = Field(None, description="Code postal", max_length=20)
+    city: Optional[str] = Field(None, description="Ville", max_length=100)
+    state_id: Optional[int] = Field(None, description="ID de l'état/province (res.country.state)")
+    country_id: Optional[int] = Field(None, description="ID du pays (res.country)")
+    vat: Optional[str] = Field(None, description="Numéro fiscal / TVA", max_length=64)
+    company_registry: Optional[str] = Field(None, description="Numéro RCCM / Registre de commerce", max_length=64)
+    website: Optional[str] = Field(None, description="Site web", max_length=255)
+    category_ids: Optional[List[int]] = Field(None, description="IDs des catégories de partenaire (res.partner.category)")
+    salesperson_id: Optional[int] = Field(None, description="ID du commercial responsable (res.users)")
+    payment_term_id: Optional[int] = Field(None, description="ID des conditions de paiement client (account.payment.term)")
+    note: Optional[str] = Field(None, description="Notes internes", max_length=1000)
+    customer_rank: int = Field(1, ge=0, description="Rang client initial")
+    supplier_rank: int = Field(0, ge=0, description="Rang fournisseur initial")
+
 class PosProductSearchRequest(BaseModel):
     barcode: Optional[str] = None
     product_name: Optional[str] = None
