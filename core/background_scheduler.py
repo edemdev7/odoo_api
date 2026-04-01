@@ -12,7 +12,7 @@ from typing import Dict, Any
 import httpx
 
 from core.odoo_client import OdooClient
-from core.encryption import encrypt_webhook_data
+from core.webhook_sender import send_encrypted_webhook
 from core.config import ODOO_DB1_CONFIG  # Import de la config par défaut
 import os
 
@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
+# Optional staging webhook URL - if set we will call both dev and staging
+WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", None)  # e.g. https://api-jnp-stg.opensi.co/public/odoo/webhook
 CHECK_INTERVAL = int(os.getenv("CREDIT_CHECK_INTERVAL", "60"))  # 60 secondes par défaut
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
 
@@ -248,35 +250,20 @@ class CreditMonitorScheduler:
             logger.info(f"📤 [SCHEDULER] Préparation webhook pour partner {partner_id}")
             
             # Encrypter les données
+            # Build URL list (dev + optional staging)
+            urls = [WEBHOOK_URL]
+            if WEBHOOK_URL_STG and WEBHOOK_URL_STG != WEBHOOK_URL:
+                urls.append(WEBHOOK_URL_STG)
+
+            logger.info(f"📤 [SCHEDULER] Envoi webhook vers {len(urls)} endpoint(s): {urls}")
+
             try:
-                encrypted_data = encrypt_webhook_data(webhook_data, use_compression=False)
-                logger.info(f"🔐 [SCHEDULER] Données encryptées (taille: {len(encrypted_data)} chars)")
+                results = await send_encrypted_webhook(urls, webhook_data, timeout=WEBHOOK_TIMEOUT, use_compression=False)
+                for url, status, info in results:
+                    if status not in (200, 201, 204):
+                        logger.warning(f"⚠️ [SCHEDULER] Non-OK response from {url}: {status} - {info}")
             except Exception as e:
-                logger.error(f"❌ [SCHEDULER] Erreur encryption: {e}")
-                return
-            
-            # Envoyer la requête
-            logger.info(f"📤 [SCHEDULER] Envoi webhook: {WEBHOOK_URL}")
-            
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as http_client:
-                response = await http_client.post(
-                    WEBHOOK_URL,
-                    headers={
-                        'Content-Type': 'application/json',
-                        'x-encrypted-data': encrypted_data
-                    }
-                )
-                
-                if response.status_code in [200, 201, 204]:
-                    logger.info(
-                        f"✅ [SCHEDULER] Webhook envoyé avec succès pour partner {partner_id} "
-                        f"- Montant: {amount} - Status: {response.status_code}"
-                    )
-                else:
-                    logger.warning(
-                        f"⚠️ [SCHEDULER] Webhook rejeté (HTTP {response.status_code}): "
-                        f"{response.text[:200]}"
-                    )
+                logger.error(f"❌ [SCHEDULER] Exception lors de l'envoi des webhooks: {e}")
                     
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur envoi webhook: {e}")
@@ -293,32 +280,22 @@ class CreditMonitorScheduler:
             logger.info(f"📤 [SCHEDULER] Préparation webhook COMPANY_SUPPLY_VALIDATION")
             logger.info(f"   supplyId: {supply_id}, invoiceId: {invoice_id}")
 
+            urls = [WEBHOOK_URL]
+            if WEBHOOK_URL_STG and WEBHOOK_URL_STG != WEBHOOK_URL:
+                urls.append(WEBHOOK_URL_STG)
+
             try:
-                encrypted_data = encrypt_webhook_data(webhook_data, use_compression=False)
-                logger.info(f"🔐 [SCHEDULER] Données encryptées (taille: {len(encrypted_data)} chars)")
+                results = await send_encrypted_webhook(urls, webhook_data, timeout=WEBHOOK_TIMEOUT, use_compression=False)
+                for url, status, info in results:
+                    if status in (200, 201, 204):
+                        logger.info(
+                            f"✅ [SCHEDULER] Webhook COMPANY_SUPPLY_VALIDATION envoyé - "
+                            f"supplyId: {supply_id}, invoiceId: {invoice_id} - URL: {url} - Status: {status}"
+                        )
+                    else:
+                        logger.warning(f"⚠️ [SCHEDULER] COMPANY_SUPPLY_VALIDATION non-OK from {url}: {status} - {info}")
             except Exception as e:
-                logger.error(f"❌ [SCHEDULER] Erreur encryption: {e}")
-                return
-
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as http_client:
-                response = await http_client.post(
-                    WEBHOOK_URL,
-                    headers={
-                        'Content-Type': 'application/json',
-                        'x-encrypted-data': encrypted_data
-                    }
-                )
-
-                if response.status_code in [200, 201, 204]:
-                    logger.info(
-                        f"✅ [SCHEDULER] Webhook COMPANY_SUPPLY_VALIDATION envoyé - "
-                        f"supplyId: {supply_id}, invoiceId: {invoice_id} - Status: {response.status_code}"
-                    )
-                else:
-                    logger.warning(
-                        f"⚠️ [SCHEDULER] Webhook rejeté (HTTP {response.status_code}): "
-                        f"{response.text[:200]}"
-                    )
+                logger.error(f"❌ [SCHEDULER] Exception lors de l'envoi du COMPANY_SUPPLY_VALIDATION: {e}")
 
         except Exception as e:
             logger.error(f"❌ [SCHEDULER] Erreur envoi webhook COMPANY_SUPPLY_VALIDATION: {e}")

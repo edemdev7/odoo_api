@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from core.security import require_scope
 from core.odoo_client import get_odoo_client
-from core.encryption import encrypt_webhook_data
+from core.webhook_sender import send_encrypted_webhook
 from models.responses import ApiResponse
 from core.background_scheduler import get_scheduler
 
@@ -25,6 +25,8 @@ router = APIRouter(prefix="/fuel-monitor", tags=["Fuel Account Monitor"])
 
 # Configuration du webhook depuis les variables d'environnement
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
+# Optional staging webhook URL - if set we will call both dev and staging
+WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", None)  # e.g. https://api-jnp-stg.opensi.co/public/odoo/webhook
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
 
 # Cache pour suivre les valeurs précédentes de credit
@@ -197,38 +199,22 @@ async def send_recharge_webhook(partner_id: str, amount: float):
         logger.info(f"📤 Préparation webhook pour partner {partner_id}")
         logger.info(f"   Montant: {amount} CFA")
         
-        # Encrypter les données
+        # Build list of URLs to call (dev + optional staging)
+        urls = [WEBHOOK_URL]
+        if WEBHOOK_URL_STG and WEBHOOK_URL_STG != WEBHOOK_URL:
+            urls.append(WEBHOOK_URL_STG)
+
+        logger.info(f"📤 Envoi webhook vers {len(urls)} endpoint(s): {urls}")
+
+        # Use shared helper to encrypt once and post to all endpoints in parallel
         try:
-            encrypted_data = encrypt_webhook_data(webhook_data)
-            logger.info(f"🔐 Données encryptées (taille: {len(encrypted_data)} chars)")
+            results = await send_encrypted_webhook(urls, webhook_data, timeout=WEBHOOK_TIMEOUT)
+            # results are logged by the helper; we can optionally do extra checks here
+            for url, status, info in results:
+                if status not in (200, 201, 204):
+                    logger.warning(f"[FUEL_MONITOR] Non-OK response from {url}: {status} - {info}")
         except Exception as e:
-            logger.error(f"❌ Erreur encryption: {e}")
-            # Si l'encryption échoue, on peut soit abandonner soit envoyer en clair
-            # Pour la sécurité, on abandonne
-            logger.error("⚠️  Webhook non envoyé (échec encryption)")
-            return
-        
-        # Envoyer la requête HTTP POST avec les données encryptées dans le header
-        logger.info(f"📤 Envoi webhook: {WEBHOOK_URL}")
-        
-        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-            response = await client.post(
-                WEBHOOK_URL,
-                headers={
-                    'Content-Type': 'application/json',
-                    'x-encrypted-data': encrypted_data
-                }
-            )
-            
-            if response.status_code in [200, 201, 204]:
-                logger.info(
-                    f"✅ Webhook envoyé avec succès pour partner {partner_id} "
-                    f"- Montant: {amount} - Status: {response.status_code}"
-                )
-            else:
-                logger.error(
-                    f"❌ Erreur webhook (HTTP {response.status_code}): {response.text}"
-                )
+            logger.error(f"❌ Erreur lors de l'envoi des webhooks: {e}")
                 
     except httpx.TimeoutException:
         logger.error(f"⏱️ Timeout lors de l'envoi du webhook vers {WEBHOOK_URL}")
