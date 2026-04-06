@@ -1637,11 +1637,28 @@ async def get_pos_inventory_transfers(
         # Construire le domaine de recherche de manière simple et robuste
         domain = []
         
-        # Filtrer par société du PDV si disponible (plus simple que par entrepôt)
-        if pos_config.get('company_id'):
+        # Filtrer par warehouse du PDV (plus précis que juste par société)
+        if pos_config.get('warehouse_id'):
+            try:
+                warehouse_id = pos_config['warehouse_id'][0] if isinstance(pos_config['warehouse_id'], list) else pos_config['warehouse_id']
+                domain.append(('warehouse_id', '=', warehouse_id))
+                logger.info(f"Filtrage par warehouse_id du PDV: {warehouse_id}")
+            except Exception as e:
+                logger.warning(f"Impossible de filtrer par warehouse: {e}")
+                # Fallback: filtrer par société si warehouse n'est pas disponible
+                if pos_config.get('company_id'):
+                    try:
+                        company_id = pos_config['company_id'][0] if isinstance(pos_config['company_id'], list) else pos_config['company_id']
+                        domain.append(('company_id', '=', company_id))
+                        logger.info(f"Fallback: Filtrage par company_id: {company_id}")
+                    except Exception as e2:
+                        logger.warning(f"Impossible de filtrer par société: {e2}")
+        elif pos_config.get('company_id'):
+            # Si warehouse n'existe pas, utiliser company_id comme fallback
             try:
                 company_id = pos_config['company_id'][0] if isinstance(pos_config['company_id'], list) else pos_config['company_id']
                 domain.append(('company_id', '=', company_id))
+                logger.info(f"Filtrage par company_id (pas de warehouse): {company_id}")
             except Exception as e:
                 logger.warning(f"Impossible de filtrer par société: {e}")
         
