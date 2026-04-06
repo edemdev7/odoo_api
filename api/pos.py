@@ -1664,11 +1664,20 @@ async def get_pos_inventory_transfers(
                 logger.warning(f"Impossible de filtrer par société: {e}")
         
         # **IMPORTANT:** Filtrer automatiquement par type de transfert en fonction de la base de données
-        # Si picking_type_code n'est pas explicitement fourni, utiliser celui de la DB
+        # MAIS: Si on filtre par warehouse du PDV, le picking_type_code est déjà implicitement filtré
+        # via picking_type_id.warehouse_id, donc ne pas appliquer le filtre picking_type_code automatique
         from core.security import get_odoo_config_from_user
         
         db_config = get_odoo_config_from_user(current_user)
-        if db_config and 'transfer_type_code' in db_config:
+        
+        # N'appliquer le filtre de picking_type_code que si c'est explicitement demandé
+        # ET si on ne filtre pas par warehouse du PDV
+        should_auto_filter_picking_type = (
+            db_config and 'transfer_type_code' in db_config and 
+            not (pos_config.get('warehouse_id'))  # Si pas de warehouse filtrage, appliquer auto-filter
+        )
+        
+        if should_auto_filter_picking_type:
             # Si le code n'est pas fourni dans la requête, utiliser celui de la DB
             if not picking_type_code:
                 picking_type_code = db_config['transfer_type_code']
@@ -1684,6 +1693,9 @@ async def get_pos_inventory_transfers(
                         status_code=403,
                         detail=f"Cette base de données ne gère que les transferts de type '{db_config['transfer_type_code']}'"
                     )
+        elif picking_type_code is None and not should_auto_filter_picking_type:
+            # Si pas d'auto-filter et pas de picking_type_code fourni, ne pas en ajouter
+            logger.info(f"Pas de filtrage automatique picking_type (PDV avec warehouse spécifique)")
         
         # Ajouter les filtres optionnels
         if state:
@@ -1819,7 +1831,7 @@ async def get_pos_inventory_transfers(
                         {
                             'fields': [
                                 'id', 'name', 'complete_name', 'usage', 'active',
-                                'warehouse_id', 'company_id', 'partner_id', 'parent_path',
+                                'warehouse_id', 'company_id', 'parent_path',
                                 'barcode', 'location_id', 'comment', 'scrap_location',
                                 'removal_strategy_id'
                             ]
@@ -1878,7 +1890,7 @@ async def get_pos_inventory_transfers(
                                     'id', 'name', 'display_name', 'default_code', 'barcode', 'categ_id',
                                     'uom_id', 'uom_po_id', 'list_price', 'standard_price',
                                     'type', 'tracking', 'weight', 'volume', 'sale_ok', 
-                                    'purchase_ok', 'active', 'image_1920', 'description',
+                                    'purchase_ok', 'active', 'description',
                                     'description_sale', 'description_purchase', 'taxes_id',
                                     'supplier_taxes_id', 'product_tmpl_id', 'product_variant_ids'
                                 ]
