@@ -1637,12 +1637,13 @@ async def get_pos_inventory_transfers(
         # Construire le domaine de recherche de manière simple et robuste
         domain = []
         
-        # Filtrer par warehouse du PDV (plus précis que juste par société)
+        # Filtrer par warehouse du PDV via picking_type_id.warehouse_id
+        # (stock.picking n'a pas de warehouse_id direct, mais via picking_type_id)
         if pos_config.get('warehouse_id'):
             try:
                 warehouse_id = pos_config['warehouse_id'][0] if isinstance(pos_config['warehouse_id'], list) else pos_config['warehouse_id']
-                domain.append(('warehouse_id', '=', warehouse_id))
-                logger.info(f"Filtrage par warehouse_id du PDV: {warehouse_id}")
+                domain.append(('picking_type_id.warehouse_id', '=', warehouse_id))
+                logger.info(f"Filtrage par warehouse du PDV (via picking_type): {warehouse_id}")
             except Exception as e:
                 logger.warning(f"Impossible de filtrer par warehouse: {e}")
                 # Fallback: filtrer par société si warehouse n'est pas disponible
