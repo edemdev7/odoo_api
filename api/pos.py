@@ -1773,6 +1773,60 @@ async def get_pos_inventory_transfers(
         
         # Enrichir chaque transfert avec les détails des mouvements
         for transfer in transfers:
+            # Enrichir avec les détails des localisations (source et destination)
+            location_details = {}
+            location_ids_to_fetch = []
+            
+            # Collecter les IDs de localisation à récupérer
+            if transfer.get('location_id') and isinstance(transfer['location_id'], (list, tuple)):
+                location_ids_to_fetch.append(transfer['location_id'][0])
+            elif transfer.get('location_id') and isinstance(transfer['location_id'], int):
+                location_ids_to_fetch.append(transfer['location_id'])
+            
+            if transfer.get('location_dest_id') and isinstance(transfer['location_dest_id'], (list, tuple)):
+                location_ids_to_fetch.append(transfer['location_dest_id'][0])
+            elif transfer.get('location_dest_id') and isinstance(transfer['location_dest_id'], int):
+                location_ids_to_fetch.append(transfer['location_dest_id'])
+            
+            # Récupérer les détails des localisations
+            if location_ids_to_fetch:
+                try:
+                    # Dédupliquer les IDs
+                    location_ids_to_fetch = list(set(location_ids_to_fetch))
+                    
+                    locations_data = client.execute_kw(
+                        'stock.location',
+                        'read',
+                        [location_ids_to_fetch],
+                        {
+                            'fields': [
+                                'id', 'name', 'complete_name', 'usage', 'active',
+                                'warehouse_id', 'company_id', 'partner_id', 'parent_path',
+                                'barcode', 'location_id', 'comment', 'scrap_location',
+                                'removal_strategy_id'
+                            ]
+                        }
+                    )
+                    
+                    # Créer un mapping des localisations
+                    location_details = {loc['id']: loc for loc in locations_data}
+                
+                except Exception as e:
+                    logger.warning(f"Erreur récupération détails localisations pour transfert {transfer['id']}: {e}")
+                    location_details = {}
+            
+            # Ajouter les détails des localisations au transfert
+            transfer['location_source_details'] = None
+            transfer['location_destination_details'] = None
+            
+            if transfer.get('location_id'):
+                source_loc_id = transfer['location_id'][0] if isinstance(transfer['location_id'], (list, tuple)) else transfer['location_id']
+                transfer['location_source_details'] = location_details.get(source_loc_id, None)
+            
+            if transfer.get('location_dest_id'):
+                dest_loc_id = transfer['location_dest_id'][0] if isinstance(transfer['location_dest_id'], (list, tuple)) else transfer['location_dest_id']
+                transfer['location_destination_details'] = location_details.get(dest_loc_id, None)
+            
             # Récupérer les détails des mouvements de stock (stock.move)
             if transfer.get('move_ids'):
                 try:
@@ -1980,7 +2034,11 @@ async def get_pos_inventory_transfers(
                     'move_details': transfer.get('move_details', []),
                     'move_line_details': transfer.get('move_line_details', []),
                     'carrier_details': transfer.get('carrier_details', {}),
-                    'picking_type_details': transfer.get('picking_type_details', {})
+                    'picking_type_details': transfer.get('picking_type_details', {}),
+                    
+                    # Détails des localisations (source et destination)
+                    'location_source_details': transfer.get('location_source_details', None),
+                    'location_destination_details': transfer.get('location_destination_details', None),
                 }
                 
                 formatted_transfers.append(formatted_transfer)
