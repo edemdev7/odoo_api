@@ -20,6 +20,7 @@ from core.encryption import decrypt_webhook_data, encrypt_webhook_data
 from core.odoo_client import OdooClient
 from models.responses import ApiResponse
 from core.background_scheduler import get_scheduler
+from core.webhook_sender import send_encrypted_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ JPASS_JOURNAL_ID = 194                       # Journal PASS GD pour paiement kki
 WEBHOOK_ACTION = "COMPANY_SUPPLY_VALIDATION" # Action webhook quand facture payée
 
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
+WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", None)
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
 
 
@@ -633,6 +635,8 @@ def _parse_supply_tag(narration: str) -> tuple:
 async def send_supply_validation_webhook(supply_id: str, invoice_id: int):
     """
     Envoyer le webhook COMPANY_SUPPLY_VALIDATION quand la facture est payée.
+    
+    Envoie vers les deux URLs configurées (dev + stg) en parallèle avec le même payload.
 
     Payload encrypté:
     {
@@ -651,36 +655,33 @@ async def send_supply_validation_webhook(supply_id: str, invoice_id: int):
         logger.info(f"📤 Préparation webhook {WEBHOOK_ACTION}")
         logger.info(f"   supplyId: {supply_id}, invoiceId: {invoice_id}")
 
-        # Encrypter les données
-        try:
-            encrypted_data = encrypt_webhook_data(webhook_data, use_compression=False)
-            logger.info(f"🔐 Données encryptées (taille: {len(encrypted_data)} chars)")
-        except Exception as e:
-            logger.error(f"❌ Erreur encryption webhook: {e}")
-            return
+        # Construire la liste des URLs
+        webhook_urls = [WEBHOOK_URL]
+        if WEBHOOK_URL_STG:
+            webhook_urls.append(WEBHOOK_URL_STG)
+        
+        logger.info(f"🎯 Envoi vers {len(webhook_urls)} endpoint(s): {webhook_urls}")
 
-        # Envoyer
-        async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as http_client:
-            response = await http_client.post(
-                WEBHOOK_URL,
-                headers={
-                    'Content-Type': 'application/json',
-                    'x-encrypted-data': encrypted_data
-                }
-            )
+        # Utiliser le helper pour envoyer à tous les URLs en parallèle
+        results = await send_encrypted_webhook(
+            urls=webhook_urls,
+            webhook_data=webhook_data,
+            timeout=WEBHOOK_TIMEOUT,
+            use_compression=False
+        )
 
-            if response.status_code in [200, 201, 204]:
+        # Vérifier les résultats
+        for url, status_code, response_text in results:
+            if status_code in [200, 201, 204]:
                 logger.info(
-                    f"✅ Webhook {WEBHOOK_ACTION} envoyé - "
-                    f"supplyId: {supply_id}, invoiceId: {invoice_id} - Status: {response.status_code}"
+                    f"✅ Webhook {WEBHOOK_ACTION} envoyé à {url} - "
+                    f"supplyId: {supply_id}, invoiceId: {invoice_id} - Status: {status_code}"
                 )
             else:
                 logger.error(
-                    f"❌ Webhook rejeté (HTTP {response.status_code}): {response.text[:200]}"
+                    f"❌ Webhook rejeté par {url} (HTTP {status_code}): {response_text[:200]}"
                 )
 
-    except httpx.TimeoutException:
-        logger.error(f"⏱️ Timeout webhook vers {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"❌ Erreur envoi webhook: {e}")
 
