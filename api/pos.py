@@ -2389,7 +2389,87 @@ async def get_transfers_by_truck(
                 raise
         
         # Enrichir chaque transfert avec les détails des mouvements
+        # D'abord, collecter tous les IDs de localisation pour un seul appel Odoo
+        all_location_ids = set()
         for transfer in transfers:
+            if transfer.get('location_id'):
+                loc_id = transfer['location_id'][0] if isinstance(transfer['location_id'], (list, tuple)) else transfer['location_id']
+                all_location_ids.add(loc_id)
+            if transfer.get('location_dest_id'):
+                loc_id = transfer['location_dest_id'][0] if isinstance(transfer['location_dest_id'], (list, tuple)) else transfer['location_dest_id']
+                all_location_ids.add(loc_id)
+        
+        # Récupérer les détails de toutes les localisations
+        locations_map = {}
+        if all_location_ids:
+            try:
+                locations_details = client.execute_kw(
+                    'stock.location',
+                    'read',
+                    [list(all_location_ids)],
+                    {'fields': ['id', 'name', 'complete_name', 'usage', 'warehouse_id', 'company_id', 'barcode', 'location_id', 'scrap_location', 'removal_strategy_id']}
+                )
+                locations_map = {loc['id']: loc for loc in locations_details}
+            except Exception as e:
+                logger.warning(f"Erreur enrichissement localisations: {e}")
+        
+        # Collecter aussi les IDs de partenaires et de chauffeurs
+        all_partner_ids = set()
+        for transfer in transfers:
+            if transfer.get('partner_id'):
+                partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
+                all_partner_ids.add(partner_id)
+        
+        partners_map = {}
+        drivers_map = {}
+        if all_partner_ids:
+            try:
+                partners_details = client.execute_kw(
+                    'res.partner',
+                    'read',
+                    [list(all_partner_ids)],
+                    {'fields': ['id', 'name', 'display_name', 'phone', 'mobile', 'email', 'type', 'is_company', 'child_ids']}
+                )
+                partners_map = {p['id']: p for p in partners_details}
+                
+                # Pour chaque partenaire, chercher les chauffeurs associés (enfants de type 'contact')
+                for partner in partners_details:
+                    if partner.get('child_ids'):
+                        try:
+                            drivers = client.execute_kw(
+                                'res.partner',
+                                'read',
+                                [partner['child_ids']],
+                                {'fields': ['id', 'name', 'mobile', 'email', 'type']}
+                            )
+                            drivers_map[partner['id']] = drivers
+                        except Exception as e:
+                            logger.debug(f"Erreur récupération chauffeurs pour {partner['id']}: {e}")
+            except Exception as e:
+                logger.warning(f"Erreur enrichissement partenaires: {e}")
+        
+        # Enrichir chaque transfert avec les détails des mouvements
+        for transfer in transfers:
+            # Ajouter les détails des localisations
+            source_loc_id = transfer['location_id'][0] if isinstance(transfer.get('location_id'), (list, tuple)) else transfer.get('location_id')
+            dest_loc_id = transfer['location_dest_id'][0] if isinstance(transfer.get('location_dest_id'), (list, tuple)) else transfer.get('location_dest_id')
+            
+            transfer['location_source_details'] = locations_map.get(source_loc_id) if source_loc_id else None
+            transfer['location_destination_details'] = locations_map.get(dest_loc_id) if dest_loc_id else None
+            
+            # Ajouter les détails du partenaire et du chauffeur si applicable
+            if transfer.get('partner_id'):
+                partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
+                partner = partners_map.get(partner_id)
+                transfer['partner_details'] = partner
+                
+                # Si c'est un camion (partenaire), chercher le chauffeur
+                if partner and drivers_map.get(partner_id):
+                    # Prendre le premier chauffeur trouvé
+                    drivers = drivers_map.get(partner_id, [])
+                    if drivers:
+                        transfer['driver_details'] = drivers[0]
+            
             # Récupérer les détails des mouvements de stock
             if transfer.get('move_ids'):
                 try:
@@ -2499,8 +2579,12 @@ async def get_transfers_by_truck(
                     'truck_name': clean_odoo_value(transfer.get('origin')),
                     
                     'partner_id': clean_odoo_value(transfer.get('partner_id')),
+                    'partner_details': clean_odoo_value(transfer.get('partner_details')),
+                    'driver_details': clean_odoo_value(transfer.get('driver_details')),
                     'location_id': clean_odoo_value(transfer.get('location_id')),
                     'location_dest_id': clean_odoo_value(transfer.get('location_dest_id')),
+                    'location_source_details': clean_odoo_value(transfer.get('location_source_details')),
+                    'location_destination_details': clean_odoo_value(transfer.get('location_destination_details')),
                     'scheduled_date': clean_odoo_value(transfer.get('scheduled_date')),
                     'date_done': clean_odoo_value(transfer.get('date_done')),
                     'date': clean_odoo_value(transfer.get('date')),
