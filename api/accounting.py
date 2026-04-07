@@ -21,6 +21,7 @@ from core.odoo_client import OdooClient
 from models.responses import ApiResponse
 from core.background_scheduler import get_scheduler
 from core.webhook_sender import send_encrypted_webhook
+from core.config import logger as config_logger  # Charge le .env via load_dotenv()
 
 logger = logging.getLogger(__name__)
 
