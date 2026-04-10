@@ -1857,6 +1857,145 @@ async def get_pos_inventory_transfers(
                 dest_loc_id = transfer['location_dest_id'][0] if isinstance(transfer['location_dest_id'], (list, tuple)) else transfer['location_dest_id']
                 transfer['location_destination_details'] = location_details.get(dest_loc_id, None)
             
+            # Enrichir avec les infos des acteurs (chauffeur, gérant, etc.)
+            transfer['location_source_actor'] = None
+            transfer['location_destination_actor'] = None
+            transfer['related_contacts'] = []
+            
+            # Batch fetch pour les acteurs et partenaires
+            partners_to_fetch = set()
+            
+            # Collecter les IDs de partenaires à récupérer
+            if transfer.get('partner_id') and isinstance(transfer['partner_id'], (list, tuple)):
+                partners_to_fetch.add(transfer['partner_id'][0])
+            elif transfer.get('partner_id') and isinstance(transfer['partner_id'], int):
+                partners_to_fetch.add(transfer['partner_id'])
+            
+            # Batch fetch des partenaires et leurs contacts
+            partners_map = {}
+            if partners_to_fetch:
+                try:
+                    partners_data = client.execute_kw(
+                        'res.partner',
+                        'read',
+                        list(partners_to_fetch),
+                        {'fields': ['id', 'name', 'phone', 'mobile', 'email', 'function', 'child_ids']}
+                    )
+                    partners_map = {p['id']: p for p in partners_data}
+                except Exception as e:
+                    logger.debug(f"Erreur récupération partenaires: {e}")
+            
+            # Batch fetch des contacts (enfants des partenaires)
+            all_contact_ids = set()
+            for partner_id in partners_to_fetch:
+                partner = partners_map.get(partner_id)
+                if partner and partner.get('child_ids'):
+                    all_contact_ids.update(partner['child_ids'] if isinstance(partner['child_ids'], (list, tuple)) else [partner['child_ids']])
+            
+            contacts_map = {}
+            if all_contact_ids:
+                try:
+                    contacts_data = client.execute_kw(
+                        'res.partner',
+                        'read',
+                        list(all_contact_ids),
+                        {'fields': ['id', 'name', 'phone', 'mobile', 'email', 'function']}
+                    )
+                    contacts_map = {c['id']: c for c in contacts_data}
+                except Exception as e:
+                    logger.debug(f"Erreur récupération contacts: {e}")
+            
+            # Détecter le partenaire source (qui expédie)
+            source_actor = None
+            if transfer.get('partner_id'):
+                partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
+                source_actor = partners_map.get(partner_id)
+            
+            # Ajouter l'acteur source au transfert
+            if source_actor:
+                transfer['location_source_actor'] = {
+                    'id': source_actor['id'],
+                    'name': source_actor.get('name', ''),
+                    'phone': source_actor.get('phone'),
+                    'mobile': source_actor.get('mobile'),
+                    'email': source_actor.get('email'),
+                    'function': source_actor.get('function')
+                }
+            
+            # Détecter le gérant de la station de destination (du POS actuel)
+            destination_actor = None
+            
+            # Récupérer les gérants (advanced_employee_ids) du POS courant
+            if pos_config.get('id'):
+                try:
+                    pos_managers = client.execute_kw(
+                        'pos.config',
+                        'read',
+                        [pos_config['id']],
+                        {'fields': ['advanced_employee_ids']}
+                    )
+                    
+                    if pos_managers and pos_managers[0].get('advanced_employee_ids'):
+                        # Récupérer le premier gérant
+                        manager_id = pos_managers[0]['advanced_employee_ids'][0]
+                        
+                        try:
+                            manager_data = client.execute_kw(
+                                'hr.employee',
+                                'read',
+                                [manager_id],
+                                {'fields': ['id', 'name', 'work_phone', 'mobile_phone', 'work_email', 'job_title']}
+                            )
+                            
+                            if manager_data:
+                                destination_actor = manager_data[0]
+                        except Exception as e:
+                            logger.debug(f"Erreur récupération gérant: {e}")
+                except Exception as e:
+                    logger.debug(f"Erreur récupération gérants du POS {pos_config.get('id')}: {e}")
+            
+            # Ajouter l'acteur destination au transfert
+            if destination_actor:
+                transfer['location_destination_actor'] = {
+                    'id': destination_actor['id'],
+                    'name': destination_actor.get('name', ''),
+                    'phone': destination_actor.get('work_phone'),
+                    'mobile': destination_actor.get('mobile_phone'),
+                    'email': destination_actor.get('work_email'),
+                    'function': destination_actor.get('job_title')
+                }
+            
+            # Collecter tous les contacts associés
+            related_contacts_set = set()
+            if source_actor:
+                related_contacts_set.add(source_actor['id'])
+            
+            for partner_id in partners_to_fetch:
+                related_contacts_set.add(partner_id)
+                partner = partners_map.get(partner_id)
+                if partner and partner.get('child_ids'):
+                    child_ids = partner['child_ids'] if isinstance(partner['child_ids'], (list, tuple)) else [partner['child_ids']]
+                    related_contacts_set.update(child_ids)
+            
+            # Formater les contacts associés
+            transfer['related_contacts'] = []
+            for contact_id in related_contacts_set:
+                if contact_id in partners_map:
+                    contact = partners_map[contact_id]
+                elif contact_id in contacts_map:
+                    contact = contacts_map[contact_id]
+                else:
+                    continue
+                
+                transfer['related_contacts'].append({
+                    'id': contact['id'],
+                    'name': contact.get('name', ''),
+                    'phone': contact.get('phone'),
+                    'mobile': contact.get('mobile'),
+                    'email': contact.get('email'),
+                    'function': contact.get('function')
+                })
+            
             # Récupérer les détails des mouvements de stock (stock.move)
             if transfer.get('move_ids'):
                 try:
@@ -2069,6 +2208,11 @@ async def get_pos_inventory_transfers(
                     # Détails des localisations (source et destination)
                     'location_source_details': transfer.get('location_source_details', None),
                     'location_destination_details': transfer.get('location_destination_details', None),
+                    
+                    # Détails des acteurs (chauffeur, gérant, etc.)
+                    'location_source_actor': clean_odoo_value(transfer.get('location_source_actor')),
+                    'location_destination_actor': clean_odoo_value(transfer.get('location_destination_actor')),
+                    'related_contacts': transfer.get('related_contacts', []),
                 }
                 
                 formatted_transfers.append(formatted_transfer)
@@ -2399,7 +2543,7 @@ async def get_transfers_by_truck(
                 loc_id = transfer['location_dest_id'][0] if isinstance(transfer['location_dest_id'], (list, tuple)) else transfer['location_dest_id']
                 all_location_ids.add(loc_id)
         
-        # Récupérer les détails de toutes les localisations
+        # Récupérer les détails de toutes les localisations (avec champs supplémentaires)
         locations_map = {}
         if all_location_ids:
             try:
@@ -2407,68 +2551,109 @@ async def get_transfers_by_truck(
                     'stock.location',
                     'read',
                     [list(all_location_ids)],
-                    {'fields': ['id', 'name', 'complete_name', 'usage', 'warehouse_id', 'company_id', 'barcode', 'location_id', 'scrap_location', 'removal_strategy_id']}
+                    {'fields': ['id', 'name', 'complete_name', 'usage', 'active', 'warehouse_id', 'company_id', 'parent_path', 'barcode', 'location_id', 'comment', 'scrap_location', 'removal_strategy_id']}
                 )
                 locations_map = {loc['id']: loc for loc in locations_details}
             except Exception as e:
                 logger.warning(f"Erreur enrichissement localisations: {e}")
         
-        # Collecter aussi les IDs de partenaires et de chauffeurs
+        # Collecter tous les IDs de partenaires (depuis transfer)
         all_partner_ids = set()
+        
         for transfer in transfers:
             if transfer.get('partner_id'):
                 partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
                 all_partner_ids.add(partner_id)
         
+        # Récupérer les détails des partenaires et leurs contacts (chauffeurs, gérants)
         partners_map = {}
         drivers_map = {}
+        
         if all_partner_ids:
             try:
                 partners_details = client.execute_kw(
                     'res.partner',
                     'read',
                     [list(all_partner_ids)],
-                    {'fields': ['id', 'name', 'display_name', 'phone', 'mobile', 'email', 'type', 'is_company', 'child_ids']}
+                    {'fields': ['id', 'name', 'display_name', 'phone', 'mobile', 'email', 'type', 'is_company', 'child_ids', 'category_id', 'commercial_partner_id']}
                 )
                 partners_map = {p['id']: p for p in partners_details}
                 
-                # Pour chaque partenaire, chercher les chauffeurs associés (enfants de type 'contact')
+                # Pour chaque partenaire, récupérer tous ses contacts (chauffeurs, gérants, etc.)
+                all_contact_ids = set()
                 for partner in partners_details:
                     if partner.get('child_ids'):
-                        try:
-                            drivers = client.execute_kw(
-                                'res.partner',
-                                'read',
-                                [partner['child_ids']],
-                                {'fields': ['id', 'name', 'mobile', 'email', 'type']}
-                            )
-                            drivers_map[partner['id']] = drivers
-                        except Exception as e:
-                            logger.debug(f"Erreur récupération chauffeurs pour {partner['id']}: {e}")
+                        for contact_id in partner['child_ids']:
+                            all_contact_ids.add(contact_id)
+                
+                if all_contact_ids:
+                    contacts_details = client.execute_kw(
+                        'res.partner',
+                        'read',
+                        [list(all_contact_ids)],
+                        {'fields': ['id', 'name', 'mobile', 'email', 'phone', 'type', 'function', 'parent_id']}
+                    )
+                    contacts_map = {c['id']: c for c in contacts_details}
+                    
+                    # Mapper les contacts par parent
+                    for partner in partners_details:
+                        if partner.get('child_ids'):
+                            partner_contacts = [contacts_map.get(cid) for cid in partner['child_ids'] if cid in contacts_map]
+                            drivers_map[partner['id']] = partner_contacts
+                            
             except Exception as e:
                 logger.warning(f"Erreur enrichissement partenaires: {e}")
         
-        # Enrichir chaque transfert avec les détails des mouvements
+        # Enrichir chaque transfert avec les détails des localisations et acteurs
         for transfer in transfers:
             # Ajouter les détails des localisations
             source_loc_id = transfer['location_id'][0] if isinstance(transfer.get('location_id'), (list, tuple)) else transfer.get('location_id')
             dest_loc_id = transfer['location_dest_id'][0] if isinstance(transfer.get('location_dest_id'), (list, tuple)) else transfer.get('location_dest_id')
             
-            transfer['location_source_details'] = locations_map.get(source_loc_id) if source_loc_id else None
-            transfer['location_destination_details'] = locations_map.get(dest_loc_id) if dest_loc_id else None
+            source_loc = locations_map.get(source_loc_id) if source_loc_id else None
+            dest_loc = locations_map.get(dest_loc_id) if dest_loc_id else None
             
-            # Ajouter les détails du partenaire et du chauffeur si applicable
+            transfer['location_source_details'] = source_loc
+            transfer['location_destination_details'] = dest_loc
+            
+            # Enrichir avec les acteurs du transfert
+            # Source actor: partenaire/chauffeur du transfert
+            source_actor = None
+            if transfer.get('partner_id'):
+                partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
+                source_actor = partners_map.get(partner_id)
+            
+            # Destination actor: toujours null pour by-truck (pas de destination spécifique)
+            dest_actor = None
+            
+            transfer['location_source_actor'] = source_actor
+            transfer['location_destination_actor'] = dest_actor
+            
+            # Ajouter les détails du partenaire principal du transfer et du chauffeur si applicable
             if transfer.get('partner_id'):
                 partner_id = transfer['partner_id'][0] if isinstance(transfer['partner_id'], (list, tuple)) else transfer['partner_id']
                 partner = partners_map.get(partner_id)
                 transfer['partner_details'] = partner
                 
-                # Si c'est un camion (partenaire), chercher le chauffeur
-                if partner and drivers_map.get(partner_id):
-                    # Prendre le premier chauffeur trouvé
-                    drivers = drivers_map.get(partner_id, [])
-                    if drivers:
-                        transfer['driver_details'] = drivers[0]
+                # Initialiser les contacts
+                transfer['driver_details'] = None
+                transfer['related_contacts'] = []
+                
+                # Si c'est un camion (partenaire), récupérer tous les contacts (chauffeurs, etc.)
+                if partner:
+                    if drivers_map.get(partner_id):
+                        # Si des contacts enfants existent
+                        contacts = drivers_map.get(partner_id, [])
+                        transfer['driver_details'] = contacts[0] if contacts else None
+                        transfer['related_contacts'] = [c for c in contacts if c]  # Tous les contacts associés
+                    else:
+                        # Si pas de contacts enfants, au moins ajouter le partenaire lui-même
+                        transfer['related_contacts'] = [partner]
+            else:
+                # Si pas de partner_id, initialiser quand même
+                transfer['partner_details'] = None
+                transfer['driver_details'] = None
+                transfer['related_contacts'] = []
             
             # Récupérer les détails des mouvements de stock
             if transfer.get('move_ids'):
@@ -2581,10 +2766,13 @@ async def get_transfers_by_truck(
                     'partner_id': clean_odoo_value(transfer.get('partner_id')),
                     'partner_details': clean_odoo_value(transfer.get('partner_details')),
                     'driver_details': clean_odoo_value(transfer.get('driver_details')),
+                    'related_contacts': clean_odoo_value(transfer.get('related_contacts')),
                     'location_id': clean_odoo_value(transfer.get('location_id')),
                     'location_dest_id': clean_odoo_value(transfer.get('location_dest_id')),
                     'location_source_details': clean_odoo_value(transfer.get('location_source_details')),
                     'location_destination_details': clean_odoo_value(transfer.get('location_destination_details')),
+                    'location_source_actor': clean_odoo_value(transfer.get('location_source_actor')),
+                    'location_destination_actor': clean_odoo_value(transfer.get('location_destination_actor')),
                     'scheduled_date': clean_odoo_value(transfer.get('scheduled_date')),
                     'date_done': clean_odoo_value(transfer.get('date_done')),
                     'date': clean_odoo_value(transfer.get('date')),

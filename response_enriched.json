@@ -1,0 +1,1069 @@
+{
+  "success": true,
+  "data": {
+    "truck_name": "AX0043RB",
+    "transfer_types": [
+      "outgoing"
+    ],
+    "transfer_types_labels": "Livraisons",
+    "database": "jnp_directe",
+    "transfers": [
+      {
+        "id": 95290,
+        "name": "BURWA/OUT/01620",
+        "code": "261020006370405",
+        "origin": "OVT/2026/04/05/05701",
+        "state": "done",
+        "picking_type_code": "outgoing",
+        "truck_name": "OVT/2026/04/05/05701",
+        "partner_id": [
+          4896,
+          "ETS PAR LA GRACE DE DIEU (PLGD)"
+        ],
+        "partner_details": {
+          "id": 4896,
+          "name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+          "display_name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+          "phone": "+229 95 15 27 01",
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [
+            5,
+            1,
+            2
+          ],
+          "commercial_partner_id": [
+            4896,
+            "ETS PAR LA GRACE DE DIEU (PLGD)"
+          ]
+        },
+        "driver_details": null,
+        "related_contacts": [
+          {
+            "id": 4896,
+            "name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+            "display_name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+            "phone": "+229 95 15 27 01",
+            "mobile": false,
+            "email": false,
+            "type": "contact",
+            "is_company": true,
+            "child_ids": [],
+            "category_id": [
+              5,
+              1,
+              2
+            ],
+            "commercial_partner_id": [
+              4896,
+              "ETS PAR LA GRACE DE DIEU (PLGD)"
+            ]
+          }
+        ],
+        "location_id": [
+          1968,
+          "CAM/AX0043RB"
+        ],
+        "location_dest_id": [
+          5,
+          "Partners/Customers"
+        ],
+        "location_source_details": {
+          "id": 1968,
+          "name": "AX0043RB",
+          "complete_name": "CAM/AX0043RB",
+          "usage": "internal",
+          "active": true,
+          "warehouse_id": [
+            143,
+            "JNP SA - CAMIONS"
+          ],
+          "company_id": [
+            2,
+            "JNP SA"
+          ],
+          "parent_path": "1/1198/1968/",
+          "barcode": false,
+          "location_id": [
+            1198,
+            "CAM"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_destination_details": {
+          "id": 5,
+          "name": "Customers",
+          "complete_name": "Partners/Customers",
+          "usage": "customer",
+          "active": true,
+          "warehouse_id": false,
+          "company_id": false,
+          "parent_path": "2/5/",
+          "barcode": false,
+          "location_id": [
+            2,
+            "Partners"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_source_actor": {
+          "id": 4896,
+          "name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+          "display_name": "ETS PAR LA GRACE DE DIEU (PLGD)",
+          "phone": "+229 95 15 27 01",
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [
+            5,
+            1,
+            2
+          ],
+          "commercial_partner_id": [
+            4896,
+            "ETS PAR LA GRACE DE DIEU (PLGD)"
+          ]
+        },
+        "location_destination_actor": null,
+        "scheduled_date": "2026-07-03 17:37:06",
+        "date_done": "2026-04-05 17:49:28",
+        "date": "2026-04-05 17:37:06",
+        "user_id": null,
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          17,
+          "JNP SA - BUREAUX WANSIROU: Bons de livraison"
+        ],
+        "priority": "0",
+        "date_deadline": "2026-04-05 17:37:06",
+        "move_type": "direct",
+        "group_id": [
+          3047,
+          "OVT/2026/04/05/05701"
+        ],
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          122541
+        ],
+        "move_line_ids": [
+          122178
+        ],
+        "create_date": "2026-04-05 17:37:06",
+        "write_date": "2026-04-05 17:49:28",
+        "create_uid": [
+          1,
+          "OdooBot"
+        ],
+        "write_uid": [
+          599,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 122541,
+            "name": "[SUPER] ESSENCE",
+            "product_id": [
+              2998,
+              "[SUPER] ESSENCE"
+            ],
+            "product_uom_qty": 1,
+            "product_qty": 1,
+            "product_uom": [
+              10,
+              "L"
+            ],
+            "state": "done",
+            "location_id": [
+              1968,
+              "CAM/AX0043RB"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "date": "2026-04-05 17:49:28",
+            "origin": "OVT/2026/04/05/05701",
+            "reference": "BURWA/OUT/01620",
+            "description_picking": "ESSENCE",
+            "product_details": {
+              "id": 2998,
+              "name": "ESSENCE",
+              "display_name": "[SUPER] ESSENCE",
+              "default_code": "SUPER",
+              "barcode": false,
+              "uom_id": [
+                10,
+                "L"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 695,
+              "standard_price": 514.8928000000001
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 122178,
+            "move_id": [
+              122541,
+              "OVT/2026/04/05/05701/SUPER: AX0043RB>Customers"
+            ],
+            "product_id": [
+              2998,
+              "[SUPER] ESSENCE"
+            ],
+            "product_uom_id": [
+              10,
+              "L"
+            ],
+            "qty_done": 1,
+            "quantity": 1,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1968,
+              "CAM/AX0043RB"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "picking_id": [
+              95290,
+              "BURWA/OUT/01620"
+            ],
+            "state": "done",
+            "reference": "BURWA/OUT/01620"
+          }
+        ],
+        "picking_type_details": {
+          "id": 17,
+          "name": "Bons de livraison",
+          "code": "outgoing",
+          "warehouse_id": [
+            4,
+            "JNP SA - BUREAUX WANSIROU"
+          ],
+          "default_location_src_id": [
+            38,
+            "BURWA/IMMO"
+          ],
+          "default_location_dest_id": false,
+          "sequence_code": "OUT"
+        },
+        "product_summary": [
+          {
+            "product_name": "ESSENCE",
+            "product_code": "SUPER",
+            "quantity": 1,
+            "uom": "L"
+          }
+        ]
+      },
+      {
+        "id": 95282,
+        "name": "BURWA/OUT/01619",
+        "code": "261017433140317",
+        "origin": "PO0032",
+        "state": "done",
+        "picking_type_code": "outgoing",
+        "truck_name": "PO0032",
+        "partner_id": [
+          4930,
+          "2 SPA"
+        ],
+        "partner_details": {
+          "id": 4930,
+          "name": "2 SPA",
+          "display_name": "2 SPA",
+          "phone": "+2290162575838",
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            4930,
+            "2 SPA"
+          ]
+        },
+        "driver_details": null,
+        "related_contacts": [
+          {
+            "id": 4930,
+            "name": "2 SPA",
+            "display_name": "2 SPA",
+            "phone": "+2290162575838",
+            "mobile": false,
+            "email": false,
+            "type": "contact",
+            "is_company": true,
+            "child_ids": [],
+            "category_id": [],
+            "commercial_partner_id": [
+              4930,
+              "2 SPA"
+            ]
+          }
+        ],
+        "location_id": [
+          1782,
+          "BTALB/Stock"
+        ],
+        "location_dest_id": [
+          5,
+          "Partners/Customers"
+        ],
+        "location_source_details": {
+          "id": 1782,
+          "name": "Stock",
+          "complete_name": "BTALB/Stock",
+          "usage": "internal",
+          "active": true,
+          "warehouse_id": [
+            186,
+            "JNP SA - BOUTIQUE ALBARIKA"
+          ],
+          "company_id": [
+            2,
+            "JNP SA"
+          ],
+          "parent_path": "1/1781/1782/",
+          "barcode": "BTALB-STOCK",
+          "location_id": [
+            1781,
+            "BTALB"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_destination_details": {
+          "id": 5,
+          "name": "Customers",
+          "complete_name": "Partners/Customers",
+          "usage": "customer",
+          "active": true,
+          "warehouse_id": false,
+          "company_id": false,
+          "parent_path": "2/5/",
+          "barcode": false,
+          "location_id": [
+            2,
+            "Partners"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_source_actor": {
+          "id": 4930,
+          "name": "2 SPA",
+          "display_name": "2 SPA",
+          "phone": "+2290162575838",
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            4930,
+            "2 SPA"
+          ]
+        },
+        "location_destination_actor": null,
+        "scheduled_date": "2026-03-17 14:14:28",
+        "date_done": "2026-03-17 14:19:09",
+        "date": "2026-03-17 14:14:33",
+        "user_id": [
+          599,
+          "API User"
+        ],
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          17,
+          "JNP SA - BUREAUX WANSIROU: Bons de livraison"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": null,
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          122526
+        ],
+        "move_line_ids": [
+          122169
+        ],
+        "create_date": "2026-03-17 14:14:33",
+        "write_date": "2026-03-17 14:19:09",
+        "create_uid": [
+          599,
+          "API User"
+        ],
+        "write_uid": [
+          599,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 122526,
+            "name": " Chaussures de sécurité",
+            "product_id": [
+              2963,
+              " Chaussures de sécurité"
+            ],
+            "product_uom_qty": 1,
+            "product_qty": 1,
+            "product_uom": [
+              1,
+              "Units"
+            ],
+            "state": "done",
+            "location_id": [
+              1782,
+              "BTALB/Stock"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "date": "2026-03-17 14:19:09",
+            "origin": false,
+            "reference": "BURWA/OUT/01619",
+            "description_picking": " Chaussures de sécurité",
+            "product_details": {
+              "id": 2963,
+              "name": " Chaussures de sécurité",
+              "display_name": " Chaussures de sécurité",
+              "default_code": false,
+              "barcode": false,
+              "uom_id": [
+                1,
+                "Units"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 1,
+              "standard_price": 0
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 122169,
+            "move_id": [
+              122526,
+              "PO0032/Stock>Customers"
+            ],
+            "product_id": [
+              2963,
+              " Chaussures de sécurité"
+            ],
+            "product_uom_id": [
+              1,
+              "Units"
+            ],
+            "qty_done": 1,
+            "quantity": 1,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1782,
+              "BTALB/Stock"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "picking_id": [
+              95282,
+              "BURWA/OUT/01619"
+            ],
+            "state": "done",
+            "reference": "BURWA/OUT/01619"
+          }
+        ],
+        "picking_type_details": {
+          "id": 17,
+          "name": "Bons de livraison",
+          "code": "outgoing",
+          "warehouse_id": [
+            4,
+            "JNP SA - BUREAUX WANSIROU"
+          ],
+          "default_location_src_id": [
+            38,
+            "BURWA/IMMO"
+          ],
+          "default_location_dest_id": false,
+          "sequence_code": "OUT"
+        },
+        "product_summary": [
+          {
+            "product_name": " Chaussures de sécurité",
+            "product_code": false,
+            "quantity": 1,
+            "uom": "Units"
+          }
+        ]
+      },
+      {
+        "id": 95280,
+        "name": "BURWA/OUT/01618",
+        "code": "261016938530317",
+        "origin": null,
+        "state": "done",
+        "picking_type_code": "outgoing",
+        "truck_name": null,
+        "partner_id": [
+          11758,
+          "2 GE"
+        ],
+        "partner_details": {
+          "id": 11758,
+          "name": "2 GE",
+          "display_name": "2 GE",
+          "phone": false,
+          "mobile": false,
+          "email": "youssifaley@gmail.com",
+          "type": "contact",
+          "is_company": false,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            11758,
+            "2 GE"
+          ]
+        },
+        "driver_details": null,
+        "related_contacts": [
+          {
+            "id": 11758,
+            "name": "2 GE",
+            "display_name": "2 GE",
+            "phone": false,
+            "mobile": false,
+            "email": "youssifaley@gmail.com",
+            "type": "contact",
+            "is_company": false,
+            "child_ids": [],
+            "category_id": [],
+            "commercial_partner_id": [
+              11758,
+              "2 GE"
+            ]
+          }
+        ],
+        "location_id": [
+          1782,
+          "BTALB/Stock"
+        ],
+        "location_dest_id": [
+          5,
+          "Partners/Customers"
+        ],
+        "location_source_details": {
+          "id": 1782,
+          "name": "Stock",
+          "complete_name": "BTALB/Stock",
+          "usage": "internal",
+          "active": true,
+          "warehouse_id": [
+            186,
+            "JNP SA - BOUTIQUE ALBARIKA"
+          ],
+          "company_id": [
+            2,
+            "JNP SA"
+          ],
+          "parent_path": "1/1781/1782/",
+          "barcode": "BTALB-STOCK",
+          "location_id": [
+            1781,
+            "BTALB"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_destination_details": {
+          "id": 5,
+          "name": "Customers",
+          "complete_name": "Partners/Customers",
+          "usage": "customer",
+          "active": true,
+          "warehouse_id": false,
+          "company_id": false,
+          "parent_path": "2/5/",
+          "barcode": false,
+          "location_id": [
+            2,
+            "Partners"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_source_actor": {
+          "id": 11758,
+          "name": "2 GE",
+          "display_name": "2 GE",
+          "phone": false,
+          "mobile": false,
+          "email": "youssifaley@gmail.com",
+          "type": "contact",
+          "is_company": false,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            11758,
+            "2 GE"
+          ]
+        },
+        "location_destination_actor": null,
+        "scheduled_date": "2026-03-17 13:52:26",
+        "date_done": "2026-03-17 14:14:07",
+        "date": "2026-03-17 13:53:38",
+        "user_id": [
+          599,
+          "API User"
+        ],
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          17,
+          "JNP SA - BUREAUX WANSIROU: Bons de livraison"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": null,
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          122524
+        ],
+        "move_line_ids": [
+          122167
+        ],
+        "create_date": "2026-03-17 13:53:38",
+        "write_date": "2026-03-17 14:14:07",
+        "create_uid": [
+          599,
+          "API User"
+        ],
+        "write_uid": [
+          599,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 122524,
+            "name": " Chaussures de sécurité",
+            "product_id": [
+              2963,
+              " Chaussures de sécurité"
+            ],
+            "product_uom_qty": 1,
+            "product_qty": 1,
+            "product_uom": [
+              1,
+              "Units"
+            ],
+            "state": "done",
+            "location_id": [
+              1782,
+              "BTALB/Stock"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "date": "2026-03-17 14:14:07",
+            "origin": false,
+            "reference": "BURWA/OUT/01618",
+            "description_picking": " Chaussures de sécurité",
+            "product_details": {
+              "id": 2963,
+              "name": " Chaussures de sécurité",
+              "display_name": " Chaussures de sécurité",
+              "default_code": false,
+              "barcode": false,
+              "uom_id": [
+                1,
+                "Units"
+              ],
+              "type": "product",
+              "tracking": "none",
+              "list_price": 1,
+              "standard_price": 0
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 122167,
+            "move_id": [
+              122524,
+              "Stock>Customers"
+            ],
+            "product_id": [
+              2963,
+              " Chaussures de sécurité"
+            ],
+            "product_uom_id": [
+              1,
+              "Units"
+            ],
+            "qty_done": 1,
+            "quantity": 1,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1782,
+              "BTALB/Stock"
+            ],
+            "location_dest_id": [
+              5,
+              "Partners/Customers"
+            ],
+            "picking_id": [
+              95280,
+              "BURWA/OUT/01618"
+            ],
+            "state": "done",
+            "reference": "BURWA/OUT/01618"
+          }
+        ],
+        "picking_type_details": {
+          "id": 17,
+          "name": "Bons de livraison",
+          "code": "outgoing",
+          "warehouse_id": [
+            4,
+            "JNP SA - BUREAUX WANSIROU"
+          ],
+          "default_location_src_id": [
+            38,
+            "BURWA/IMMO"
+          ],
+          "default_location_dest_id": false,
+          "sequence_code": "OUT"
+        },
+        "product_summary": [
+          {
+            "product_name": " Chaussures de sécurité",
+            "product_code": false,
+            "quantity": 1,
+            "uom": "Units"
+          }
+        ]
+      },
+      {
+        "id": 130,
+        "name": "DEPOT/OUT/00001",
+        "code": "261017023560317",
+        "origin": "Retour de DEPOT/IN/00001",
+        "state": "done",
+        "picking_type_code": "outgoing",
+        "truck_name": "Retour de DEPOT/IN/00001",
+        "partner_id": [
+          5105,
+          "DPB"
+        ],
+        "partner_details": {
+          "id": 5105,
+          "name": "DPB",
+          "display_name": "DPB",
+          "phone": false,
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            5105,
+            "DPB"
+          ]
+        },
+        "driver_details": null,
+        "related_contacts": [
+          {
+            "id": 5105,
+            "name": "DPB",
+            "display_name": "DPB",
+            "phone": false,
+            "mobile": false,
+            "email": false,
+            "type": "contact",
+            "is_company": true,
+            "child_ids": [],
+            "category_id": [],
+            "commercial_partner_id": [
+              5105,
+              "DPB"
+            ]
+          }
+        ],
+        "location_id": [
+          1183,
+          "DEPOT/Stock"
+        ],
+        "location_dest_id": [
+          4,
+          "Partners/Vendors"
+        ],
+        "location_source_details": {
+          "id": 1183,
+          "name": "Stock",
+          "complete_name": "DEPOT/Stock",
+          "usage": "internal",
+          "active": true,
+          "warehouse_id": [
+            141,
+            "JNP SA - DEPOT SOMMIER"
+          ],
+          "company_id": [
+            2,
+            "JNP SA"
+          ],
+          "parent_path": "1/1182/1183/",
+          "barcode": "DEPOT-STOCK",
+          "location_id": [
+            1182,
+            "DEPOT"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_destination_details": {
+          "id": 4,
+          "name": "Vendors",
+          "complete_name": "Partners/Vendors",
+          "usage": "supplier",
+          "active": true,
+          "warehouse_id": false,
+          "company_id": false,
+          "parent_path": "2/4/",
+          "barcode": false,
+          "location_id": [
+            2,
+            "Partners"
+          ],
+          "comment": false,
+          "scrap_location": false,
+          "removal_strategy_id": false
+        },
+        "location_source_actor": {
+          "id": 5105,
+          "name": "DPB",
+          "display_name": "DPB",
+          "phone": false,
+          "mobile": false,
+          "email": false,
+          "type": "contact",
+          "is_company": true,
+          "child_ids": [],
+          "category_id": [],
+          "commercial_partner_id": [
+            5105,
+            "DPB"
+          ]
+        },
+        "location_destination_actor": null,
+        "scheduled_date": "2024-09-12 11:54:27",
+        "date_done": "2024-09-12 12:00:29",
+        "date": "2024-09-11 04:35:01",
+        "user_id": null,
+        "company_id": [
+          2,
+          "JNP SA"
+        ],
+        "products_availability": null,
+        "products_availability_state": null,
+        "note": null,
+        "picking_type_id": [
+          1235,
+          "JNP SA - DEPOT SOMMIER: Bons de livraison"
+        ],
+        "priority": "0",
+        "date_deadline": null,
+        "move_type": "direct",
+        "group_id": [
+          41,
+          "P00008"
+        ],
+        "has_packages": null,
+        "is_locked": true,
+        "move_ids": [
+          746
+        ],
+        "move_line_ids": [
+          667
+        ],
+        "create_date": "2024-09-12 11:54:26",
+        "write_date": "2026-03-17 13:56:23",
+        "create_uid": [
+          2,
+          "Administrator"
+        ],
+        "write_uid": [
+          599,
+          "API User"
+        ],
+        "move_details": [
+          {
+            "id": 746,
+            "name": "[ESS] ESSENCE",
+            "product_id": [
+              774,
+              "[ESS] ESSENCE"
+            ],
+            "product_uom_qty": 297500,
+            "product_qty": 297500,
+            "product_uom": [
+              10,
+              "L"
+            ],
+            "state": "done",
+            "location_id": [
+              1183,
+              "DEPOT/Stock"
+            ],
+            "location_dest_id": [
+              4,
+              "Partners/Vendors"
+            ],
+            "date": "2024-09-12 12:00:29",
+            "origin": "P00008",
+            "reference": "DEPOT/OUT/00001",
+            "description_picking": "[ESS] ESSENCE",
+            "product_details": {
+              "id": 774,
+              "name": "ESSENCE",
+              "display_name": "[ESS] ESSENCE",
+              "default_code": "ESS",
+              "barcode": false,
+              "uom_id": [
+                10,
+                "L"
+              ],
+              "type": "consu",
+              "tracking": "none",
+              "list_price": 680,
+              "standard_price": 499.18600000000004
+            }
+          }
+        ],
+        "move_line_details": [
+          {
+            "id": 667,
+            "move_id": [
+              746,
+              "Retour de DEPOT/IN/00001/ESS: Stock>Vendors"
+            ],
+            "product_id": [
+              774,
+              "[ESS] ESSENCE"
+            ],
+            "product_uom_id": [
+              10,
+              "L"
+            ],
+            "qty_done": 297500,
+            "quantity": 297500,
+            "lot_id": false,
+            "lot_name": false,
+            "location_id": [
+              1183,
+              "DEPOT/Stock"
+            ],
+            "location_dest_id": [
+              4,
+              "Partners/Vendors"
+            ],
+            "picking_id": [
+              130,
+              "DEPOT/OUT/00001"
+            ],
+            "state": "done",
+            "reference": "DEPOT/OUT/00001"
+          }
+        ],
+        "picking_type_details": {
+          "id": 1235,
+          "name": "Bons de livraison",
+          "code": "outgoing",
+          "warehouse_id": [
+            141,
+            "JNP SA - DEPOT SOMMIER"
+          ],
+          "default_location_src_id": [
+            1183,
+            "DEPOT/Stock"
+          ],
+          "default_location_dest_id": false,
+          "sequence_code": "OUT"
+        },
+        "product_summary": [
+          {
+            "product_name": "ESSENCE",
+            "product_code": "ESS",
+            "quantity": 297500,
+            "uom": "L"
+          }
+        ]
+      }
+    ],
+    "filters_applied": {
+      "truck_name": "AX0043RB",
+      "transfer_type": "outgoing",
+      "state": null,
+      "date_from": null,
+      "date_to": null
+    },
+    "pagination": {
+      "total_count": 4,
+      "page": 1,
+      "page_size": 50,
+      "total_pages": 1,
+      "current_count": 4
+    }
+  },
+  "message": "Trouvé 4 transfert(s) (Livraisons) sur 4 pour le camion 'AX0043RB' (page 1/1)",
+  "count": 4
+}
