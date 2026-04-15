@@ -1634,24 +1634,63 @@ async def get_pos_inventory_transfers(
         
         pos_config = pos_config[0]
         
-        # Construire le domaine de recherche de manière simple et robuste
+        # Construire le domaine de recherche
+        # STRATÉGIE: Filtrer par location_dest_id OU location_id pour attraper TOUS les transferts du PDV
+        # - Arrivées (incoming/internal) : location_dest_id ILIKE "JO70/"
+        # - Sorties (outgoing/internal) : location_id ILIKE "JO70/"
+        # - Internes : location_id OU location_dest_id ILIKE "JO70/"
         domain = []
         
-        # Filtrer par warehouse du PDV via picking_type_id.warehouse_id
-        # (stock.picking n'a pas de warehouse_id direct, mais via picking_type_id)
         if pos_config.get('warehouse_id'):
             try:
                 warehouse_id = pos_config['warehouse_id'][0] if isinstance(pos_config['warehouse_id'], list) else pos_config['warehouse_id']
-                domain.append(('picking_type_id.warehouse_id', '=', warehouse_id))
-                logger.info(f"Filtrage par warehouse du PDV (via picking_type): {warehouse_id}")
+                logger.info(f"PDV {pos_config['name']} - warehouse_id: {warehouse_id}")
+                
+                # Extraire le code du PDV
+                pos_name_short = pos_config['name'].split()[0]  # "JO70" de "JO70 COVE"
+                pos_location_pattern = f"{pos_name_short}/"  # "JO70/"
+                logger.info(f"Cherchant transferts pour PDV '{pos_name_short}' (pattern: '{pos_location_pattern}')")
+                
+                # Chercher les locations qui contiennent le code PDV dans leur chemin complet
+                pos_locations = client.execute_kw(
+                    'stock.location',
+                    'search',
+                    [[
+                        ('warehouse_id', '=', warehouse_id),
+                        ('usage', '=', 'internal'),
+                        ('complete_name', 'ilike', pos_location_pattern)  # "JO70/"
+                    ]],
+                    {}
+                )
+                
+                if pos_locations:
+                    logger.info(f"Trouvé {len(pos_locations)} emplacements pour PDV {pos_name_short}")
+                    # Filtrer les transferts où location_id OU location_dest_id appartient au PDV
+                    # Cela capture :
+                    # - Les arrivées (location_dest_id = JO70/Stock)
+                    # - Les sorties (location_id = JO70/Stock)
+                    # - Les internes (les deux)
+                    domain = ['|',
+                        ('location_dest_id', 'in', pos_locations),
+                        ('location_id', 'in', pos_locations)
+                    ]
+                else:
+                    logger.warning(f"Aucun emplacement trouvé pour PDV {pos_name_short}")
+                    # Fallback: filtrer directement par ilike sur complete_name
+                    # Cela capture les transferts arrivant ET partant du PDV
+                    logger.info(f"Fallback: cherchant par location_id ou location_dest_id ilike '{pos_location_pattern}'...")
+                    domain = ['|',
+                        ('location_dest_id.complete_name', 'ilike', pos_location_pattern),
+                        ('location_id.complete_name', 'ilike', pos_location_pattern)
+                    ]
             except Exception as e:
-                logger.warning(f"Impossible de filtrer par warehouse: {e}")
-                # Fallback: filtrer par société si warehouse n'est pas disponible
+                logger.error(f"Erreur récupération locations PDV: {e}")
+                # Fallback: filtrer par société
                 if pos_config.get('company_id'):
                     try:
                         company_id = pos_config['company_id'][0] if isinstance(pos_config['company_id'], list) else pos_config['company_id']
                         domain.append(('company_id', '=', company_id))
-                        logger.info(f"Fallback: Filtrage par company_id: {company_id}")
+                        logger.info(f"Fallback after error: Filtrage par company_id: {company_id}")
                     except Exception as e2:
                         logger.warning(f"Impossible de filtrer par société: {e2}")
         elif pos_config.get('company_id'):
