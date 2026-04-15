@@ -36,7 +36,7 @@ JPASS_JOURNAL_ID = 194                       # Journal PASS GD pour paiement kki
 WEBHOOK_ACTION = "COMPANY_SUPPLY_VALIDATION" # Action webhook quand facture payée
 
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
-WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", None)
+WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", "https://api-jnp-stg.opensi.co/public/odoo/webhook")
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
 
 
@@ -633,9 +633,9 @@ def _parse_supply_tag(narration: str) -> tuple:
 # WEBHOOK
 # ============================================================
 
-async def send_supply_validation_webhook(supply_id: str, invoice_id: int):
+async def send_supply_validation_webhook_async(supply_id: str, invoice_id: int):
     """
-    Envoyer le webhook COMPANY_SUPPLY_VALIDATION quand la facture est payée.
+    Fonction async pour envoyer le webhook COMPANY_SUPPLY_VALIDATION.
     
     Envoie vers les deux URLs configurées (dev + stg) en parallèle avec le même payload.
 
@@ -685,6 +685,28 @@ async def send_supply_validation_webhook(supply_id: str, invoice_id: int):
 
     except Exception as e:
         logger.error(f"❌ Erreur envoi webhook: {e}")
+
+
+def send_supply_validation_webhook(supply_id: str, invoice_id: int):
+    """
+    Wrapper synchrone pour exécuter le webhook async via BackgroundTasks.
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Si une boucle est déjà en cours, créer une nouvelle boucle
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    send_supply_validation_webhook_async(supply_id, invoice_id)
+                )
+                future.result()
+        else:
+            asyncio.run(send_supply_validation_webhook_async(supply_id, invoice_id))
+    except Exception as e:
+        logger.error(f"❌ Erreur dans wrapper webhook: {e}")
 
 
 # ============================================================
