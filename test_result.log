@@ -1,7 +1,0 @@
-🔑 Génération du JWT token...
-✅ Token généré: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZ...
-
-📡 Appel: GET http://127.0.0.1:8002/api/pos/4/inventory/transfers
-
-❌ Erreur connexion: HTTP Error 404: Not Found
-  Vérifiez que le serveur est lancé sur http://127.0.0.1:8002
