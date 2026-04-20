@@ -298,7 +298,7 @@ async def create_record(
 @router.post("/odoo/companies", response_model=ApiResponse, tags=["Odoo - Écriture"])
 async def create_company(
     request: CompanyCreateRequest,
-    current_user: dict = Depends(require_scope("write"))
+    current_user: dict = Depends(require_scope("pos"))
 ):
     """Créer une nouvelle entreprise (res.partner) avec les champs essentiels."""
 
@@ -321,12 +321,26 @@ async def create_company(
             }
         )
 
-        if salesperson_id:
+        if salesperson_id and salesperson_id > 0:
             values["user_id"] = salesperson_id
-        if payment_term_id:
+        
+        if payment_term_id and payment_term_id > 0:
             values["property_payment_term_id"] = payment_term_id
-        if category_ids:
-            values["category_id"] = [(6, 0, category_ids)]
+        
+        # Valider et assigner les catégories
+        if category_ids and any(cid > 0 for cid in category_ids):
+            # Filtrer les IDs valides (> 0)
+            valid_category_ids = [cid for cid in category_ids if cid > 0]
+            if valid_category_ids:
+                # Vérifier que les catégories existent
+                existing_categories = client.execute_kw(
+                    "res.partner.category",
+                    "search",
+                    [[("id", "in", valid_category_ids)]]
+                )
+                if existing_categories:
+                    values["category_id"] = [(6, 0, existing_categories)]
+        
         if note:
             values["comment"] = note
 
@@ -357,6 +371,77 @@ async def create_company(
             data={"id": new_partner_id, "partner": partner_data[0] if partner_data else None},
             message=f"Entreprise créée avec succès (ID {new_partner_id})",
         )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de l'entreprise: {str(e)}")
+
+
+@router.get("/odoo/companies/categories", response_model=ApiResponse, tags=["Odoo - Lecture"])
+async def get_company_categories(
+    current_user: dict = Depends(require_scope("pos")),
+    search: Optional[str] = Query(None, description="Recherche par nom de catégorie"),
+    limit: int = Query(100, ge=1, le=1000, description="Nombre maximum de catégories à retourner"),
+    offset: int = Query(0, ge=0, description="Décalage pour la pagination")
+):
+    """
+    Récupérer les catégories d'entreprises disponibles.
+    
+    Cette API permet d'obtenir la liste des catégories (res.partner.category) disponibles dans Odoo.
+    Utile pour assigner des catégories lors de la création ou modification d'une entreprise.
+    
+    **Paramètres:**
+    - **search**: Recherche textuelle sur le nom de la catégorie (optionnel)
+    - **limit**: Nombre maximum de catégories à retourner (défaut: 100, max: 1000)
+    - **offset**: Décalage pour la pagination (défaut: 0)
+    
+    **Retour:**
+    - **success**: Indique si la requête a réussi
+    - **data**: Liste des catégories avec id, name, color
+    - **count**: Nombre total de catégories trouvées
+    - **message**: Message informatif
+    
+    **Exemple d'utilisation:**
+    ```
+    GET /odoo/companies/categories?search=Client&limit=50&offset=0
+    ```
+    """
+    try:
+        client = get_odoo_client(current_user)
+        
+        # Construire le domaine de recherche
+        domain = []
+        if search:
+            domain.append(('name', 'ilike', search))
+        
+        # Compter le total
+        total_count = client.execute_kw(
+            'res.partner.category',
+            'search_count',
+            [domain]
+        )
+        
+        # Récupérer les catégories
+        categories = client.execute_kw(
+            'res.partner.category',
+            'search_read',
+            [domain],
+            {
+                'fields': ['id', 'name', 'color', 'parent_id'],
+                'limit': limit,
+                'offset': offset,
+                'order': 'name asc'
+            }
+        )
+        
+        return ApiResponse(
+            success=True,
+            data=categories,
+            count=len(categories),
+            message=f"Trouvé {len(categories)} catégorie(s) d'entreprise(s) (total: {total_count})"
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des catégories: {str(e)}")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la création de l'entreprise: {str(e)}")
