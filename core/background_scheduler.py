@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 WEBHOOK_URL = os.getenv("FUEL_WEBHOOK_URL", "https://api-jnp-dev.opensi.co/public/odoo/webhook")
 # Optional staging webhook URL - if set we will call both dev and staging
-WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", None)  # e.g. https://api-jnp-stg.opensi.co/public/odoo/webhook
+WEBHOOK_URL_STG = os.getenv("FUEL_WEBHOOK_URL_STG", "https://api-jnp-stg.opensi.co/public/odoo/webhook")
 CHECK_INTERVAL = int(os.getenv("CREDIT_CHECK_INTERVAL", "60"))  # 60 secondes par défaut
 WEBHOOK_TIMEOUT = int(os.getenv("FUEL_WEBHOOK_TIMEOUT", "10"))
 

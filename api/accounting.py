@@ -687,27 +687,6 @@ async def send_supply_validation_webhook_async(supply_id: str, invoice_id: int):
         logger.error(f"❌ Erreur envoi webhook: {e}")
 
 
-def send_supply_validation_webhook(supply_id: str, invoice_id: int):
-    """
-    Wrapper synchrone pour exécuter le webhook async via BackgroundTasks.
-    """
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Si une boucle est déjà en cours, créer une nouvelle boucle
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    send_supply_validation_webhook_async(supply_id, invoice_id)
-                )
-                future.result()
-        else:
-            asyncio.run(send_supply_validation_webhook_async(supply_id, invoice_id))
-    except Exception as e:
-        logger.error(f"❌ Erreur dans wrapper webhook: {e}")
-
 
 # ============================================================
 # ENDPOINT PRINCIPAL
@@ -867,7 +846,7 @@ async def credit_customer_account(
 
             # Envoyer le webhook immédiatement en arrière-plan
             background_tasks.add_task(
-                send_supply_validation_webhook,
+                send_supply_validation_webhook_async,
                 supply_id=credit_request.supply_id,
                 invoice_id=invoice_id
             )
