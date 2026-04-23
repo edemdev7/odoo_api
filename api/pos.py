@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 from models.schemas import (
-    PosProductSearchRequest, PosOrderCreateRequest, PosShopUpdateRequest, 
+    PosProductSearchRequest, PosOrderCreateRequest, PosShopUpdateRequest,
     PosShopArchiveRequest, PosShop, PosSessionStatus, PosSessionInitializeRequest,
     PosSessionResponse, PosPump, PosOpenSessionRequest, PosCloseSessionRequest,
     PumpDetails, PumpSelectionRequest, PosOrderCreateFullRequest,
@@ -13,7 +13,8 @@ from models.schemas import (
     PosCreateRequest, PosEmployeeAssignmentRequest, PosConfigResponse,
     ProductCreateRequest, PosProductAssignmentRequest, StockMovementRequest,
     StockLevelRequest, ProductStockResponse, StockPickingResponse,
-    StockPickingStateUpdateRequest, StockPickingListRequest
+    StockPickingStateUpdateRequest, StockPickingListRequest,
+    PosOrderCreateSimpleRequest, PosAddPaymentRequest
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -5350,6 +5351,291 @@ async def get_payment_methods(
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des méthodes de paiement: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+@router.post("/{pos_id}/orders", response_model=ApiResponse)
+async def create_pos_order_only(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    request: PosOrderCreateSimpleRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Créer une commande POS sans paiement
+
+    Crée une commande en état **draft**, prête à recevoir des paiements.
+    Appelez ensuite `POST /{pos_id}/orders/{order_id}/payments` pour enregistrer chaque paiement.
+
+    **Corps de la requête :**
+    ```json
+    {
+      "session_id": 123,
+      "lines": [
+        {
+          "product_id": 42,
+          "qty": 2.5,
+          "price_unit": 600,
+          "discount": 0,
+          "note": "note optionnelle"
+        }
+      ],
+      "partner_id": null,
+      "note": "note globale optionnelle"
+    }
+    ```
+
+    **Réponse :**
+    - `order_id` : ID Odoo de la commande créée
+    - `amount_total` : montant total à payer
+    - `amount_due` : montant restant à payer (= amount_total à la création)
+    - `payment_status` : `unpaid` | `partial` | `paid`
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # Vérifier que la session existe et est ouverte
+        session_data = client.execute_kw(
+            'pos.session', 'read', [request.session_id],
+            {'fields': ['id', 'state', 'config_id', 'user_id']}
+        )
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session POS non trouvée")
+
+        session = session_data[0]
+        if session['config_id'][0] != pos_id:
+            raise HTTPException(status_code=400, detail="La session n'appartient pas à ce point de vente")
+        if session['state'] != 'opened':
+            raise HTTPException(status_code=400, detail=f"La session n'est pas ouverte (état: {session['state']})")
+
+        # Valider les produits et préparer les lignes
+        order_lines = []
+        amount_total = 0.0
+
+        for line in request.lines:
+            product = client.execute_kw(
+                'product.product', 'search_read',
+                [[('id', '=', line.product_id)]],
+                {'fields': ['id', 'name', 'list_price', 'type'], 'limit': 1}
+            )
+            if not product:
+                raise HTTPException(status_code=400, detail=f"Produit {line.product_id} non trouvé dans Odoo")
+
+            product_info = product[0]
+            line_total = line.qty * line.price_unit * (1 - (line.discount or 0) / 100)
+            amount_total += line_total
+
+            line_vals = {
+                'product_id': line.product_id,
+                'qty': line.qty,
+                'price_unit': line.price_unit,
+                'discount': line.discount or 0.0,
+                'price_subtotal': line_total,
+                'price_subtotal_incl': line_total,
+                'full_product_name': product_info['name'],
+            }
+
+            # Construire la note de ligne (infos pompe + note manuelle)
+            note_parts = []
+            if line.pump_id is not None:
+                note_parts.append(f"Pompe #{line.pump_id}")
+            if line.start_pump_index is not None and line.end_pump_index is not None:
+                note_parts.append(f"Index: {line.start_pump_index} → {line.end_pump_index}")
+                note_parts.append(f"Volume: {line.end_pump_index - line.start_pump_index:.2f}L")
+            if line.note:
+                note_parts.append(line.note)
+            if note_parts:
+                line_vals['note'] = " | ".join(note_parts)
+
+            order_lines.append((0, 0, line_vals))
+
+        # Créer la commande sans paiement (state=draft)
+        user_id_val = session['user_id'][0] if isinstance(session.get('user_id'), list) else session.get('user_id', 1)
+        order_vals = {
+            'session_id': request.session_id,
+            'pos_reference': f"Order-{pos_id}-{int(time.time())}",
+            'user_id': user_id_val,
+            'lines': order_lines,
+            'amount_total': amount_total,
+            'amount_paid': 0.0,
+            'amount_return': 0.0,
+            'amount_tax': 0.0,
+            'state': 'draft',
+            'date_order': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+        if request.partner_id:
+            order_vals['partner_id'] = request.partner_id
+        if current_user.get('employee_id'):
+            order_vals['employee_id'] = current_user['employee_id']
+        if request.note:
+            order_vals['note'] = request.note
+
+        order_id = client.execute_kw('pos.order', 'create', [order_vals])
+        logger.info(f"Commande {order_id} créée (draft) - PDV {pos_id} - Montant: {amount_total}")
+
+        return ApiResponse(
+            success=True,
+            data={
+                'order_id': order_id,
+                'pos_reference': order_vals['pos_reference'],
+                'session_id': request.session_id,
+                'partner_id': request.partner_id,
+                'amount_total': amount_total,
+                'amount_paid': 0.0,
+                'amount_due': amount_total,
+                'amount_return': 0.0,
+                'payment_status': 'unpaid',
+                'lines_count': len(request.lines),
+                'state': 'draft'
+            },
+            message=f"Commande créée — Montant à payer: {amount_total}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur création commande PDV {pos_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
+
+
+@router.post("/{pos_id}/orders/{order_id}/payments", response_model=ApiResponse)
+async def add_payment_to_order(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    order_id: int = Path(..., description="ID de la commande POS"),
+    request: PosAddPaymentRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Ajouter un ou plusieurs paiements à une commande POS existante
+
+    Peut être appelé **plusieurs fois** sur la même commande (paiement partiel),
+    et accepte **plusieurs modes de paiement en un seul appel**.
+
+    La commande passe automatiquement en état **paid** quand le total payé ≥ montant total.
+
+    **Exemples de corps :**
+
+    Un seul mode :
+    ```json
+    {
+      "payments": [
+        { "payment_method_id": 1, "amount": 1500.0 }
+      ]
+    }
+    ```
+
+    Plusieurs modes simultanés :
+    ```json
+    {
+      "payments": [
+        { "payment_method_id": 1, "amount": 500.0 },
+        { "payment_method_id": 3, "amount": 1000.0 }
+      ]
+    }
+    ```
+
+    **Réponse :**
+    - `payments_added` : liste des paiements créés (avec leur `payment_id`)
+    - `total_paid` : cumul de tous les paiements sur la commande
+    - `amount_due` : reste à payer (0 si soldée)
+    - `amount_return` : monnaie rendue si surpaiement
+    - `payment_status` : `unpaid` | `partial` | `paid`
+    - `is_complete` : `true` si la commande est soldée
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # Vérifier que la commande existe
+        order_data = client.execute_kw(
+            'pos.order', 'read', [order_id],
+            {'fields': ['id', 'session_id', 'state', 'amount_total', 'amount_paid', 'amount_return']}
+        )
+        if not order_data:
+            raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
+
+        order = order_data[0]
+
+        # Vérifier que la commande appartient au bon PDV
+        session_id_val = order['session_id'][0] if isinstance(order['session_id'], list) else order['session_id']
+        session_data = client.execute_kw(
+            'pos.session', 'read', [session_id_val],
+            {'fields': ['config_id', 'state']}
+        )
+        if not session_data or session_data[0]['config_id'][0] != pos_id:
+            raise HTTPException(status_code=400, detail="La commande n'appartient pas à ce point de vente")
+
+        # Vérifier l'état de la commande
+        if order['state'] in ('paid', 'done', 'invoiced'):
+            raise HTTPException(status_code=400, detail=f"La commande est déjà soldée (état: {order['state']})")
+        if order['state'] == 'cancel':
+            raise HTTPException(status_code=400, detail="La commande est annulée")
+
+        amount_total = float(order['amount_total'])
+        current_paid = float(order['amount_paid'] or 0)
+        payment_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Créer chaque paiement dans Odoo
+        payments_added = []
+        total_this_call = 0.0
+
+        for p in request.payments:
+            payment_id = client.execute_kw('pos.payment', 'create', [{
+                'pos_order_id': order_id,
+                'payment_method_id': p.payment_method_id,
+                'amount': p.amount,
+                'payment_date': payment_date,
+            }])
+            payments_added.append({
+                'payment_id': payment_id,
+                'payment_method_id': p.payment_method_id,
+                'amount': p.amount,
+            })
+            total_this_call += p.amount
+            logger.info(f"Paiement {payment_id} créé — Commande {order_id}: {p.amount} (méthode {p.payment_method_id})")
+
+        # Recalculer les montants
+        new_paid = current_paid + total_this_call
+        amount_return = max(0.0, new_paid - amount_total)
+        amount_due = max(0.0, amount_total - new_paid)
+        is_complete = new_paid >= amount_total
+
+        if is_complete:
+            client.execute_kw('pos.order', 'write', [[order_id], {
+                'state': 'paid',
+                'amount_return': amount_return,
+            }])
+            payment_status = 'paid'
+            logger.info(f"Commande {order_id} soldée — payé: {new_paid}, rendu: {amount_return}")
+        else:
+            payment_status = 'partial'
+
+        return ApiResponse(
+            success=True,
+            data={
+                'order_id': order_id,
+                'payments_added': payments_added,
+                'amount_paid_this_call': total_this_call,
+                'total_paid': new_paid,
+                'amount_total': amount_total,
+                'amount_due': amount_due,
+                'amount_return': amount_return,
+                'payment_status': payment_status,
+                'is_complete': is_complete,
+            },
+            message=(
+                f"Commande soldée — Rendu: {amount_return}" if is_complete
+                else f"{len(payments_added)} paiement(s) enregistré(s) — Reste à payer: {amount_due}"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur ajout paiement commande {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors du paiement: {str(e)}")
+
 
 @router.post("/{pos_id}/create-order", response_model=ApiResponse)
 async def create_complete_pos_order(

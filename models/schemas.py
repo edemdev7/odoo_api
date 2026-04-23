@@ -214,6 +214,7 @@ class PosOrderLine(BaseModel):
     discount: Optional[float] = Field(0.0, description="Remise en pourcentage")
     start_pump_index: Optional[float] = Field(None, description="Index pompe début")
     end_pump_index: Optional[float] = Field(None, description="Index pompe fin")
+    note: Optional[str] = Field(None, description="Note sur la ligne")
 
 class PosPayment(BaseModel):
     payment_method_id: int = Field(..., description="ID de la méthode de paiement")
@@ -230,6 +231,17 @@ class PosOrderCreateFullRequest(BaseModel):
     # Rétrocompatibilité : support de l'ancien format
     payment_method_id: Optional[int] = Field(None, description="[DEPRECATED] Utiliser 'payments' à la place")
     amount_paid: Optional[float] = Field(None, description="[DEPRECATED] Utiliser 'payments' à la place")
+
+class PosOrderCreateSimpleRequest(BaseModel):
+    """Créer une commande POS sans paiement"""
+    session_id: int = Field(..., description="ID de la session POS")
+    lines: List[PosOrderLine] = Field(..., description="Lignes de commande")
+    partner_id: Optional[int] = Field(None, description="ID du client (optionnel)")
+    note: Optional[str] = Field(None, description="Note sur la commande")
+
+class PosAddPaymentRequest(BaseModel):
+    """Ajouter un ou plusieurs paiements à une commande existante"""
+    payments: List[PosPayment] = Field(..., min_length=1, description="Liste des paiements (un ou plusieurs modes)")
 
 class CashRegisterCloseRequest(BaseModel):
     ending_balance: float = Field(..., description="Solde de fermeture déclaré")
