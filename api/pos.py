@@ -6152,7 +6152,42 @@ async def get_companies(
                 'order': 'name asc'
             }
         )
-        
+
+        if companies:
+            partner_ids = [c['id'] for c in companies]
+
+            # Calculer le solde réel depuis account.move.line (bypass le champ calculé
+            # res.partner.credit qui est limité à la société active du user API).
+            # On somme toutes les écritures receivable non-lettrées de toutes les sociétés.
+            try:
+                balance_rows = client.execute_kw(
+                    'account.move.line',
+                    'read_group',
+                    [[
+                        ('partner_id', 'in', partner_ids),
+                        ('account_id.account_type', '=', 'asset_receivable'),
+                        ('reconciled', '=', False),
+                        ('parent_state', '=', 'posted'),
+                    ]],
+                    {
+                        'groupby': ['partner_id'],
+                        'fields': ['partner_id', 'debit:sum', 'credit:sum'],
+                        'lazy': False,
+                    }
+                )
+                balance_map = {
+                    (row['partner_id'][0] if isinstance(row['partner_id'], list) else row['partner_id']):
+                    round(row.get('debit', 0) - row.get('credit', 0), 2)
+                    for row in balance_rows
+                }
+            except Exception as e:
+                logger.warning(f"Impossible de calculer les soldes depuis account.move.line: {e}")
+                balance_map = {}
+
+            for company in companies:
+                # Remplacer le credit calculé par société avec le vrai solde toutes sociétés
+                company['credit'] = balance_map.get(company['id'], 0.0)
+
         return ApiResponse(
             success=True,
             data={

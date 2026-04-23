@@ -882,11 +882,36 @@ async def credit_customer_account(
             logger.info(f"📝 Facture {invoice_number} en attente de rapprochement bancaire (admin)")
 
         # ===== 9. PRÉPARER LA RÉPONSE =====
-        final_partner = client.execute_kw(
-            'res.partner', 'read', [credit_request.partner_id],
-            {'fields': ['credit', 'debit']}
-        )
-        new_balance = final_partner[0]['credit'] if final_partner else None
+        # Calculer le solde réel depuis account.move.line pour toutes les sociétés
+        # (res.partner.credit est limité à la société active de l'utilisateur API)
+        def _compute_partner_balance(client, partner_id):
+            try:
+                rows = client.execute_kw(
+                    'account.move.line',
+                    'read_group',
+                    [[
+                        ('partner_id', '=', partner_id),
+                        ('account_id.account_type', '=', 'asset_receivable'),
+                        ('reconciled', '=', False),
+                        ('parent_state', '=', 'posted'),
+                    ]],
+                    {
+                        'groupby': ['partner_id'],
+                        'fields': ['partner_id', 'debit:sum', 'credit:sum'],
+                        'lazy': False,
+                    }
+                )
+                return round(rows[0].get('debit', 0) - rows[0].get('credit', 0), 2) if rows else 0.0
+            except Exception as e:
+                logger.warning(f"Impossible de calculer le solde depuis account.move.line: {e}")
+                return None
+
+        old_balance = _compute_partner_balance(client, credit_request.partner_id)
+        new_balance = old_balance  # sera recalculé après l'écriture
+
+        # Pour kkiapay: la facture est immédiatement lettrée (paid), credit revient à 0 → normal
+        # Pour bank: la facture reste ouverte (in_payment), credit augmente → visible ici
+        new_balance = _compute_partner_balance(client, credit_request.partner_id)
 
         response_data = {
             'order_id': order_id,
@@ -906,8 +931,17 @@ async def credit_customer_account(
                 'name': product['name'],
                 'code': product.get('default_code', TVPASS_PRODUCT_CODE)
             },
-            'old_balance': partner['credit'],
-            'new_balance': new_balance,
+            'balance': {
+                'before': old_balance,
+                'after': new_balance,
+                'note': (
+                    "Solde kkiapay: facture immédiatement lettrée (état=paid), le solde revient à son niveau précédent. "
+                    "C'est le comportement normal — la facture est réglée."
+                ) if credit_request.payment_method == PaymentMethodEnum.kkiapay else (
+                    "Solde bank: facture en attente de rapprochement admin (état=in_payment). "
+                    "Le solde augmente jusqu'au rapprochement bancaire."
+                )
+            },
             'webhook_sent': webhook_sent,
         }
 
