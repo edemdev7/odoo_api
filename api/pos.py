@@ -3669,42 +3669,72 @@ async def get_all_trucks(
 
 @router.get("/products/fuel", response_model=ApiResponse)
 async def get_fuel_products(
-    pos_id: Optional[int] = Query(None, description="ID du point de vente pour filtrer par catégorie"),
+    pos_id: int = Query(..., description="ID du point de vente"),
     search: Optional[str] = Query(None, description="Rechercher un produit par nom"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
-    Récupérer les produits de type carburant/fuel disponibles dans Odoo
-    
-    Cette route est utilisée pour associer des produits aux pompes lors de la configuration.
-    Elle retourne tous les produits qui peuvent être vendus dans un point de vente.
-    
+    Récupérer les produits disponibles pour un point de vente spécifique.
+
+    Respecte la configuration Odoo du POS :
+    - Si le POS a des catégories restreintes (`iface_available_categ_ids`), seuls
+      les produits de ces catégories sont retournés.
+    - Sinon, tous les produits `available_in_pos=True` de la base sont retournés.
+
     **Paramètres :**
-    - **pos_id** : Filtrer par point de vente (optionnel)
+    - **pos_id** : ID du point de vente (obligatoire)
     - **search** : Rechercher par nom (optionnel)
-    
-    **Informations retournées :**
-    - Liste des produits avec ID, nom, prix, code-barres
-    - Catégorie du produit
-    - Unité de mesure
-    
+
     **Requires:** Authentification JWT avec scope 'pos'
     """
     try:
         client = get_odoo_client(current_user)
-        
+
+        # Récupérer la config du POS pour connaître ses catégories restreintes
+        pos_config = client.execute_kw(
+            'pos.config', 'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'iface_available_categ_ids'], 'limit': 1}
+        )
+        if not pos_config:
+            raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
+
+        pos_name = pos_config[0]['name']
+        allowed_categ_ids = pos_config[0].get('iface_available_categ_ids') or []
+
         # Construire le domaine de recherche
         domain = [
-            ('available_in_pos', '=', True),  # Disponible dans POS
-            ('sale_ok', '=', True),  # Peut être vendu
-            ('active', '=', True)  # Actif
+            ('available_in_pos', '=', True),
+            ('sale_ok', '=', True),
+            ('active', '=', True),
         ]
-        
-        # Ajouter filtre par nom si recherche
+
+        if allowed_categ_ids:
+            # iface_available_categ_ids contient des IDs de pos.category.
+            # Le lien produit↔catégorie POS est sur product.template (champ pos_categ_ids).
+            # On fait une recherche en deux étapes pour éviter les problèmes de traversal XML-RPC.
+            try:
+                template_ids = client.execute_kw(
+                    'product.template',
+                    'search',
+                    [[('pos_categ_ids', 'in', allowed_categ_ids)]],
+                )
+                if template_ids:
+                    domain.append(('product_tmpl_id', 'in', template_ids))
+                    logger.info(f"POS {pos_name}: {len(template_ids)} template(s) dans {len(allowed_categ_ids)} catégorie(s) POS")
+                else:
+                    # Catégories POS configurées mais aucun produit lié → fallback tous produits disponibles
+                    logger.warning(f"POS {pos_name}: aucun produit lié aux catégories POS {allowed_categ_ids}, retour de tous les produits available_in_pos")
+            except Exception as e:
+                # Champ inexistant dans cette version d'Odoo → fallback
+                logger.warning(f"POS {pos_name}: impossible de filtrer par catégorie POS ({e}), retour de tous les produits disponibles")
+        else:
+            logger.info(f"POS {pos_name}: aucune restriction de catégorie, retour de tous les produits disponibles")
+
         if search:
             domain.append(('name', 'ilike', search))
-        
-        # Récupérer les produits
+
+        # Récupérer les produits (sans limite artificielle)
         products = client.execute_kw(
             'product.product',
             'search_read',
@@ -3716,7 +3746,6 @@ async def get_fuel_products(
                     'uom_id', 'type', 'qty_available', 'description_sale'
                 ],
                 'order': 'name asc',
-                'limit': 100
             }
         )
         
@@ -3748,13 +3777,13 @@ async def get_fuel_products(
             }
             products_list.append(product_data)
         
-        logger.info(f"Récupéré {len(products_list)} produits disponibles pour POS")
-        
+        logger.info(f"POS {pos_name} ({pos_id}): {len(products_list)} produit(s) retourné(s)")
+
         return ApiResponse(
             success=True,
             data={'products': products_list},
             count=len(products_list),
-            message=f"{len(products_list)} produit(s) disponible(s)"
+            message=f"{len(products_list)} produit(s) disponible(s) pour le POS '{pos_name}'"
         )
         
     except HTTPException:
