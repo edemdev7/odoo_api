@@ -3667,26 +3667,46 @@ async def get_all_trucks(
 
 # ===== GESTION DES PRODUITS POUR POMPES =====
 
+# IDs des product.category pour le filtrage station-service
+# produits_blanc  → carburants pompés : ESSENCE, Essence (Cession bac), GASOIL, PETROLE
+_CATEG_PRODUITS_BLANC = [23, 93, 95, 98]
+# lubrifiants     → LUBRIFIANTS
+_CATEG_LUBRIFIANTS = [96]
+# gaz_accessoire  → tout le reste (GAZ, ACCESSOIRES, BOUTEILLES, etc.)
+_CATEG_POMPE = _CATEG_PRODUITS_BLANC + _CATEG_LUBRIFIANTS  # exclusion pour gaz_accessoire
+
+
 @router.get("/products/fuel", response_model=ApiResponse)
 async def get_fuel_products(
     pos_id: int = Query(..., description="ID du point de vente"),
+    filtre: Optional[str] = Query(
+        None,
+        description="Filtre produit : 'produits_blanc' (carburants pompe), 'lubrifiants', 'gaz_accessoire' (gaz + accessoires). Sans filtre = tous les produits du POS."
+    ),
     search: Optional[str] = Query(None, description="Rechercher un produit par nom"),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
     Récupérer les produits disponibles pour un point de vente spécifique.
 
-    Respecte la configuration Odoo du POS :
-    - Si le POS a des catégories restreintes (`iface_available_categ_ids`), seuls
-      les produits de ces catégories sont retournés.
-    - Sinon, tous les produits `available_in_pos=True` de la base sont retournés.
+    Respecte la configuration Odoo du POS (iface_available_categ_ids), puis applique
+    un filtre métier optionnel par type de produit station-service.
 
-    **Paramètres :**
-    - **pos_id** : ID du point de vente (obligatoire)
-    - **search** : Rechercher par nom (optionnel)
+    **Valeurs de filtre :**
+    - `produits_blanc` : carburants pris depuis la pompe (ESSENCE, GASOIL, PETROLE…)
+    - `lubrifiants` : huiles et lubrifiants
+    - `gaz_accessoire` : GAZ, bouteilles, accessoires et tout le reste
+    - *(absent)* : tous les produits du POS sans distinction
 
     **Requires:** Authentification JWT avec scope 'pos'
     """
+    VALID_FILTRES = {None, 'produits_blanc', 'lubrifiants', 'gaz_accessoire'}
+    if filtre not in VALID_FILTRES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Valeur de filtre invalide '{filtre}'. Valeurs acceptées : produits_blanc, lubrifiants, gaz_accessoire"
+        )
+
     try:
         client = get_odoo_client(current_user)
 
@@ -3702,17 +3722,15 @@ async def get_fuel_products(
         pos_name = pos_config[0]['name']
         allowed_categ_ids = pos_config[0].get('iface_available_categ_ids') or []
 
-        # Construire le domaine de recherche
+        # Domaine de base
         domain = [
             ('available_in_pos', '=', True),
             ('sale_ok', '=', True),
             ('active', '=', True),
         ]
 
+        # Filtre par catégories POS restreintes (iface_available_categ_ids)
         if allowed_categ_ids:
-            # iface_available_categ_ids contient des IDs de pos.category.
-            # Le lien produit↔catégorie POS est sur product.template (champ pos_categ_ids).
-            # On fait une recherche en deux étapes pour éviter les problèmes de traversal XML-RPC.
             try:
                 template_ids = client.execute_kw(
                     'product.template',
@@ -3723,18 +3741,23 @@ async def get_fuel_products(
                     domain.append(('product_tmpl_id', 'in', template_ids))
                     logger.info(f"POS {pos_name}: {len(template_ids)} template(s) dans {len(allowed_categ_ids)} catégorie(s) POS")
                 else:
-                    # Catégories POS configurées mais aucun produit lié → fallback tous produits disponibles
                     logger.warning(f"POS {pos_name}: aucun produit lié aux catégories POS {allowed_categ_ids}, retour de tous les produits available_in_pos")
             except Exception as e:
-                # Champ inexistant dans cette version d'Odoo → fallback
                 logger.warning(f"POS {pos_name}: impossible de filtrer par catégorie POS ({e}), retour de tous les produits disponibles")
         else:
             logger.info(f"POS {pos_name}: aucune restriction de catégorie, retour de tous les produits disponibles")
 
+        # Filtre métier par type de produit station-service
+        if filtre == 'produits_blanc':
+            domain.append(('categ_id', 'in', _CATEG_PRODUITS_BLANC))
+        elif filtre == 'lubrifiants':
+            domain.append(('categ_id', 'in', _CATEG_LUBRIFIANTS))
+        elif filtre == 'gaz_accessoire':
+            domain.append(('categ_id', 'not in', _CATEG_POMPE))
+
         if search:
             domain.append(('name', 'ilike', search))
 
-        # Récupérer les produits (sans limite artificielle)
         products = client.execute_kw(
             'product.product',
             'search_read',
@@ -3748,7 +3771,7 @@ async def get_fuel_products(
                 'order': 'name asc',
             }
         )
-        
+
         if not products:
             return ApiResponse(
                 success=True,
@@ -3756,11 +3779,9 @@ async def get_fuel_products(
                 count=0,
                 message="Aucun produit trouvé"
             )
-        
-        # Formater les produits
-        products_list = []
-        for prod in products:
-            product_data = {
+
+        products_list = [
+            {
                 'id': prod['id'],
                 'name': prod.get('name', 'N/A'),
                 'code': prod.get('default_code'),
@@ -3775,17 +3796,19 @@ async def get_fuel_products(
                 'stock_quantity': prod.get('qty_available', 0.0),
                 'description': prod.get('description_sale')
             }
-            products_list.append(product_data)
-        
-        logger.info(f"POS {pos_name} ({pos_id}): {len(products_list)} produit(s) retourné(s)")
+            for prod in products
+        ]
+
+        filtre_label = filtre or 'tous'
+        logger.info(f"POS {pos_name} ({pos_id}) [filtre={filtre_label}]: {len(products_list)} produit(s) retourné(s)")
 
         return ApiResponse(
             success=True,
             data={'products': products_list},
             count=len(products_list),
-            message=f"{len(products_list)} produit(s) disponible(s) pour le POS '{pos_name}'"
+            message=f"{len(products_list)} produit(s) disponible(s) pour le POS '{pos_name}' [filtre={filtre_label}]"
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -3794,7 +3817,58 @@ async def get_fuel_products(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
-  
+
+
+@router.get("/products/categories", response_model=ApiResponse)
+async def get_product_categories(
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Retourne toutes les catégories de produits (product.category) de la base.
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        categories = client.execute_kw(
+            'product.category',
+            'search_read',
+            [[]],
+            {
+                'fields': ['id', 'name', 'parent_id', 'complete_name'],
+                'order': 'complete_name asc',
+            }
+        )
+
+        categories_list = [
+            {
+                'id': cat['id'],
+                'name': cat.get('name', ''),
+                'complete_name': cat.get('complete_name', ''),
+                'parent_id': cat['parent_id'][0] if cat.get('parent_id') and isinstance(cat['parent_id'], list) else None,
+                'parent_name': cat['parent_id'][1] if cat.get('parent_id') and isinstance(cat['parent_id'], list) else None,
+            }
+            for cat in categories
+        ]
+
+        return ApiResponse(
+            success=True,
+            data={'categories': categories_list},
+            count=len(categories_list),
+            message=f"{len(categories_list)} catégorie(s) trouvée(s)"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des catégories produits: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération: {str(e)}"
+        )
+
+
 # ===== GESTION DES SESSIONS POS =====
 
 @router.get("/{pos_id}/suggested-opening-balance", response_model=ApiResponse)
