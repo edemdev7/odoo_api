@@ -5740,6 +5740,124 @@ async def add_payment_to_order(
         raise HTTPException(status_code=500, detail=f"Erreur lors du paiement: {str(e)}")
 
 
+@router.get("/{pos_id}/orders/{order_id}/invoice", response_model=ApiResponse)
+async def get_pos_order_invoice(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    order_id: int = Path(..., description="ID de la commande POS"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer la facture associée à une commande POS.
+
+    Retourne les détails de la facture (account.move) liée à la commande.
+    Utilisez l'`invoice_id` retourné avec `GET /accounting/invoice/{invoice_id}/pdf`
+    pour télécharger le PDF.
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # Lire la commande POS avec le champ account_move
+        order_data = client.execute_kw(
+            'pos.order', 'read', [order_id],
+            {'fields': ['id', 'name', 'state', 'session_id', 'account_move', 'amount_total', 'partner_id']}
+        )
+        if not order_data:
+            raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
+
+        order = order_data[0]
+
+        # Vérifier que la commande appartient au bon PDV
+        session_id_val = order['session_id'][0] if isinstance(order['session_id'], list) else order['session_id']
+        session_data = client.execute_kw(
+            'pos.session', 'read', [session_id_val],
+            {'fields': ['config_id']}
+        )
+        if not session_data or session_data[0]['config_id'][0] != pos_id:
+            raise HTTPException(status_code=400, detail="La commande n'appartient pas à ce point de vente")
+
+        # Vérifier qu'une facture est liée
+        account_move = order.get('account_move')
+        invoice_id = account_move[0] if isinstance(account_move, list) else account_move
+        if not invoice_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Aucune facture liée à la commande {order['name']} (état: {order['state']})"
+            )
+
+        # Lire les détails de la facture
+        invoice_data = client.execute_kw(
+            'account.move', 'read', [invoice_id],
+            {'fields': [
+                'id', 'name', 'state', 'move_type', 'payment_state',
+                'amount_total', 'amount_residual', 'amount_tax',
+                'invoice_date', 'invoice_date_due',
+                'partner_id', 'invoice_origin',
+                'invoice_line_ids', 'currency_id',
+            ]}
+        )
+        if not invoice_data:
+            raise HTTPException(status_code=404, detail=f"Facture {invoice_id} introuvable dans Odoo")
+
+        invoice = invoice_data[0]
+
+        # Lire les lignes de facture
+        line_ids = invoice.get('invoice_line_ids', [])
+        lines = []
+        if line_ids:
+            raw_lines = client.execute_kw(
+                'account.move.line', 'read', [line_ids],
+                {'fields': ['id', 'name', 'quantity', 'price_unit', 'price_subtotal', 'price_total', 'product_id']}
+            )
+            lines = [
+                {
+                    'id': l['id'],
+                    'product_id': l['product_id'][0] if isinstance(l.get('product_id'), list) else l.get('product_id'),
+                    'product_name': l['product_id'][1] if isinstance(l.get('product_id'), list) else None,
+                    'description': l.get('name', ''),
+                    'quantity': l.get('quantity', 0),
+                    'price_unit': l.get('price_unit', 0),
+                    'price_subtotal': l.get('price_subtotal', 0),
+                    'price_total': l.get('price_total', 0),
+                }
+                for l in raw_lines
+            ]
+
+        return ApiResponse(
+            success=True,
+            data={
+                'order_id': order_id,
+                'order_name': order.get('name'),
+                'order_state': order.get('state'),
+                'invoice': {
+                    'id': invoice['id'],
+                    'name': invoice.get('name'),
+                    'state': invoice.get('state'),
+                    'payment_state': invoice.get('payment_state'),
+                    'amount_total': invoice.get('amount_total'),
+                    'amount_tax': invoice.get('amount_tax'),
+                    'amount_residual': invoice.get('amount_residual'),
+                    'invoice_date': str(invoice.get('invoice_date') or ''),
+                    'invoice_date_due': str(invoice.get('invoice_date_due') or ''),
+                    'partner_id': invoice['partner_id'][0] if isinstance(invoice.get('partner_id'), list) else invoice.get('partner_id'),
+                    'partner_name': invoice['partner_id'][1] if isinstance(invoice.get('partner_id'), list) else None,
+                    'origin': invoice.get('invoice_origin'),
+                    'currency': invoice['currency_id'][1] if isinstance(invoice.get('currency_id'), list) else None,
+                    'lines': lines,
+                    'pdf_url': f"/accounting/invoice/{invoice['id']}/pdf",
+                },
+            },
+            message=f"Facture {invoice.get('name')} — {invoice.get('payment_state')}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération facture commande {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+
 @router.post("/{pos_id}/create-order", response_model=ApiResponse)
 async def create_complete_pos_order(
     pos_id: int = Path(..., description="ID du point de vente"),

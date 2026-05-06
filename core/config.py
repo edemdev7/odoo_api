@@ -21,10 +21,10 @@ REVOKED_TOKENS = set()
 # DB1: Base Test JNP Directe (Transferts internes)
 ODOO_DB1_CONFIG = {
     "name": "jnp_directe",
-    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-statging-012026-27069493.dev.odoo.com"),
-    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-statging-012026-27069493"),
+    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-test-30012085.dev.odoo.com"),
+    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-test-30012085"),
     "username": os.getenv("ODOO_DB1_USERNAME", "api@jnpgroupe.com"),
-    "api_key": os.getenv("ODOO_DB1_API_KEY", "3c9b926990c7cf6eaa2fe583fb1667e40410e854"),
+    "api_key": os.getenv("ODOO_DB1_API_KEY", "a9be048e3bf796ebcece7b47a8f64f7ee60f343c"),
     "transfer_type": "internal",  # Transferts internes
     "transfer_type_code": "internal"
 }
