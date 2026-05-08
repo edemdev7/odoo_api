@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Body, Query
+from fastapi.responses import Response
 from typing import List, Dict, Any, Optional
 import time
+import base64
 from datetime import datetime
 
 from models.schemas import (
@@ -14,13 +16,15 @@ from models.schemas import (
     ProductCreateRequest, PosProductAssignmentRequest, StockMovementRequest,
     StockLevelRequest, ProductStockResponse, StockPickingResponse,
     StockPickingStateUpdateRequest, StockPickingListRequest,
-    PosOrderCreateSimpleRequest, PosAddPaymentRequest
+    PosOrderCreateSimpleRequest, PosAddPaymentRequest,
+    PosPaymentMethodCreateRequest
 )
 from models.responses import ApiResponse
 from core.security import require_scope
 from core.odoo_client import get_odoo_client
 from core.config import logger
 from core.pump_manager import pump_manager
+from api.accounting import _generate_pdf_via_wizard
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
 
@@ -5455,6 +5459,57 @@ async def get_payment_methods(
         logger.error(f"Erreur lors de la récupération des méthodes de paiement: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
 
+
+@router.post("/payment-methods", response_model=ApiResponse)
+async def create_payment_method(
+    request: PosPaymentMethodCreateRequest,
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Créer un nouveau mode de paiement POS dans Odoo.
+
+    - **Cash** : `is_cash_count=true` + `journal_id` requis (journal de caisse)
+    - **Externe (KKiaPay, Token, JNPPass)** : `is_cash_count=false`, `journal_id` optionnel
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        vals = {
+            'name': request.name,
+            'is_cash_count': request.is_cash_count,
+        }
+        if request.journal_id:
+            vals['journal_id'] = request.journal_id
+
+        method_id = client.execute_kw('pos.payment.method', 'create', [vals])
+        logger.info(f"Mode de paiement créé : '{request.name}' (ID: {method_id})")
+
+        created = client.execute_kw(
+            'pos.payment.method', 'read', [method_id],
+            {'fields': ['id', 'name', 'is_cash_count', 'journal_id']}
+        )
+        method = created[0]
+
+        return ApiResponse(
+            success=True,
+            data={
+                'id': method['id'],
+                'name': method['name'],
+                'is_cash_count': method.get('is_cash_count', False),
+                'journal_id': method['journal_id'][0] if isinstance(method.get('journal_id'), list) else method.get('journal_id'),
+                'journal_name': method['journal_id'][1] if isinstance(method.get('journal_id'), list) else None,
+            },
+            message=f"Mode de paiement '{request.name}' créé (ID: {method_id})"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur création mode de paiement: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création: {str(e)}")
+
 @router.post("/{pos_id}/orders", response_model=ApiResponse)
 async def create_pos_order_only(
     pos_id: int = Path(..., description="ID du point de vente"),
@@ -5740,7 +5795,7 @@ async def add_payment_to_order(
         raise HTTPException(status_code=500, detail=f"Erreur lors du paiement: {str(e)}")
 
 
-@router.get("/{pos_id}/orders/{order_id}/invoice", response_model=ApiResponse)
+@router.get("/{pos_id}/orders/{order_id}/invoice")
 async def get_pos_order_invoice(
     pos_id: int = Path(..., description="ID du point de vente"),
     order_id: int = Path(..., description="ID de la commande POS"),
@@ -5777,78 +5832,71 @@ async def get_pos_order_invoice(
         if not session_data or session_data[0]['config_id'][0] != pos_id:
             raise HTTPException(status_code=400, detail="La commande n'appartient pas à ce point de vente")
 
-        # Vérifier qu'une facture est liée
+        # Récupérer ou générer la facture liée
         account_move = order.get('account_move')
         invoice_id = account_move[0] if isinstance(account_move, list) else account_move
+        invoice_generated = False
+
         if not invoice_id:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Aucune facture liée à la commande {order['name']} (état: {order['state']})"
+            # La commande n'a pas de facture — la générer via action_pos_order_invoice
+            if order['state'] not in ('paid', 'done', 'invoiced'):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Impossible de facturer une commande en état '{order['state']}'. La commande doit être payée d'abord."
+                )
+            logger.info(f"Génération de la facture pour la commande {order['name']} (ID: {order_id})")
+
+            # Marquer tous les comptes bancaires non fiables de l'entreprise comme fiables
+            untrusted_bank_ids = client.execute_kw(
+                'res.partner.bank', 'search',
+                [[['allow_out_payment', '=', False]]],
             )
+            if untrusted_bank_ids:
+                client.execute_kw('res.partner.bank', 'write', [untrusted_bank_ids, {'allow_out_payment': True}])
+                logger.info(f"Comptes bancaires marqués fiables : {untrusted_bank_ids}")
+
+            client.execute_kw('pos.order', 'action_pos_order_invoice', [[order_id]])
+
+            # Relire la commande pour récupérer l'account_move créé
+            refreshed = client.execute_kw(
+                'pos.order', 'read', [order_id],
+                {'fields': ['account_move']}
+            )
+            account_move = refreshed[0].get('account_move') if refreshed else None
+            invoice_id = account_move[0] if isinstance(account_move, list) else account_move
+
+            if not invoice_id:
+                raise HTTPException(
+                    status_code=500,
+                    detail="La génération de la facture a échoué — aucun account.move créé"
+                )
+            invoice_generated = True
+            logger.info(f"Facture générée : ID={invoice_id} pour commande {order['name']}")
 
         # Lire les détails de la facture
-        invoice_data = client.execute_kw(
+        # Récupérer le nom de la facture pour le nom du fichier
+        invoice_meta = client.execute_kw(
             'account.move', 'read', [invoice_id],
-            {'fields': [
-                'id', 'name', 'state', 'move_type', 'payment_state',
-                'amount_total', 'amount_residual', 'amount_tax',
-                'invoice_date', 'invoice_date_due',
-                'partner_id', 'invoice_origin',
-                'invoice_line_ids', 'currency_id',
-            ]}
+            {'fields': ['name']}
         )
-        if not invoice_data:
+        if not invoice_meta:
             raise HTTPException(status_code=404, detail=f"Facture {invoice_id} introuvable dans Odoo")
 
-        invoice = invoice_data[0]
+        invoice_name = invoice_meta[0].get('name', f'FAC-{invoice_id}')
+        safe_name = invoice_name.replace('/', '_')
 
-        # Lire les lignes de facture
-        line_ids = invoice.get('invoice_line_ids', [])
-        lines = []
-        if line_ids:
-            raw_lines = client.execute_kw(
-                'account.move.line', 'read', [line_ids],
-                {'fields': ['id', 'name', 'quantity', 'price_unit', 'price_subtotal', 'price_total', 'product_id']}
+        logger.info(f"Génération PDF facture {invoice_name} (ID: {invoice_id})")
+        pdf_content = _generate_pdf_via_wizard(client, invoice_id)
+        if not pdf_content:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Impossible de générer le PDF pour la facture {invoice_name}"
             )
-            lines = [
-                {
-                    'id': l['id'],
-                    'product_id': l['product_id'][0] if isinstance(l.get('product_id'), list) else l.get('product_id'),
-                    'product_name': l['product_id'][1] if isinstance(l.get('product_id'), list) else None,
-                    'description': l.get('name', ''),
-                    'quantity': l.get('quantity', 0),
-                    'price_unit': l.get('price_unit', 0),
-                    'price_subtotal': l.get('price_subtotal', 0),
-                    'price_total': l.get('price_total', 0),
-                }
-                for l in raw_lines
-            ]
 
-        return ApiResponse(
-            success=True,
-            data={
-                'order_id': order_id,
-                'order_name': order.get('name'),
-                'order_state': order.get('state'),
-                'invoice': {
-                    'id': invoice['id'],
-                    'name': invoice.get('name'),
-                    'state': invoice.get('state'),
-                    'payment_state': invoice.get('payment_state'),
-                    'amount_total': invoice.get('amount_total'),
-                    'amount_tax': invoice.get('amount_tax'),
-                    'amount_residual': invoice.get('amount_residual'),
-                    'invoice_date': str(invoice.get('invoice_date') or ''),
-                    'invoice_date_due': str(invoice.get('invoice_date_due') or ''),
-                    'partner_id': invoice['partner_id'][0] if isinstance(invoice.get('partner_id'), list) else invoice.get('partner_id'),
-                    'partner_name': invoice['partner_id'][1] if isinstance(invoice.get('partner_id'), list) else None,
-                    'origin': invoice.get('invoice_origin'),
-                    'currency': invoice['currency_id'][1] if isinstance(invoice.get('currency_id'), list) else None,
-                    'lines': lines,
-                    'pdf_url': f"/accounting/invoice/{invoice['id']}/pdf",
-                },
-            },
-            message=f"Facture {invoice.get('name')} — {invoice.get('payment_state')}"
+        return Response(
+            content=pdf_content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
         )
 
     except HTTPException:

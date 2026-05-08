@@ -243,6 +243,12 @@ class PosAddPaymentRequest(BaseModel):
     """Ajouter un ou plusieurs paiements à une commande existante"""
     payments: List[PosPayment] = Field(..., min_length=1, description="Liste des paiements (un ou plusieurs modes)")
 
+class PosPaymentMethodCreateRequest(BaseModel):
+    """Créer un mode de paiement POS"""
+    name: str = Field(..., description="Nom du mode de paiement (ex: KKiaPay, Token, JNPPass)")
+    is_cash_count: bool = Field(False, description="True pour les espèces (comptage caisse activé)")
+    journal_id: Optional[int] = Field(None, description="ID du journal comptable (optionnel pour les paiements externes)")
+
 class CashRegisterCloseRequest(BaseModel):
     ending_balance: float = Field(..., description="Solde de fermeture déclaré")
     pump_end_indexes: List[Dict[str, Any]] = Field(..., description="Index de fin des pompes")
