@@ -5766,6 +5766,13 @@ async def add_payment_to_order(
             }])
             payment_status = 'paid'
             logger.info(f"Commande {order_id} soldée — payé: {new_paid}, rendu: {amount_return}")
+
+            # Déclencher le mouvement de stock (diminue les quantités en solde)
+            try:
+                client.execute_kw('pos.order', 'action_pos_order_picking', [[order_id]])
+                logger.info(f"Mouvement de stock créé pour commande {order_id}")
+            except Exception as stock_err:
+                logger.warning(f"Mouvement de stock non créé pour commande {order_id}: {stock_err}")
         else:
             payment_status = 'partial'
 
