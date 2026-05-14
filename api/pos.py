@@ -4250,6 +4250,105 @@ async def get_pos_session_status(
         logger.error(f"Erreur lors de la vérification du statut de session: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la vérification: {str(e)}")
 
+
+@router.get("/{pos_id}/session/{session_id}/details", response_model=ApiResponse)
+async def get_session_details(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    session_id: int = Path(..., description="ID de la session POS"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Récupérer les détails complets d'une session POS (ouverte ou fermée).
+
+    Retourne : index pompes, nombre de ventes, soldes, pompistes.
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # Données Odoo de la session
+        session_data = client.execute_kw(
+            'pos.session', 'read', [session_id],
+            {'fields': [
+                'id', 'name', 'state', 'config_id',
+                'start_at', 'stop_at',
+                'cash_register_balance_start',
+                'cash_register_balance_end_real',
+                'cash_register_difference',
+            ]}
+        )
+        if not session_data:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} non trouvée")
+
+        session = session_data[0]
+
+        # Vérifier que la session appartient au bon PDV
+        config_id = session['config_id'][0] if isinstance(session.get('config_id'), list) else session.get('config_id')
+        if config_id != pos_id:
+            raise HTTPException(status_code=400, detail="La session n'appartient pas à ce point de vente")
+
+        is_closed = session['state'] == 'closed'
+
+        # Nombre de ventes et montant total des ventes
+        orders = client.execute_kw(
+            'pos.order', 'search_read',
+            [[('session_id', '=', session_id), ('state', 'in', ['paid', 'done', 'invoiced'])]],
+            {'fields': ['id', 'amount_total', 'employee_id']}
+        )
+        nb_ventes = len(orders)
+        montant_ventes = sum(float(o.get('amount_total') or 0) for o in orders)
+
+        # Pompistes ayant travaillé sur la session (distinct par employee_id)
+        pompistes_map = {}
+        for o in orders:
+            emp = o.get('employee_id')
+            if emp and isinstance(emp, list) and emp[0]:
+                pompistes_map[emp[0]] = emp[1]
+        pompistes = [{'id': eid, 'name': name} for eid, name in pompistes_map.items()]
+
+        # Données pompes depuis pump_manager (index début / index fin courant)
+        pumps_raw = pump_manager.get_session_pumps(session_id)
+        pumps = [
+            {
+                'id': p['id'],
+                'name': p['name'],
+                'type': p['type'],
+                'product_id': p.get('product_id'),
+                'product_name': p.get('product_name'),
+                'start_index': p['start_index'],
+                'end_index': p['current_index'] if is_closed else None,
+                'volume': round(p['current_index'] - p['start_index'], 3) if is_closed else None,
+            }
+            for p in pumps_raw
+        ]
+
+        return ApiResponse(
+            success=True,
+            data={
+                'session_id': session_id,
+                'session_name': session.get('name'),
+                'state': session.get('state'),
+                'start_at': str(session.get('start_at') or ''),
+                'stop_at': str(session.get('stop_at') or '') if is_closed else None,
+                'solde_debut': session.get('cash_register_balance_start', 0),
+                'solde_fin': session.get('cash_register_balance_end_real') if is_closed else None,
+                'difference_caisse': session.get('cash_register_difference') if is_closed else None,
+                'nb_ventes': nb_ventes,
+                'montant_ventes': montant_ventes,
+                'pompistes': pompistes,
+                'pompes': pumps,
+            },
+            message=f"Session {session.get('name')} — {session.get('state')}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération détails session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+
 @router.post("/{pos_id}/resume-session", response_model=PosSessionResponse)
 async def resume_pos_session(
     pos_id: int = Path(..., description="ID du point de vente"),
