@@ -5731,7 +5731,15 @@ async def add_payment_to_order(
             raise HTTPException(status_code=400, detail="La commande est annulée")
 
         amount_total = float(order['amount_total'])
-        current_paid = float(order['amount_paid'] or 0)
+
+        # Lire les paiements existants directement depuis pos.payment
+        # (amount_paid sur pos.order est un champ computed qui peut être obsolète via XML-RPC)
+        existing_payments = client.execute_kw(
+            'pos.payment', 'search_read',
+            [[('pos_order_id', '=', order_id)]],
+            {'fields': ['amount', 'payment_method_id']}
+        )
+        current_paid = sum(float(p['amount']) for p in existing_payments)
         payment_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # Créer chaque paiement dans Odoo
