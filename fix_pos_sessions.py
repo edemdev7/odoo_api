@@ -3,9 +3,9 @@ import xmlrpc.client
 from datetime import datetime
 
 # Configuration
-url = "https://apps.perfect-erp.com"
-db = "holdingithiel-dagbehami-prod-26291418"
-username = "api@odoo.com"
+url = "https://holdingithiel-dagbehami-test-30012085.dev.odoo.com"
+db = "holdingithiel-dagbehami-test-30012085"
+username = "api@jnpgroupe.com"
 password = "zBfMQyOlYVkg8WB"
 
 print("Connexion à Odoo...")

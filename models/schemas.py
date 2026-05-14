@@ -148,7 +148,8 @@ class StationPumpData(BaseModel):
     name: str = Field(..., description="Nom de la pompe (ex: J1_E1)")
     stationId: str = Field(..., description="ID de la station")
     type: str = Field(..., description="Type de carburant (PETROL, FUEL, etc.)")
-    start_index: float = Field(..., description="Index de début de session")
+    start_index: Optional[float] = Field(None, description="Index de début (requis à l'ouverture, ignoré à la fermeture)")
+    end_index: Optional[float] = Field(None, description="Index de fin (requis à la fermeture de session)")
     product_id: Optional[int] = Field(None, description="ID du produit Odoo associé (product.product)")
     product_name: Optional[str] = Field(None, description="Nom du produit Odoo")
 
@@ -173,7 +174,6 @@ class PosOpenSessionWithPumpsRequest(BaseModel):
 
 class PosCloseSessionRequest(BaseModel):
     session_id: Optional[int] = Field(None, description="ID de la session à fermer (optionnel si session active détectée)")
-    starting_balance: Optional[float] = Field(None, description="Solde d'ouverture (pour vérification cohérence)")
     ending_balance: Optional[float] = Field(None, description="Solde de fermeture déclaré")
     closing_notes: Optional[str] = Field(None, description="Notes de fermeture")
     forced: bool = Field(False, description="Forcer la fermeture même si le solde de fermeture ne correspond pas (starting_balance + total ventes)")
