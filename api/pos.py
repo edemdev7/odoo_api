@@ -5029,7 +5029,7 @@ async def close_pos_session(
     **Mode Station-Service** (avec pump_indexes):
     - Fermeture avec validation des pompes
     - Contrôle de cohérence index vs ventes
-    - Tolérance de 1% ou 1L pour les différences
+    - Tolérance de 1% ou 1L pour les 
     
     **Payload unifié (identique à l'ouverture):**
     ```json
