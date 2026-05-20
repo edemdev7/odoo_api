@@ -5332,10 +5332,11 @@ async def close_pos_session(
         
         # Ajouter les résultats de validation si mode station
         if validation_result:
+            pump_validations = validation_result.get('pump_validations', [])
             response_data['validation_summary'] = {
-                'total_pumps': len(validation_result.pump_validations),
-                'valid_pumps': sum(1 for p in validation_result.pump_validations if p.is_valid),
-                'total_sales': validation_result.total_sales
+                'total_pumps': len(pump_validations),
+                'valid_pumps': sum(1 for p in pump_validations if (p.get('is_valid') if isinstance(p, dict) else p.is_valid)),
+                'total_sales': validation_result.get('total_sales', 0)
             }
         
         return PosSessionResponse(**response_data)
