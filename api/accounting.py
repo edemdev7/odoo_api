@@ -975,6 +975,159 @@ async def credit_customer_account(
 
 
 # ============================================================
+# ENDPOINT DÉBIT COMPTE (VENTE PAR CARTE / TOKEN)
+# ============================================================
+
+class DebitAccountRequest(BaseModel):
+    """Débiter le solde d'une entreprise après une vente par carte ou token"""
+    partner_id: int = Field(..., description="ID de l'entreprise (res.partner)")
+    amount: float = Field(..., gt=0, description="Montant à débiter (doit être > 0)")
+    reference: str = Field(..., description="Référence de la transaction")
+    payment_method: str = Field(..., description="Méthode de paiement: card ou token")
+    product_id: Optional[int] = Field(None, description="ID du produit vendu (carburant, etc.)")
+    description: Optional[str] = Field(None, description="Description de la vente")
+    date: Optional[str] = Field(None, description="Date de la transaction (YYYY-MM-DD)")
+
+
+@router.post("/debit-account", response_model=ApiResponse)
+async def debit_customer_account(request: DebitAccountRequest):
+    """
+    Débiter le solde d'une entreprise après une vente par carte ou token.
+
+    **Flux :**
+    1. Vérifie que le partenaire existe et récupère son solde actuel
+    2. Crée une facture client (out_invoice) pour le montant de la vente
+    3. Enregistre le paiement via le journal JPASS → réduit le solde
+    4. Retourne l'ancien et le nouveau solde
+
+    **Corps :**
+    ```json
+    {
+        "partner_id": 123,
+        "amount": 15000,
+        "reference": "VENTE-CARTE-001",
+        "payment_method": "card",
+        "product_id": 42,
+        "description": "Vente carburant - Pompe J1",
+        "date": "2026-05-20"
+    }
+    ```
+    """
+    try:
+        client = OdooClient()
+        move_date = request.date or datetime.now().strftime('%Y-%m-%d')
+        description = request.description or f"Vente {request.payment_method} - {request.reference}"
+
+        # Vérifier le partenaire
+        partner = client.execute_kw(
+            'res.partner', 'search_read',
+            [[('id', '=', request.partner_id)]],
+            {'fields': ['id', 'name', 'credit'], 'limit': 1}
+        )
+        if not partner:
+            raise HTTPException(status_code=404, detail=f"Partenaire {request.partner_id} non trouvé")
+        partner = partner[0]
+
+        def _balance(pid):
+            try:
+                rows = client.execute_kw(
+                    'account.move.line', 'read_group',
+                    [[
+                        ('partner_id', '=', pid),
+                        ('account_id.account_type', '=', 'asset_receivable'),
+                        ('reconciled', '=', False),
+                        ('parent_state', '=', 'posted'),
+                    ]],
+                    {'groupby': ['partner_id'], 'fields': ['debit:sum', 'credit:sum'], 'lazy': False}
+                )
+                return round(rows[0].get('debit', 0) - rows[0].get('credit', 0), 2) if rows else 0.0
+            except Exception:
+                return None
+
+        balance_before = _balance(request.partner_id)
+
+        # Trouver le produit (optionnel)
+        product = None
+        if request.product_id:
+            products = client.execute_kw(
+                'product.product', 'search_read',
+                [[('id', '=', request.product_id)]],
+                {'fields': ['id', 'name', 'default_code', 'list_price'], 'limit': 1}
+            )
+            product = products[0] if products else None
+
+        product_id = product['id'] if product else TVPASS_PRODUCT_ID
+        product_name = product['name'] if product else description
+
+        # Créer la facture directement (out_invoice)
+        invoice_vals = {
+            'move_type': 'out_invoice',
+            'partner_id': request.partner_id,
+            'invoice_date': move_date,
+            'ref': request.reference,
+            'invoice_line_ids': [(0, 0, {
+                'product_id': product_id,
+                'name': description,
+                'quantity': 1,
+                'price_unit': request.amount,
+            })],
+        }
+        invoice_id = client.execute_kw('account.move', 'create', [invoice_vals])
+        client.execute_kw('account.move', 'action_post', [[invoice_id]])
+        logger.info(f"Facture débit créée et validée : ID={invoice_id}")
+
+        # Enregistrer le paiement via le wizard (même journal JPASS)
+        wizard_context = {'active_model': 'account.move', 'active_ids': [invoice_id]}
+        wizard_id = client.execute_kw(
+            'account.payment.register', 'create',
+            [{'journal_id': JPASS_JOURNAL_ID, 'amount': request.amount,
+              'payment_date': move_date, 'communication': request.reference}],
+            {'context': wizard_context}
+        )
+        client.execute_kw(
+            'account.payment.register', 'action_create_payments',
+            [[wizard_id]], {'context': wizard_context}
+        )
+        logger.info(f"Paiement débit enregistré pour facture {invoice_id}")
+
+        balance_after = _balance(request.partner_id)
+
+        invoice_data = client.execute_kw(
+            'account.move', 'read', [invoice_id],
+            {'fields': ['name', 'payment_state']}
+        )
+        invoice_name = invoice_data[0]['name'] if invoice_data else f"INV-{invoice_id}"
+        payment_state = invoice_data[0].get('payment_state') if invoice_data else 'unknown'
+
+        return ApiResponse(
+            success=True,
+            data={
+                'invoice_id': invoice_id,
+                'invoice_name': invoice_name,
+                'payment_state': payment_state,
+                'partner_id': request.partner_id,
+                'partner_name': partner['name'],
+                'amount_debited': request.amount,
+                'payment_method': request.payment_method,
+                'reference': request.reference,
+                'date': move_date,
+                'balance': {
+                    'before': balance_before,
+                    'after': balance_after,
+                    'difference': round((balance_after or 0) - (balance_before or 0), 2),
+                }
+            },
+            message=f"Solde de {partner['name']} débité de {request.amount} ({request.payment_method})"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur débit compte: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur lors du débit: {str(e)}")
+
+
+# ============================================================
 # ENDPOINT DE VÉRIFICATION COMPTE
 # ============================================================
 
