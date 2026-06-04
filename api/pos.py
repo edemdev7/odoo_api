@@ -5346,6 +5346,136 @@ async def close_pos_session(
     except Exception as e:
         logger.error(f"Erreur lors de la fermeture de session: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur lors de la fermeture: {str(e)}")
+
+
+@router.post("/{pos_id}/cashout", response_model=ApiResponse)
+async def pos_cashout(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    amount: float = Query(..., gt=0, description="Montant à verser (doit être > 0)"),
+    reference: str = Query(..., description="Référence ou motif du versement"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Enregistrer un versement bancaire depuis la caisse du PDV.
+
+    Réduit le solde de la caisse en créant une sortie de fonds (cash out).
+    Odoo génère automatiquement les écritures comptables correspondantes
+    (crédit compte caisse → débit compte suspense banque).
+
+    La réconciliation avec le vrai compte bancaire est faite côté Odoo par le comptable.
+
+    **Requires:** Authentification JWT avec scope 'pos'
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # Récupérer la session active
+        pos_config = client.execute_kw(
+            'pos.config', 'read', [pos_id],
+            {'fields': ['name', 'current_session_id', 'payment_method_ids']}
+        )
+        if not pos_config:
+            raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+
+        pos_config = pos_config[0]
+        if not pos_config.get('current_session_id'):
+            raise HTTPException(status_code=400, detail="Aucune session active sur ce point de vente")
+
+        session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
+
+        # Trouver le journal de caisse (méthode de paiement cash de la session)
+        payment_method_ids = pos_config.get('payment_method_ids', [])
+        cash_journal_id = None
+
+        if payment_method_ids:
+            cash_methods = client.execute_kw(
+                'pos.payment.method', 'search_read',
+                [[('id', 'in', payment_method_ids), ('is_cash_count', '=', True)]],
+                {'fields': ['id', 'name', 'journal_id'], 'limit': 1}
+            )
+            if cash_methods and cash_methods[0].get('journal_id'):
+                cash_journal_id = cash_methods[0]['journal_id'][0] if isinstance(cash_methods[0]['journal_id'], list) else cash_methods[0]['journal_id']
+
+        if not cash_journal_id:
+            # Fallback : chercher un journal de type cash lié à la session
+            session_data = client.execute_kw(
+                'pos.session', 'read', [session_id],
+                {'fields': ['cash_journal_id']}
+            )
+            if session_data and session_data[0].get('cash_journal_id'):
+                cash_journal_id = session_data[0]['cash_journal_id'][0] if isinstance(session_data[0]['cash_journal_id'], list) else session_data[0]['cash_journal_id']
+
+        if not cash_journal_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Impossible de trouver le journal de caisse du PDV. Vérifiez qu'un mode de paiement cash est configuré."
+            )
+
+        # Solde d'ouverture de la session
+        session_data = client.execute_kw(
+            'pos.session', 'read', [session_id],
+            {'fields': ['cash_register_balance_start', 'start_at']}
+        )
+        balance_start = float(session_data[0].get('cash_register_balance_start') or 0)
+        session_start_at = session_data[0].get('start_at') or datetime.now().strftime('%Y-%m-%d')
+
+        def _read_cash_balance():
+            # Lire directement les lignes du journal de caisse depuis l'ouverture de session
+            lines = client.execute_kw(
+                'account.bank.statement.line', 'search_read',
+                [[
+                    ('journal_id', '=', cash_journal_id),
+                    ('date', '>=', str(session_start_at)[:10]),
+                ]],
+                {'fields': ['amount']}
+            )
+            total_movements = sum(float(l['amount']) for l in lines)
+            return round(balance_start + total_movements, 2)
+
+        balance_before = _read_cash_balance()
+
+        # Créer la ligne de sortie de fonds (montant négatif = cash out)
+        today = datetime.now().strftime('%Y-%m-%d')
+        statement_line_id = client.execute_kw(
+            'account.bank.statement.line', 'create',
+            [{
+                'journal_id': cash_journal_id,
+                'amount': -abs(amount),
+                'payment_ref': f"Versement bancaire - {reference}",
+                'date': today,
+            }]
+        )
+        logger.info(f"Cashout PDV {pos_id} — session {session_id} — montant: {amount} — ligne: {statement_line_id}")
+
+        balance_after = _read_cash_balance()
+
+        return ApiResponse(
+            success=True,
+            data={
+                'statement_line_id': statement_line_id,
+                'session_id': session_id,
+                'pos_id': pos_id,
+                'pos_name': pos_config['name'],
+                'amount_transferred': amount,
+                'reference': reference,
+                'date': today,
+                'cash_journal_id': cash_journal_id,
+                'balance': {
+                    'before': balance_before,
+                    'after': balance_after,
+                    'difference': round(balance_after - balance_before, 2),
+                }
+            },
+            message=f"Versement de {amount} FCFA enregistré — Solde caisse: {balance_before} → {balance_after}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur cashout PDV {pos_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors du versement: {str(e)}")
+
+
 # ===== GESTION DES POMPES ET VENTES =====
 
 

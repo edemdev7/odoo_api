@@ -32,10 +32,10 @@ ODOO_DB1_CONFIG = {
 # DB2: Base Test Franchise (Transferts réceptions)
 ODOO_DB2_CONFIG = {
     "name": "franchise",
-    "url": os.getenv("ODOO_DB2_URL", "https://staging-apps.perfect-erp.com"),
-    "db": os.getenv("ODOO_DB2_NAME", "staging-apps.perfect-erp.com"),
-    "username": os.getenv("ODOO_DB2_USERNAME", "api@odoo.com"),
-    "api_key": os.getenv("ODOO_DB2_API_KEY", "1ba8793e151954c349bf8511fd2bfee068338205"),
+    "url": os.getenv("ODOO_DB2_URL", " https://staging-app.perfect-erp.com"),
+    "db": os.getenv("ODOO_DB2_NAME", "staging-app.perfect-erp.com"),
+    "username": os.getenv("ODOO_DB2_USERNAME", "api-rest.odoo.com"),
+    "api_key": os.getenv("ODOO_DB2_API_KEY", "d3b50d6b6694cecb785a8a87ee8dd388ff0c325e"),
     "transfer_type": "reception",  # Transferts réceptions
     "transfer_type_code": "incoming"
 }
