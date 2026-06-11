@@ -17,6 +17,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 heures
 # Liste des tokens invalidés/révoqués
 REVOKED_TOKENS = set()
 
+# Session active par utilisateur (user_key -> token courant)
+# Permet d'empêcher les connexions simultanées et d'invalider l'ancienne
+# session lorsqu'une nouvelle connexion (ou un changement de PIN/mot de
+# passe) a lieu sur le même compte.
+ACTIVE_SESSIONS = {}
+
 # Configuration Odoo - Multi-base de données
 # DB1: Base Test JNP Directe (Transferts internes)
 ODOO_DB1_CONFIG = {

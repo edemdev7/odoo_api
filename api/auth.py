@@ -4,7 +4,10 @@ from datetime import datetime, timedelta
 
 from models.schemas import UserLogin, PinLogin, PinResetRequest, Token, LogoutRequest, UserData
 from models.responses import ApiResponse
-from core.security import authenticate_user, create_access_token, get_current_user, require_scope, invalidate_token
+from core.security import (
+    authenticate_user, create_access_token, get_current_user, require_scope,
+    invalidate_token, register_session, invalidate_user_sessions
+)
 from core.config import ACCESS_TOKEN_EXPIRE_MINUTES, logger
 from core.odoo_client import default_odoo_client, get_odoo_client
 
@@ -90,10 +93,13 @@ async def login(user_data: UserLogin):
             }
         
         access_token = create_access_token(
-            data=token_data, 
+            data=token_data,
             expires_delta=access_token_expires
         )
-        
+
+        # Une seule session active par compte : invalide l'ancien token s'il existe
+        register_session(user["username"], access_token)
+
         # Récupérer des informations supplémentaires sur l'utilisateur depuis Odoo
         user_data = {
             "username": user["username"],
@@ -307,7 +313,10 @@ async def pin_login(login_data: PinLogin):
             expires_delta=access_token_expires,
             odoo_db_name=authenticated_db_config['name']  # Passer le nom de la DB
         )
-        
+
+        # Une seule session active par compte : invalide l'ancien token s'il existe
+        register_session(virtual_user["username"], access_token)
+
         # Créer les données utilisateur pour l'employé
         user_data = {
             "username": virtual_user["username"],
@@ -431,6 +440,10 @@ async def reset_pin(reset_data: PinResetRequest):
                 )
             
             logger.info(f"PIN mis à jour avec succès pour l'employé: {employee['name']} (ID: {employee['id']})")
+
+            # Invalider toute session active suite au changement de PIN
+            invalidate_user_sessions(f"employee_{employee['id']}")
+
             return ApiResponse(
                 success=True,
                 message=f"Code PIN mis à jour avec succès pour {employee['name']}"
@@ -815,13 +828,15 @@ async def logout(
     **Retourne** un message de confirmation si la déconnexion a réussi.
     """
     try:
-        # Vérifier que le token fourni correspond au token d'authentification actuel
-        from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-        from fastapi import Request
-        
         # Valider et invalider le token
         invalidate_token(logout_data.token)
-        
+
+        # Retirer la session active si ce token en était la session courante
+        from core.config import ACTIVE_SESSIONS
+        username = current_user.get("username")
+        if username and ACTIVE_SESSIONS.get(username) == logout_data.token:
+            del ACTIVE_SESSIONS[username]
+
         logger.info(f"Déconnexion réussie pour: {current_user['username']}")
         return ApiResponse(
             success=True,

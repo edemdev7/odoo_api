@@ -6,8 +6,8 @@ from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
 
 from core.config import (
-    SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS, 
-    ODOO_CONFIG, ODOO_DATABASES, logger, REVOKED_TOKENS
+    SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, API_USERS,
+    ODOO_CONFIG, ODOO_DATABASES, logger, REVOKED_TOKENS, ACTIVE_SESSIONS
 )
 
 # Classes de sécurité
@@ -109,7 +109,19 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if username is None:
             logger.warning("Token sans username")
             raise credentials_exception
-            
+
+        # Vérifier que ce token est bien la session active de l'utilisateur
+        # (une seule session par compte : une nouvelle connexion ou un
+        # changement de PIN/mot de passe invalide les anciens tokens)
+        active_token = ACTIVE_SESSIONS.get(username)
+        if active_token and active_token != token:
+            logger.warning(f"Session obsolète pour {username}: une autre connexion a invalidé ce token")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session invalidée: une nouvelle connexion a été effectuée sur ce compte. Veuillez vous reconnecter.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         # Vérifier si c'est un employé authentifié par PIN (format employee_ID)
         if username.startswith("employee_"):
             # Pour les authentifications par PIN, créer un utilisateur virtuel avec les données du token
@@ -175,6 +187,31 @@ def invalidate_token(token: str):
     REVOKED_TOKENS.add(token)
     logger.info("Token invalidé avec succès")
     return True
+
+def register_session(user_key: str, token: str):
+    """
+    Enregistre `token` comme session active de `user_key`.
+
+    Si une autre session était déjà active pour ce compte (connexion depuis
+    un autre appareil/onglet), son token est immédiatement révoqué afin
+    qu'une seule session reste valide à la fois.
+    """
+    old_token = ACTIVE_SESSIONS.get(user_key)
+    if old_token and old_token != token:
+        REVOKED_TOKENS.add(old_token)
+        logger.info(f"Session précédente invalidée pour {user_key} (nouvelle connexion détectée)")
+    ACTIVE_SESSIONS[user_key] = token
+
+def invalidate_user_sessions(user_key: str):
+    """
+    Invalide la session active de `user_key`, par exemple après un
+    changement de PIN ou de mot de passe.
+    """
+    old_token = ACTIVE_SESSIONS.pop(user_key, None)
+    if old_token:
+        REVOKED_TOKENS.add(old_token)
+        logger.info(f"Session invalidée pour {user_key} suite à un changement d'identifiants")
+    return old_token is not None
 
 def require_scope(required_scope: str):
     """Décorateur pour vérifier les permissions"""
