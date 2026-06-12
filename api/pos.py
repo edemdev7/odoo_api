@@ -5301,7 +5301,23 @@ async def close_pos_session(
                 except Exception as e3:
                     logger.error(f"Impossible de fermer la session: {e3}")
                     raise HTTPException(status_code=500, detail=f"Impossible de fermer la session Odoo: {str(e)}")
-        
+
+        # S'assurer que stop_at est bien renseigné. Sans cela, Odoo plante
+        # (AttributeError: 'bool' object has no attribute 'astimezone') dans
+        # pos.config._compute_last_session dès qu'on ouvre le point de vente.
+        if final_state == 'closed':
+            try:
+                session_check = client.execute_kw(
+                    'pos.session', 'read', [session_id], {'fields': ['stop_at']}
+                )
+                if not session_check[0].get('stop_at'):
+                    client.execute_kw('pos.session', 'write', [[session_id], {
+                        'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }])
+                    logger.info(f"stop_at défini manuellement pour la session {session_id}")
+            except Exception as e:
+                logger.warning(f"Impossible de vérifier/définir stop_at pour la session {session_id}: {e}")
+
         # Construire le message de réponse
         forced_msg = " (FORCÉE)" if request.forced else ""
         if is_station_mode:

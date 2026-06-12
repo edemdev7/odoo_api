@@ -3,8 +3,8 @@ import xmlrpc.client
 from datetime import datetime
 
 # Configuration
-url = "https://holdingithiel-dagbehami-test-30012085.dev.odoo.com"
-db = "holdingithiel-dagbehami-test-30012085"
+url = "https://holdingithiel-dagbehami-statging-012026-32870733.dev.odoo.com"
+db = "holdingithiel-dagbehami-statging-012026-32870733"
 username = "api@jnpgroupe.com"
 password = "zBfMQyOlYVkg8WB"
 
