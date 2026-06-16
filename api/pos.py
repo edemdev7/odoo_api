@@ -5109,71 +5109,73 @@ async def close_pos_session(
         session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
         
         # Mode Station-Service : Validation des pompes avec notre gestionnaire
+        # [DÉSACTIVÉ] La validation des pompes via pump_manager est temporairement
+        # désactivée. Pour la réactiver, décommenter le bloc ci-dessous.
         validation_result = None
-        if is_station_mode:
-            logger.info(f"Mode station activé - Validation de {len(pump_data_list)} pompe(s)")
-            
-            try:
-                # Mettre à jour les index finaux des pompes
-                update_errors = []
-                for pump_data in pump_data_list:
-                    # Support des deux formats
-                    if isinstance(pump_data, dict):
-                        pump_id = pump_data.get('pump_id') or pump_data.get('id')
-                        end_index = pump_data.get('end_index') or pump_data.get('current_index')
-                    else:
-                        # Format StationPumpData
-                        pump_id = pump_data.id
-                        end_index = getattr(pump_data, 'end_index', None) or getattr(pump_data, 'current_index', None)
-                    
-                    if not pump_id or end_index is None:
-                        update_errors.append(f"Données manquantes pour pompe: {pump_data}")
-                        continue
-                    
-                    success = pump_manager.update_pump_index(
-                        session_id=session_id,
-                        pump_id=pump_id,
-                        new_index=end_index,
-                        order_id=None  # Fermeture de session
-                    )
-                    
-                    if not success:
-                        error_msg = f"Pompe '{pump_id}' non trouvée pour session {session_id}. "
-                        error_msg += "Assurez-vous que la pompe a été enregistrée lors de l'ouverture de la session."
-                        update_errors.append(error_msg)
-                        logger.error(error_msg)
-                
-                if update_errors:
-                    logger.error(f"Erreurs lors de la mise à jour des pompes: {update_errors}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Erreurs pompes: {'; '.join(update_errors)}"
-                    )
-                
-                # Valider la cohérence des données avec notre gestionnaire
-                validation_report = pump_manager.validate_session_closure(session_id)
-                
-                if not validation_report['valid']:
-                    logger.warning(f"Validation des pompes échouée: {validation_report['errors']}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Validation des pompes échouée: {'; '.join(validation_report['errors'])}"
-                    )
-                
-                if validation_report['warnings']:
-                    logger.warning(f"Avertissements validation pompes: {validation_report['warnings']}")
-                
-                logger.info("✅ Validation des pompes réussie avec notre gestionnaire")
-                validation_result = validation_report
-                
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Erreur lors de la validation des pompes: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Erreur lors de la validation des pompes: {str(e)}"
-                )
+        # if is_station_mode:
+        #     logger.info(f"Mode station activé - Validation de {len(pump_data_list)} pompe(s)")
+        #
+        #     try:
+        #         # Mettre à jour les index finaux des pompes
+        #         update_errors = []
+        #         for pump_data in pump_data_list:
+        #             # Support des deux formats
+        #             if isinstance(pump_data, dict):
+        #                 pump_id = pump_data.get('pump_id') or pump_data.get('id')
+        #                 end_index = pump_data.get('end_index') or pump_data.get('current_index')
+        #             else:
+        #                 # Format StationPumpData
+        #                 pump_id = pump_data.id
+        #                 end_index = getattr(pump_data, 'end_index', None) or getattr(pump_data, 'current_index', None)
+        #
+        #             if not pump_id or end_index is None:
+        #                 update_errors.append(f"Données manquantes pour pompe: {pump_data}")
+        #                 continue
+        #
+        #             success = pump_manager.update_pump_index(
+        #                 session_id=session_id,
+        #                 pump_id=pump_id,
+        #                 new_index=end_index,
+        #                 order_id=None  # Fermeture de session
+        #             )
+        #
+        #             if not success:
+        #                 error_msg = f"Pompe '{pump_id}' non trouvée pour session {session_id}. "
+        #                 error_msg += "Assurez-vous que la pompe a été enregistrée lors de l'ouverture de la session."
+        #                 update_errors.append(error_msg)
+        #                 logger.error(error_msg)
+        #
+        #         if update_errors:
+        #             logger.error(f"Erreurs lors de la mise à jour des pompes: {update_errors}")
+        #             raise HTTPException(
+        #                 status_code=400,
+        #                 detail=f"Erreurs pompes: {'; '.join(update_errors)}"
+        #             )
+        #
+        #         # Valider la cohérence des données avec notre gestionnaire
+        #         validation_report = pump_manager.validate_session_closure(session_id)
+        #
+        #         if not validation_report['valid']:
+        #             logger.warning(f"Validation des pompes échouée: {validation_report['errors']}")
+        #             raise HTTPException(
+        #                 status_code=400,
+        #                 detail=f"Validation des pompes échouée: {'; '.join(validation_report['errors'])}"
+        #             )
+        #
+        #         if validation_report['warnings']:
+        #             logger.warning(f"Avertissements validation pompes: {validation_report['warnings']}")
+        #
+        #         logger.info("✅ Validation des pompes réussie avec notre gestionnaire")
+        #         validation_result = validation_report
+        #
+        #     except HTTPException:
+        #         raise
+        #     except Exception as e:
+        #         logger.error(f"Erreur lors de la validation des pompes: {e}")
+        #         raise HTTPException(
+        #             status_code=500,
+        #             detail=f"Erreur lors de la validation des pompes: {str(e)}"
+        #         )
         
         # Vérifier l'état de la session et récupérer les données financières
         session_data = client.execute_kw(
