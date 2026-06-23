@@ -4581,9 +4581,16 @@ async def open_pos_session(
             
             if session['config_id'][0] != pos_id:
                 raise HTTPException(status_code=400, detail="La session ne correspond pas au point de vente")
-            
+
             if session['state'] not in ['opening_control', 'new']:
-                logger.warning(f"Session {request.session_id} dans l'état {session['state']}, tentative d'ouverture forcée")
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Impossible d'ouvrir: la session {request.session_id} est dans l'état "
+                        f"'{session['state']}', pas 'opening_control'. Fermez-la complètement avant "
+                        f"d'en ouvrir une nouvelle."
+                    )
+                )
             
             # Traiter et sauvegarder les données des pompes
             try:
@@ -4647,6 +4654,32 @@ async def open_pos_session(
         
         # === MODE STANDARD (caisse normale) ===
         else:
+            # Vérifier qu'il n'y a pas déjà une session active sur ce PDV avant
+            # d'en créer une nouvelle (sinon on se retrouve avec plusieurs
+            # sessions ouvertes en parallèle si la précédente n'a pas été
+            # réellement fermée côté Odoo).
+            pos_config_check = client.execute_kw(
+                'pos.config',
+                'read',
+                [pos_id],
+                {'fields': ['name', 'current_session_id']}
+            )
+            if not pos_config_check:
+                raise HTTPException(status_code=404, detail="Point de vente non trouvé")
+
+            if pos_config_check[0].get('current_session_id'):
+                existing_session_id = pos_config_check[0]['current_session_id'][0]
+                existing_state = client.execute_kw(
+                    'pos.session', 'read', [existing_session_id], {'fields': ['state']}
+                )[0]['state']
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Une session ({existing_session_id}, état '{existing_state}') est déjà "
+                        f"active sur ce point de vente. Fermez-la avant d'en ouvrir une nouvelle."
+                    )
+                )
+
             # Créer une nouvelle session pour le mode standard
             session_vals = {
                 'config_id': pos_id,
@@ -5280,29 +5313,48 @@ async def close_pos_session(
             except Exception as e:
                 logger.warning(f"Impossible d'écrire cash_register_balance_end_real: {e}")
 
-        # Appeler la méthode officielle de clôture Odoo
+        # Appeler les méthodes officielles de clôture Odoo
+        # action_pos_session_closing_control fait passer la session en 'closing_control'
+        # (contrôle de caisse) mais ne la ferme pas réellement. Il faut ensuite
+        # action_pos_session_close pour finaliser la fermeture (état 'closed' +
+        # écritures comptables). On relit l'état réel à la fin plutôt que de le
+        # supposer, pour ne jamais répondre "fermée" si Odoo ne l'a pas vraiment fermée.
         logger.info(f"Appel action_pos_session_closing_control pour session {session_id}")
-        final_state = 'closing_control'
         try:
             client.execute_kw('pos.session', 'action_pos_session_closing_control', [[session_id]])
-            final_state = 'closed'
-            logger.info(f"Session {session_id} fermée via action_pos_session_closing_control")
         except Exception as e:
             logger.warning(f"action_pos_session_closing_control a échoué: {e}")
+
+        try:
+            logger.info(f"Appel action_pos_session_close pour session {session_id}")
+            client.execute_kw('pos.session', 'action_pos_session_close', [[session_id]])
+        except Exception as e:
+            logger.warning(f"action_pos_session_close a échoué: {e}")
             # Fallback : écrire l'état directement
             try:
                 client.execute_kw('pos.session', 'write', [[session_id], {'state': 'closed'}])
-                final_state = 'closed'
-                logger.info(f"Session {session_id} fermée via write state=closed")
+                logger.info(f"Session {session_id} fermée via write state=closed (fallback)")
             except Exception as e2:
-                logger.warning(f"write state=closed a échoué: {e2}")
-                # Dernier recours : closing_control
-                try:
-                    client.execute_kw('pos.session', 'write', [[session_id], {'state': 'closing_control'}])
-                    final_state = 'closing_control'
-                except Exception as e3:
-                    logger.error(f"Impossible de fermer la session: {e3}")
-                    raise HTTPException(status_code=500, detail=f"Impossible de fermer la session Odoo: {str(e)}")
+                logger.error(f"write state=closed a échoué: {e2}")
+                raise HTTPException(status_code=500, detail=f"Impossible de fermer la session Odoo: {str(e2)}")
+
+        # Relire l'état réel de la session depuis Odoo : on ne fait jamais confiance
+        # à un succès d'appel pour dire que la session est fermée.
+        final_session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['state']})
+        final_state = final_session[0]['state'] if final_session else 'unknown'
+
+        if final_state != 'closed':
+            logger.error(
+                f"Session {session_id} non réellement fermée après tentative de clôture "
+                f"(état actuel: {final_state})"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"La session n'a pas pu être réellement fermée (état actuel: {final_state}). "
+                    f"Vérifiez les écarts de caisse ou de stock côté Odoo."
+                )
+            )
 
         # S'assurer que stop_at est bien renseigné. Sans cela, Odoo plante
         # (AttributeError: 'bool' object has no attribute 'astimezone') dans
