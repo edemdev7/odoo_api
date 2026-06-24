@@ -31,7 +31,8 @@ router = APIRouter(prefix="/accounting", tags=["Accounting"])
 # CONSTANTES
 # ============================================================
 TVPASS_PRODUCT_CODE = "TVPASS_ESS"          # Référence interne du produit
-TVPASS_PRODUCT_ID = 2999                     # ID du produit (fallback)
+TVPASS_PRODUCT_ID = 2742                     # ID du produit "Carburant (TV_PASS) ESSENCE" (fallback)
+TVPASS_TAX_ID = 245                          # ID du groupe de taxes "TAXES TV.PASS ESSENCE (Vente)"
 JPASS_JOURNAL_ID = 194                       # Journal PASS GD pour paiement kkiapay
 WEBHOOK_ACTION = "COMPANY_SUPPLY_VALIDATION" # Action webhook quand facture payée
 
@@ -99,12 +100,38 @@ def find_tvpass_product(client: OdooClient, product_id: Optional[int] = None) ->
 def create_sale_order(client: OdooClient, partner_id: int, product: dict,
                       amount: float, reference: str, date: str,
                       description: str) -> int:
-    """Créer et confirmer une commande de vente"""
+    """Créer et confirmer une commande de vente.
+
+    Le montant rechargé est décomposé en quantité × prix unitaire TTC afin que
+    les taxes fixes (TVA, TS, ASAS) soient prélevées proportionnellement au
+    volume, et non une seule fois sur une quantité = 1.
+
+    Exemple : recharge 25 000 CFA, prix TTC/litre = 725 CFA
+      → qty = 25 000 / 725 = 34,483 litres
+      → taxes = 34,483 × 241,79 CFA ≈ 8 337 CFA  (au lieu de 242 CFA)
+    """
+    unit_price = product.get('list_price') or 0.0
+    if unit_price <= 0:
+        # Sécurité : si le prix n'est pas renseigné, on reste à qty=1
+        qty = 1.0
+        unit_price = amount
+        logger.warning(
+            f"⚠️ list_price du produit {product['id']} est 0 ou absent — "
+            f"fallback qty=1, price_unit={amount}"
+        )
+    else:
+        qty = round(amount / unit_price, 4)
+
+    logger.info(
+        f"📐 Décomposition recharge: {amount} CFA ÷ {unit_price} CFA/L "
+        f"= {qty} L"
+    )
+
     order_line_vals = {
         'product_id': product['id'],
         'name': description,
-        'product_uom_qty': 1,
-        'price_unit': amount,
+        'product_uom_qty': qty,
+        'price_unit': unit_price,
     }
 
     order_vals = {
@@ -1070,6 +1097,7 @@ async def debit_customer_account(request: DebitAccountRequest):
                 'name': description,
                 'quantity': 1,
                 'price_unit': request.amount,
+                'tax_ids': [(6, 0, [TVPASS_TAX_ID])],
             })],
         }
         invoice_id = client.execute_kw('account.move', 'create', [invoice_vals])
