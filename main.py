@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+import json
 import uvicorn
 import importlib
 import os
@@ -17,6 +20,44 @@ from api.fuel_monitor import router as fuel_monitor_router
 from api.accounting import router as accounting_router
 from core.config import logger
 from core.background_scheduler import start_credit_monitor, stop_credit_monitor
+from core.formatters import clean_numbers
+
+
+class NumberFormatterMiddleware(BaseHTTPMiddleware):
+    """
+    Formate tous les floats des réponses JSON :
+    - Max 3 décimales, zéros supprimés
+    - Séparateur décimal : virgule  (ex: 2,45 au lieu de 2.45)
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        content_type = response.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            return response
+
+        # Lire le corps de la réponse
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        try:
+            data = json.loads(body)
+            cleaned = clean_numbers(data)
+            return JSONResponse(
+                content=cleaned,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
+        except Exception:
+            # En cas d'erreur de parsing, retourner la réponse originale
+            from starlette.responses import Response
+            return Response(
+                content=body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
 
 # Configuration et création de l'application FastAPI
 app = FastAPI(
@@ -77,6 +118,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Middleware formatage des nombres (virgule, 3 décimales max)
+app.add_middleware(NumberFormatterMiddleware)
 
 # Inclusion des routers
 app.include_router(auth_router)
