@@ -4104,7 +4104,21 @@ async def get_available_pos_shops(
             # Vérifier s'il y a une session active
             session_info = None
             balance = 0.0
-            
+
+            def _session_total_payments(session_id: int) -> float:
+                """Somme tous les paiements (cash + autres) d'une session."""
+                try:
+                    payments = client.execute_kw(
+                        'pos.payment',
+                        'search_read',
+                        [[('session_id', '=', session_id)]],
+                        {'fields': ['amount']}
+                    )
+                    return float(sum(p.get('amount', 0) or 0 for p in payments))
+                except Exception as e:
+                    logger.warning(f"Impossible de récupérer les paiements de la session {session_id}: {e}")
+                    return 0.0
+
             if pos_config.get('current_session_id'):
                 session_id = pos_config['current_session_id'][0] if isinstance(pos_config['current_session_id'], list) else pos_config['current_session_id']
                 session_data = client.execute_kw(
@@ -4115,20 +4129,19 @@ async def get_available_pos_shops(
                 )
                 if session_data:
                     session_info = session_data[0]
-                    # Récupérer le solde de la session active
-                    balance = float(session_info.get('cash_register_balance_end_real', 0) or 
-                                  session_info.get('cash_register_balance_start', 0) or 0)
+                    # Somme de tous les moyens de paiement (cash + carte + token + etc.)
+                    balance = _session_total_payments(session_id)
             else:
-                # Si pas de session active, récupérer le solde de la dernière session fermée
+                # Si pas de session active, récupérer le total de la dernière session fermée
                 try:
                     last_sessions = client.execute_kw(
                         'pos.session',
                         'search_read',
                         [[('config_id', '=', pos_config['id']), ('state', '=', 'closed')]],
-                        {'fields': ['cash_register_balance_end_real'], 'order': 'create_date desc', 'limit': 1}
+                        {'fields': ['id'], 'order': 'create_date desc', 'limit': 1}
                     )
                     if last_sessions:
-                        balance = float(last_sessions[0].get('cash_register_balance_end_real', 0) or 0)
+                        balance = _session_total_payments(last_sessions[0]['id'])
                 except Exception as e:
                     logger.warning(f"Impossible de récupérer le dernier solde pour PDV {pos_config['id']}: {e}")
                     balance = 0.0
