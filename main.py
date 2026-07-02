@@ -45,18 +45,22 @@ class NumberFormatterMiddleware(BaseHTTPMiddleware):
         try:
             data = json.loads(body)
             cleaned = clean_numbers(data)
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
             return JSONResponse(
                 content=cleaned,
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=headers,
             )
         except Exception:
             # En cas d'erreur de parsing, retourner la réponse originale
             from starlette.responses import Response
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
             return Response(
                 content=body,
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=headers,
             )
 
 # Configuration et création de l'application FastAPI
