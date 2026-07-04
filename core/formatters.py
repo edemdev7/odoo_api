@@ -1,68 +1,53 @@
 """
 Formatage des nombres dans les réponses API.
 
-Règles :
-- Max 3 décimales, zéros inutiles supprimés  (3373573.0 → "3373573", 1.100 → "1,1")
-- Séparateur décimal : virgule  (2.45 → "2,45")
+Stratégie :
+- Tous les floats sont arrondis à 3 décimales max (gardés comme numbers JSON).
+- Exception : les clés dans COMMA_STRING_KEYS sont converties en string avec
+  virgule comme séparateur décimal — réservé aux valeurs affichées directement
+  aux pompistes pour saisie manuelle (index pompe, volumes, etc.).
 
-Exemples :
-    297.87999999999  → "297,88"
-    3373573.0        → "3373573"
-    2.45             → "2,45"
-    0.0              → "0"
-    1.500            → "1,5"
-
-Certaines clés doivent rester des nombres (pas de conversion en string) car elles
-sont utilisées programmatiquement côté client : voir NUMBER_KEYS.
+Exemples de rendu final (number) :
+    297.87999999999  →  297.88
+    3373573.0        →  3373573.0   (int si .0, sinon float arrondi)
+    2.45             →  2.45
 """
 
-# Clés dont la valeur doit rester un float arrondi (pas converti en string)
-NUMBER_KEYS = {
-    "balance",
-    "amount_total",
-    "amount_paid",
-    "amount_due",
-    "amount_return",
-    "amount_tax",
-    "amount_residual",
-    "credit",
-    "debit",
-    "credit_limit",
-    "qty",
-    "qty_available",
-    "quantity",
-    "stock_quantity",
+# Clés dont la valeur doit être convertie en STRING avec virgule.
+# À compléter uniquement pour les champs affichés/saisis par les pompistes.
+COMMA_STRING_KEYS: set[str] = {
+    # ex: "pump_index", "volume_display"  — à ajouter au besoin
 }
 
 
-def format_number(value: float) -> str:
+def _round_float(value: float) -> float | int:
+    """Arrondit un float à 3 décimales. Retourne un int si le résultat est entier."""
+    rounded = round(value, 3)
+    # Évite d'envoyer 3373573.0 au lieu de 3373573
+    if rounded == int(rounded):
+        return int(rounded)
+    return rounded
+
+
+def _to_comma_string(value: float) -> str:
     """Formate un float en string avec virgule et max 3 décimales."""
     rounded = round(value, 3)
     formatted = f"{rounded:.3f}".rstrip("0").rstrip(".")
     return formatted.replace(".", ",")
 
 
-def round_number(value: float) -> float:
-    """Arrondit un float à 3 décimales max (reste un number)."""
-    return round(value, 3)
-
-
 def clean_numbers(obj, parent_key: str = ""):
     """
-    Parcourt récursivement un dict/list et formate chaque float :
-    - Si la clé est dans NUMBER_KEYS → arrondi mais reste un float
-    - Sinon → converti en string avec virgule
-    Les int, str, bool et None ne sont pas touchés.
+    Parcourt récursivement un dict/list :
+    - float dans COMMA_STRING_KEYS → string avec virgule
+    - tout autre float             → arrondi, reste un number JSON
     """
     if isinstance(obj, dict):
-        return {
-            k: clean_numbers(v, parent_key=k)
-            for k, v in obj.items()
-        }
+        return {k: clean_numbers(v, parent_key=k) for k, v in obj.items()}
     if isinstance(obj, list):
         return [clean_numbers(item, parent_key=parent_key) for item in obj]
     if isinstance(obj, float):
-        if parent_key in NUMBER_KEYS:
-            return round_number(obj)
-        return format_number(obj)
+        if parent_key in COMMA_STRING_KEYS:
+            return _to_comma_string(obj)
+        return _round_float(obj)
     return obj
