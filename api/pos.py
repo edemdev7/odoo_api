@@ -4624,11 +4624,14 @@ async def open_pos_session(
                 for pump in request.pump_indexes:
                     logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
                 
-                # Mettre à jour la session dans Odoo avec le solde de départ (si fourni)
-                session_update = {'state': 'opened'}
-                if request.starting_balance is not None:
-                    session_update['cash_register_balance_start'] = request.starting_balance
-                    logger.info(f"Solde de départ caisse: {request.starting_balance}")
+                # Toujours écrire cash_register_balance_start pour éviter d'hériter
+                # du solde de fermeture de la session précédente.
+                opening_balance = request.starting_balance if request.starting_balance is not None else 0.0
+                session_update = {
+                    'state': 'opened',
+                    'cash_register_balance_start': opening_balance,
+                }
+                logger.info(f"Solde de départ caisse: {opening_balance}")
                 
                 client.execute_kw('pos.session', 'write', [[request.session_id], session_update])
                 
@@ -4699,9 +4702,9 @@ async def open_pos_session(
                 'user_id': current_user.get('employee_id', 1),  # Utiliser l'ID employé ou fallback
             }
             
-            # Ajouter le solde de départ si fourni
-            if request.starting_balance is not None:
-                session_vals['cash_register_balance_start'] = request.starting_balance
+            # Toujours initialiser cash_register_balance_start pour éviter d'hériter
+            # du solde de fermeture de la session précédente.
+            session_vals['cash_register_balance_start'] = request.starting_balance if request.starting_balance is not None else 0.0
             
             # Créer la session
             new_session_id = client.execute_kw(
