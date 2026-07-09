@@ -5231,61 +5231,90 @@ async def close_pos_session(
             'pos.session',
             'read',
             [session_id],
-            {'fields': ['state', 'cash_register_balance_start', 'cash_register_total_entry_encoding', 'order_count']}
+            {'fields': ['state', 'cash_register_balance_start', 'order_count']}
         )
-        
+
         if not session_data:
             raise HTTPException(status_code=404, detail="Session non trouvée")
-        
+
         session = session_data[0]
-        
-        # Récupérer le solde d'ouverture depuis Odoo
-        odoo_starting_balance = float(session.get('cash_register_balance_start', 0.0) or 0.0)
-        
-        # Récupérer le total des ventes cash de la session
-        # cash_register_total_entry_encoding = total des mouvements cash enregistrés
-        odoo_total_cash_entries = float(session.get('cash_register_total_entry_encoding', 0.0) or 0.0)
         order_count = int(session.get('order_count', 0) or 0)
-        
-        # Calculer aussi le total via les commandes POS de la session
+
+        # -----------------------------------------------------------------------
+        # Solde d'ouverture : on privilégie ce que le gérant a déclaré à
+        # l'ouverture (request.starting_balance).  Si absent, on lit Odoo.
+        # On NE fait PAS confiance à cash_register_balance_start d'Odoo car
+        # Odoo hérite parfois de la session précédente malgré notre write.
+        # -----------------------------------------------------------------------
+        effective_starting_balance = (
+            float(request.starting_balance)
+            if request.starting_balance is not None
+            else float(session.get('cash_register_balance_start', 0.0) or 0.0)
+        )
+
+        # -----------------------------------------------------------------------
+        # Total des ventes CASH uniquement (ce qui rentre physiquement en caisse).
+        # Les paiements TVPASS / carte / token n'entrent PAS dans la caisse.
+        # On filtre pos.payment par les méthodes de paiement is_cash_count=True.
+        # -----------------------------------------------------------------------
         try:
-            pos_orders = client.execute_kw(
-                'pos.order',
+            cash_methods = client.execute_kw(
+                'pos.payment.method',
                 'search_read',
-                [[['session_id', '=', session_id], ['state', 'in', ['paid', 'done', 'invoiced']]]],
-                {'fields': ['amount_total', 'amount_paid']}
+                [[('is_cash_count', '=', True)]],
+                {'fields': ['id', 'name']}
             )
-            total_sales_from_orders = sum(float(o.get('amount_paid', 0.0) or 0.0) for o in pos_orders)
-            order_count = len(pos_orders)
-            logger.info(f"Session {session_id}: {order_count} commande(s), total ventes={total_sales_from_orders}")
+            cash_method_ids = [m['id'] for m in cash_methods]
+            logger.info(f"Méthodes cash détectées: {[m['name'] for m in cash_methods]}")
         except Exception as e:
-            logger.warning(f"Impossible de récupérer les commandes POS: {e}")
-            total_sales_from_orders = odoo_total_cash_entries
-            order_count = session.get('order_count', 0)
-        
-        # Utiliser le total le plus fiable
-        total_sales = total_sales_from_orders if total_sales_from_orders > 0 else odoo_total_cash_entries
-        
-        # Vérification de cohérence du solde d'ouverture si fourni
-        if request.starting_balance is not None:
-            if abs(request.starting_balance - odoo_starting_balance) > 0.01:
-                logger.warning(
-                    f"Incohérence solde d'ouverture: Reçu={request.starting_balance}, "
-                    f"Odoo={odoo_starting_balance}"
-                )
-        
-        # === VÉRIFICATION DE COHÉRENCE : ending_balance == starting_balance + total_ventes ===
+            logger.warning(f"Impossible de récupérer les méthodes cash: {e}")
+            cash_method_ids = []
+
+        try:
+            cash_payment_domain = [('session_id', '=', session_id)]
+            if cash_method_ids:
+                cash_payment_domain.append(('payment_method_id', 'in', cash_method_ids))
+
+            cash_payments = client.execute_kw(
+                'pos.payment',
+                'search_read',
+                [cash_payment_domain],
+                {'fields': ['amount', 'payment_method_id']}
+            )
+            total_cash_sales = sum(float(p.get('amount', 0.0) or 0.0) for p in cash_payments)
+            logger.info(f"Session {session_id}: total cash={total_cash_sales} ({len(cash_payments)} paiement(s) cash)")
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer les paiements cash: {e}")
+            total_cash_sales = 0.0
+
+        # Total toutes méthodes confondues (pour le rapport, pas pour la vérification)
+        try:
+            all_payments = client.execute_kw(
+                'pos.payment',
+                'search_read',
+                [[('session_id', '=', session_id)]],
+                {'fields': ['amount']}
+            )
+            total_sales = sum(float(p.get('amount', 0.0) or 0.0) for p in all_payments)
+            order_count = order_count or len(all_payments)
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer tous les paiements: {e}")
+            total_sales = total_cash_sales
+
+        # -----------------------------------------------------------------------
+        # VÉRIFICATION DE COHÉRENCE (cash uniquement)
+        # ending_balance déclaré == starting_balance + total_cash_sales
+        # -----------------------------------------------------------------------
         if request.ending_balance is not None:
-            expected_balance = odoo_starting_balance + total_sales
+            expected_balance = effective_starting_balance + total_cash_sales
             difference = abs(request.ending_balance - expected_balance)
-            
+
             logger.info(
-                f"Vérification solde: starting={odoo_starting_balance}, "
-                f"total_ventes={total_sales}, expected_ending={expected_balance}, "
+                f"Vérification caisse: starting={effective_starting_balance}, "
+                f"cash_sales={total_cash_sales}, expected_ending={expected_balance}, "
                 f"declared_ending={request.ending_balance}, diff={difference}"
             )
-            
-            # Tolérance de 0.01 pour les arrondis
+
             if difference > 0.01:
                 if not request.forced:
                     raise HTTPException(
@@ -5295,12 +5324,14 @@ async def close_pos_session(
                             "message": (
                                 f"Le solde de fermeture déclaré ({request.ending_balance} FCFA) ne correspond pas "
                                 f"au solde attendu ({expected_balance} FCFA). "
-                                f"Détail: solde ouverture ({odoo_starting_balance}) + total ventes ({total_sales}) "
-                                f"= {expected_balance}. Différence: {difference} FCFA. "
+                                f"Détail: solde ouverture ({effective_starting_balance}) "
+                                f"+ ventes cash ({total_cash_sales}) = {expected_balance}. "
+                                f"Différence: {difference} FCFA. "
                                 f"Envoyez forced=true pour forcer la fermeture."
                             ),
-                            "starting_balance": odoo_starting_balance,
-                            "total_sales": total_sales,
+                            "starting_balance": effective_starting_balance,
+                            "total_cash_sales": total_cash_sales,
+                            "total_sales_all_methods": total_sales,
                             "expected_ending_balance": expected_balance,
                             "declared_ending_balance": request.ending_balance,
                             "difference": difference,
@@ -5407,9 +5438,10 @@ async def close_pos_session(
             'state': final_state,
             'message': message,
             'balance_summary': {
-                'starting_balance': odoo_starting_balance,
-                'total_sales': total_sales,
-                'expected_ending_balance': odoo_starting_balance + total_sales,
+                'starting_balance': effective_starting_balance,
+                'total_cash_sales': total_cash_sales,
+                'total_sales_all_methods': total_sales,
+                'expected_ending_balance': effective_starting_balance + total_cash_sales,
                 'declared_ending_balance': request.ending_balance,
                 'order_count': order_count,
                 'forced': request.forced
