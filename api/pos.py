@@ -5365,6 +5365,26 @@ async def close_pos_session(
         # -----------------------------------------------------------------------
         close_error_msg: str | None = None
 
+        # Pré-clôture : annuler les commandes encore en brouillon.
+        # Odoo refuse de fermer une session avec des orders en état 'draft'.
+        try:
+            draft_orders = client.execute_kw(
+                'pos.order', 'search_read',
+                [[('session_id', '=', session_id), ('state', '=', 'draft')]],
+                {'fields': ['id', 'name']}
+            )
+            if draft_orders:
+                draft_ids = [o['id'] for o in draft_orders]
+                draft_names = [o.get('name', str(o['id'])) for o in draft_orders]
+                logger.warning(
+                    f"{len(draft_ids)} commande(s) en brouillon détectée(s) dans la session "
+                    f"{session_id} — annulation automatique: {draft_names}"
+                )
+                client.execute_kw('pos.order', 'write', [draft_ids, {'state': 'cancel'}])
+                logger.info(f"Commandes brouillon annulées: {draft_ids}")
+        except Exception as e:
+            logger.warning(f"Impossible d'annuler les commandes brouillon: {e}")
+
         # Stratégie 1 : écrire 'closing_control' directement pour bypasser
         # _check_pos_session_balance() d'Odoo, puis appeler action_pos_session_close.
         try:
