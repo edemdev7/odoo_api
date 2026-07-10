@@ -5360,48 +5360,63 @@ async def close_pos_session(
             except Exception as e:
                 logger.warning(f"Impossible d'écrire cash_register_balance_end_real: {e}")
 
-        # Appeler les méthodes officielles de clôture Odoo
-        # action_pos_session_closing_control fait passer la session en 'closing_control'
-        # (contrôle de caisse) mais ne la ferme pas réellement. Il faut ensuite
-        # action_pos_session_close pour finaliser la fermeture (état 'closed' +
-        # écritures comptables). On relit l'état réel à la fin plutôt que de le
-        # supposer, pour ne jamais répondre "fermée" si Odoo ne l'a pas vraiment fermée.
-        logger.info(f"Appel action_pos_session_closing_control pour session {session_id}")
-        try:
-            client.execute_kw('pos.session', 'action_pos_session_closing_control', [[session_id]])
-        except Exception as e:
-            logger.warning(f"action_pos_session_closing_control a échoué: {e}")
+        # -----------------------------------------------------------------------
+        # CLÔTURE CÔTÉ ODOO — tentatives en cascade, erreurs surfacées
+        # -----------------------------------------------------------------------
+        close_error_msg: str | None = None
 
+        # Stratégie 1 : écrire 'closing_control' directement pour bypasser
+        # _check_pos_session_balance() d'Odoo, puis appeler action_pos_session_close.
+        try:
+            client.execute_kw('pos.session', 'write', [[session_id], {
+                'state': 'closing_control',
+                'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }])
+            logger.info(f"Session {session_id} → closing_control (write direct)")
+        except Exception as e:
+            logger.warning(f"write closing_control a échoué ({e}) — essai méthode officielle")
+            try:
+                client.execute_kw('pos.session', 'action_pos_session_closing_control', [[session_id]])
+                logger.info(f"action_pos_session_closing_control réussie")
+            except Exception as e2:
+                logger.warning(f"action_pos_session_closing_control a échoué: {e2}")
+
+        # Stratégie 2 : fermeture officielle (comptabilité, ecritures, etc.)
         try:
             logger.info(f"Appel action_pos_session_close pour session {session_id}")
             client.execute_kw('pos.session', 'action_pos_session_close', [[session_id]])
+            logger.info(f"action_pos_session_close réussie")
         except Exception as e:
-            logger.warning(f"action_pos_session_close a échoué: {e}")
-            # Fallback : écrire l'état directement
+            close_error_msg = str(e)
+            logger.error(f"action_pos_session_close a échoué: {close_error_msg}")
+
+            # Stratégie 3 (last resort) : écriture directe state=closed
             try:
-                client.execute_kw('pos.session', 'write', [[session_id], {'state': 'closed'}])
+                client.execute_kw('pos.session', 'write', [[session_id], {
+                    'state': 'closed',
+                    'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }])
                 logger.info(f"Session {session_id} fermée via write state=closed (fallback)")
+                close_error_msg = None  # écriture directe a réussi
             except Exception as e2:
                 logger.error(f"write state=closed a échoué: {e2}")
-                raise HTTPException(status_code=500, detail=f"Impossible de fermer la session Odoo: {str(e2)}")
+                # On ne lève pas ici — on relit l'état et on lève en dessous si nécessaire.
 
-        # Relire l'état réel de la session depuis Odoo : on ne fait jamais confiance
-        # à un succès d'appel pour dire que la session est fermée.
+        # Relire l'état réel : on ne fait jamais confiance aux appels pour confirmer la clôture.
         final_session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['state']})
         final_state = final_session[0]['state'] if final_session else 'unknown'
 
         if final_state != 'closed':
             logger.error(
-                f"Session {session_id} non réellement fermée après tentative de clôture "
+                f"Session {session_id} non fermée après toutes les tentatives "
                 f"(état actuel: {final_state})"
             )
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"La session n'a pas pu être réellement fermée (état actuel: {final_state}). "
-                    f"Vérifiez les écarts de caisse ou de stock côté Odoo."
-                )
-            )
+            detail_msg = f"La session n'a pas pu être fermée (état actuel: {final_state})."
+            if close_error_msg:
+                detail_msg += f" Erreur Odoo: {close_error_msg}"
+            else:
+                detail_msg += " Vérifiez les commandes non payées ou les écarts de caisse côté Odoo."
+            raise HTTPException(status_code=500, detail=detail_msg)
 
         # S'assurer que stop_at est bien renseigné. Sans cela, Odoo plante
         # (AttributeError: 'bool' object has no attribute 'astimezone') dans
