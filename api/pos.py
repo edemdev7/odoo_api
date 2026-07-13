@@ -5401,7 +5401,7 @@ async def close_pos_session(
             except Exception as e2:
                 logger.warning(f"action_pos_session_closing_control a échoué: {e2}")
 
-        # Stratégie 2 : fermeture officielle (comptabilité, ecritures, etc.)
+        # Stratégie 2 : fermeture officielle (comptabilité, écritures, etc.)
         try:
             logger.info(f"Appel action_pos_session_close pour session {session_id}")
             client.execute_kw('pos.session', 'action_pos_session_close', [[session_id]])
@@ -5410,17 +5410,25 @@ async def close_pos_session(
             close_error_msg = str(e)
             logger.error(f"action_pos_session_close a échoué: {close_error_msg}")
 
-            # Stratégie 3 (last resort) : écriture directe state=closed
-            try:
+        # Stratégie 3 (fallback systématique) : vérifier l'état immédiatement après
+        # l'appel. Odoo peut retourner sans exception mais renvoyer un dict wizard
+        # (action) au lieu de fermer réellement — dans ce cas l'état reste closing_control.
+        try:
+            interim = client.execute_kw('pos.session', 'read', [[session_id]], {'fields': ['state']})
+            interim_state = interim[0]['state'] if interim else 'unknown'
+            if interim_state != 'closed':
+                logger.warning(
+                    f"État après action_pos_session_close: {interim_state} "
+                    f"— write direct state=closed (fallback)"
+                )
                 client.execute_kw('pos.session', 'write', [[session_id], {
                     'state': 'closed',
                     'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 }])
-                logger.info(f"Session {session_id} fermée via write state=closed (fallback)")
-                close_error_msg = None  # écriture directe a réussi
-            except Exception as e2:
-                logger.error(f"write state=closed a échoué: {e2}")
-                # On ne lève pas ici — on relit l'état et on lève en dessous si nécessaire.
+                logger.info(f"Session {session_id} fermée via write direct (fallback)")
+                close_error_msg = None
+        except Exception as e_fb:
+            logger.error(f"Fallback write state=closed a échoué: {e_fb}")
 
         # Relire l'état réel : on ne fait jamais confiance aux appels pour confirmer la clôture.
         final_session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['state']})
