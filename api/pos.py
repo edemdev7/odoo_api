@@ -4624,7 +4624,7 @@ async def open_pos_session(
                 for pump in request.pump_indexes:
                     logger.info(f"Pompe {pump.name} ({pump.type}): Index de début = {pump.start_index}")
                 
-                # Toujours écrire cash_register_balance_start pour éviter d'hériter
+                 # Toujours écrire cash_register_balance_start pour éviter d'hériter
                 # du solde de fermeture de la session précédente.
                 opening_balance = request.starting_balance if request.starting_balance is not None else 0.0
                 session_update = {
@@ -5344,9 +5344,9 @@ async def close_pos_session(
                         f"Attendu={expected_balance}, Déclaré={request.ending_balance}"
                     )
         
-        if session['state'] not in ['opened', 'opening_control']:
+        if session['state'] not in ['opened', 'opening_control', 'closing_control']:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"La session ne peut pas être fermée. État actuel: {session['state']}"
             )
         
