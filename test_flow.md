@@ -50,6 +50,23 @@ Content-Type: application/json
 }
 ```
 
+**EXPLICATION ** 
+
+**`data.transfer`** — le transfert que tu viens de valider (la livraison qui vient d'être faite) :
+- `id` / `name` — identifiant Odoo et référence du bon de livraison (`WH/OUT/00042`)
+- `previous_state` — état avant la validation (`assigned` = était prêt à livrer)
+- `state` — état après validation (`done` = livraison confirmée dans Odoo, stock débité)
+- `date_done` — horodatage exact de la validation
+
+**`data.backorder`** — le reliquat généré automatiquement par Odoo pour la quantité non livrée. C'est un **nouveau transfert** lié au même besoin initial :
+- `id` / `name` — identifiant du nouveau bon de livraison reliquat (`WH/OUT/00042/001`)
+- `state` — `assigned` = le reliquat est déjà réservé et prêt à être livré dès disponibilité
+- `scheduled_date` — date de livraison prévue pour ce reliquat
+- `move_line_count` — nombre de lignes produit dans le reliquat (ici 1 produit en attente)
+
+**`data.is_partial`** — `true` si un reliquat a été créé (livraison incomplète), `false` si tout a été livré d'un coup. Le front peut s'en servir pour décider d'afficher ou non la section reliquat.
+
+**`data.lines_validated`** — nombre de lignes (`move_line`) traitées dans cet appel. Utile pour vérifier que toutes les lignes envoyées ont bien été prises en compte.
 ---
 
 **Étape 2 — valider le reliquat (les 20 000 L restants)**
