@@ -501,6 +501,29 @@ class StockPickingStateUpdateRequest(BaseModel):
     action: str = Field(..., description="Action à effectuer", pattern="^(confirm|assign|done|cancel)$")
     force: bool = Field(False, description="Forcer l'action même si les conditions ne sont pas remplies")
 
+class PartialDeliveryLine(BaseModel):
+    """Ligne de livraison partielle : quelle quantité a été effectivement livrée pour une move_line donnée."""
+    move_line_id: int = Field(..., description="ID de la ligne de mouvement (stock.move.line)")
+    qty_done: float = Field(..., ge=0, description="Quantité réellement livrée")
+
+class PartialDeliveryRequest(BaseModel):
+    """
+    Requête de validation partielle d'un transfert.
+
+    Odoo crée automatiquement un reliquat (backorder) pour la quantité restante
+    si `create_backorder=True`. Le prochain appel de cet endpoint sur le backorder
+    permet de livrer la tranche suivante.
+    """
+    lines: List[PartialDeliveryLine] = Field(
+        ...,
+        description="Liste des lignes avec la quantité réellement livrée pour chacune"
+    )
+    create_backorder: bool = Field(
+        True,
+        description="Créer un reliquat pour la quantité non livrée (recommandé). "
+                    "False = valider sans reliquat (les quantités non livrées sont perdues)."
+    )
+
 class StockPickingListRequest(BaseModel):
     pos_id: Optional[int] = Field(None, description="Filtrer par point de vente")
     state: Optional[str] = Field(None, description="Filtrer par état (draft/waiting/ready/done/cancel)")
