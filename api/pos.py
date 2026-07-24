@@ -16,7 +16,6 @@ from models.schemas import (
     ProductCreateRequest, PosProductAssignmentRequest, StockMovementRequest,
     StockLevelRequest, ProductStockResponse, StockPickingResponse,
     StockPickingStateUpdateRequest, StockPickingListRequest,
-    PartialDeliveryRequest,
     PosOrderCreateSimpleRequest, PosAddPaymentRequest,
     PosPaymentMethodCreateRequest
 )
@@ -1586,6 +1585,40 @@ async def adjust_product_stock(
 
 # ===== GESTION DES INVENTAIRES (STOCK.PICKING) =====
 
+def _build_product_summary(move_details: list, move_line_details: list) -> list:
+    """
+    Construit le résumé produit d'un transfert avec les bonnes quantités.
+
+    - quantity_demanded  : besoin initial (stock.move.product_uom_qty)
+    - quantity_to_deliver: quantité fixée par l'admin pour cette tranche
+                           (somme des stock.move.line.quantity pour ce move)
+    - is_partial         : True si quantity_to_deliver < quantity_demanded
+    """
+    # Grouper les move_lines par move_id pour sommer leurs quantités
+    ml_by_move: dict[int, float] = {}
+    for ml in move_line_details:
+        move_id = ml.get('move_id')
+        if isinstance(move_id, list):
+            move_id = move_id[0]
+        if move_id:
+            ml_by_move[move_id] = ml_by_move.get(move_id, 0.0) + float(ml.get('quantity') or 0)
+
+    summary = []
+    for move in move_details:
+        move_id = move.get('id')
+        qty_demanded = float(move.get('product_uom_qty') or 0)
+        qty_to_deliver = ml_by_move.get(move_id, qty_demanded)  # fallback = demandée
+        summary.append({
+            'product_name': move.get('product_details', {}).get('name', 'Produit inconnu'),
+            'product_code': move.get('product_details', {}).get('default_code'),
+            'quantity_demanded': qty_demanded,
+            'quantity_to_deliver': qty_to_deliver,
+            'is_partial': abs(qty_to_deliver - qty_demanded) > 0.01,
+            'uom': move.get('product_uom', [None, 'Unité'])[1] if move.get('product_uom') else 'Unité',
+        })
+    return summary
+
+
 @router.get("/{pos_id}/inventory/transfers", response_model=ApiResponse)
 async def get_pos_inventory_transfers(
     pos_id: int = Path(..., description="ID du point de vente"),
@@ -2122,7 +2155,26 @@ async def get_pos_inventory_transfers(
                     transfer['move_line_details'] = []
             else:
                 transfer['move_line_details'] = []
-            
+
+            # Calcul des quantités : demandée (move) vs à livrer (move_line)
+            # quantity_demanded  = somme des product_uom_qty sur stock.move (besoin initial)
+            # quantity_to_deliver = somme des 'quantity' sur stock.move.line (ce que l'admin a fixé)
+            # Si les deux diffèrent → livraison partielle, un reliquat sera créé à la validation
+            quantity_demanded = sum(
+                float(m.get('product_uom_qty') or 0)
+                for m in transfer.get('move_details', [])
+            )
+            quantity_to_deliver = sum(
+                float(ml.get('quantity') or 0)
+                for ml in transfer.get('move_line_details', [])
+            )
+            transfer['quantity_demanded'] = quantity_demanded
+            transfer['quantity_to_deliver'] = quantity_to_deliver
+            transfer['is_partial_delivery'] = (
+                quantity_to_deliver > 0 and
+                abs(quantity_to_deliver - quantity_demanded) > 0.01
+            )
+
             # Ajouter des informations sur le type de picking avec plus de détails
             if transfer.get('picking_type_id'):
                 try:
@@ -2146,7 +2198,7 @@ async def get_pos_inventory_transfers(
                     transfer['picking_type_details'] = {}
             else:
                 transfer['picking_type_details'] = {}
-        
+
         # Formater les résultats - Créer directement le dictionnaire avec tous les détails
         def clean_odoo_value(value):
             """Nettoyer les valeurs False d'Odoo"""
@@ -2244,12 +2296,17 @@ async def get_pos_inventory_transfers(
                     'quality_check_todo': clean_odoo_value(transfer.get('quality_check_todo')),
                     'quality_check_fail': clean_odoo_value(transfer.get('quality_check_fail')),
                     
+                    # Quantités : demandée vs réellement à livrer dans cette tranche
+                    'quantity_demanded': transfer.get('quantity_demanded', 0),
+                    'quantity_to_deliver': transfer.get('quantity_to_deliver', 0),
+                    'is_partial_delivery': transfer.get('is_partial_delivery', False),
+
                     # Détails enrichis
                     'move_details': transfer.get('move_details', []),
                     'move_line_details': transfer.get('move_line_details', []),
                     'carrier_details': transfer.get('carrier_details', {}),
                     'picking_type_details': transfer.get('picking_type_details', {}),
-                    
+
                     # Détails des localisations (source et destination)
                     'location_source_details': transfer.get('location_source_details', None),
                     'location_destination_details': transfer.get('location_destination_details', None),
@@ -2846,21 +2903,23 @@ async def get_transfers_by_truck(
                     'create_uid': clean_odoo_value(transfer.get('create_uid')),
                     'write_uid': clean_odoo_value(transfer.get('write_uid')),
                     
+                    # Quantités : demandée vs à livrer dans cette tranche
+                    'quantity_demanded': transfer.get('quantity_demanded', 0),
+                    'quantity_to_deliver': transfer.get('quantity_to_deliver', 0),
+                    'is_partial_delivery': transfer.get('is_partial_delivery', False),
+
                     # Détails enrichis
                     'move_details': transfer.get('move_details', []),
                     'move_line_details': transfer.get('move_line_details', []),
                     'picking_type_details': transfer.get('picking_type_details', {}),
-                    
+
                     # Résumé des produits
-                    'product_summary': [
-                        {
-                            'product_name': move.get('product_details', {}).get('name', 'Produit inconnu'),
-                            'product_code': move.get('product_details', {}).get('default_code'),
-                            'quantity': move.get('product_uom_qty', 0),
-                            'uom': move.get('product_uom', [None, 'Unité'])[1] if move.get('product_uom') else 'Unité'
-                        }
-                        for move in transfer.get('move_details', [])
-                    ]
+                    # quantity_demanded = besoin initial (stock.move.product_uom_qty)
+                    # quantity_to_deliver = ce que l'admin a fixé pour cette tranche (stock.move.line.quantity)
+                    'product_summary': _build_product_summary(
+                        transfer.get('move_details', []),
+                        transfer.get('move_line_details', [])
+                    )
                 }
                 
                 formatted_transfers.append(formatted_transfer)
@@ -3008,21 +3067,78 @@ async def update_inventory_transfer_state(
                     raise ValueError(f"Le transfert doit être confirmé pour réserver les produits (état actuel: {current_state})")
             
             elif request.action == "done":
-                # Valider le transfert (ready/assigned → done)
-                if current_state in ['assigned', 'confirmed']:
-                    # Vérifier si des quantités sont définies
-                    client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                    success = True
-                    new_state = 'done'
-                    logger.info(f"✅ Transfert {transfer_name} validé et terminé")
-                elif request.force:
-                    client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                    success = True
-                    new_state = 'done'
+                # Valider le transfert avec gestion automatique du reliquat.
+                # Si l'admin a fixé une quantité inférieure à la demande initiale dans Odoo
+                # (stock.move.line.quantity < stock.move.product_uom_qty), on écrit qty_done
+                # avant de valider pour que Odoo génère le reliquat automatiquement.
+                if current_state not in ['assigned', 'confirmed', 'partially_available'] and not request.force:
+                    raise ValueError(f"Le transfert doit être assigné pour être validé (état actuel: {current_state})")
+
+                # Lire move_lines et moves pour détecter une livraison partielle
+                ml_ids = transfer.get('move_line_ids') or []
+                m_ids = transfer.get('move_ids') or []
+                move_lines, moves = [], []
+                if ml_ids:
+                    move_lines = client.execute_kw(
+                        'stock.move.line', 'read', [ml_ids],
+                        {'fields': ['id', 'quantity', 'qty_done']}
+                    )
+                if m_ids:
+                    moves = client.execute_kw(
+                        'stock.move', 'read', [m_ids],
+                        {'fields': ['id', 'product_uom_qty']}
+                    )
+
+                qty_demanded = sum(float(m.get('product_uom_qty') or 0) for m in moves)
+                qty_to_deliver = sum(float(ml.get('quantity') or 0) for ml in move_lines)
+                is_partial = qty_to_deliver > 0 and abs(qty_to_deliver - qty_demanded) > 0.01
+
+                if is_partial:
+                    # Écrire qty_done = quantity sur chaque move_line
+                    for ml in move_lines:
+                        client.execute_kw(
+                            'stock.move.line', 'write',
+                            [[ml['id']], {'qty_done': float(ml.get('quantity') or 0)}]
+                        )
+                    logger.info(
+                        f"Livraison partielle détectée: {qty_to_deliver}/{qty_demanded} — "
+                        f"qty_done écrit sur {len(move_lines)} move_line(s)"
+                    )
+
+                # Valider
+                validate_result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                logger.info(f"button_validate → {type(validate_result).__name__}: {validate_result}")
+
+                # Gérer les wizards Odoo (reliquat ou transfert immédiat)
+                if isinstance(validate_result, dict):
+                    res_model = validate_result.get('res_model', '')
+                    wizard_id = validate_result.get('res_id')
+                    try:
+                        if res_model == 'stock.backorder.confirmation':
+                            if not wizard_id:
+                                wizard_id = client.execute_kw(
+                                    'stock.backorder.confirmation', 'create',
+                                    [{'pick_ids': [(4, transfer_id)], 'show_transfers': False}]
+                                )
+                            client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
+                            logger.info(f"Reliquat confirmé via wizard {wizard_id}")
+                        elif res_model == 'stock.immediate.transfer':
+                            if not wizard_id:
+                                wizard_id = client.execute_kw(
+                                    'stock.immediate.transfer', 'create',
+                                    [{'pick_ids': [(4, transfer_id)]}]
+                                )
+                            client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
+                            logger.info(f"Immediate transfer wizard traité: {wizard_id}")
+                    except Exception as e_wiz:
+                        logger.warning(f"Gestion wizard échouée: {e_wiz}")
+
+                success = True
+                if request.force and current_state not in ['assigned', 'confirmed', 'partially_available']:
                     logger.warning(f"⚠️ Transfert {transfer_name} validé en mode forcé (état initial: {current_state})")
                 else:
-                    raise ValueError(f"Le transfert doit être assigné pour être validé (état actuel: {current_state})")
-            
+                    logger.info(f"✅ Transfert {transfer_name} validé")
+
             elif request.action == "cancel":
                 # Annuler le transfert
                 if current_state != 'done':
@@ -3040,17 +3156,34 @@ async def update_inventory_transfer_state(
             
             # Récupérer l'état mis à jour
             updated_transfer = client.execute_kw(
-                'stock.picking',
-                'read',
-                [[transfer_id]],
-                {'fields': ['id', 'name', 'state']}
+                'stock.picking', 'read', [[transfer_id]],
+                {'fields': ['id', 'name', 'state', 'date_done', 'backorder_ids']}
             )
-            
             if updated_transfer:
                 new_state = updated_transfer[0]['state']
-            
+
             logger.info(f"📊 Résultat: {transfer_name} - {current_state} → {new_state} (succès: {success})")
-            
+
+            # Pour action=done, récupérer le reliquat éventuellement créé
+            backorder_info = None
+            if request.action == "done" and updated_transfer:
+                backorder_ids = updated_transfer[0].get('backorder_ids') or []
+                if backorder_ids:
+                    backorders = client.execute_kw(
+                        'stock.picking', 'read', [backorder_ids],
+                        {'fields': ['id', 'name', 'state', 'scheduled_date']}
+                    )
+                    open_bo = [b for b in backorders if b.get('state') not in ('cancel', 'done')]
+                    if open_bo:
+                        bo = open_bo[-1]
+                        backorder_info = {
+                            'id': bo['id'],
+                            'name': bo['name'],
+                            'state': bo['state'],
+                            'scheduled_date': bo.get('scheduled_date') or None,
+                            'quantity_remaining': round(qty_demanded - qty_to_deliver, 3) if is_partial else 0,
+                        }
+
             return ApiResponse(
                 success=True,
                 data={
@@ -3059,9 +3192,14 @@ async def update_inventory_transfer_state(
                     'action': request.action,
                     'previous_state': current_state,
                     'new_state': new_state,
-                    'state_changed': new_state != current_state
+                    'state_changed': new_state != current_state,
+                    'backorder': backorder_info,
+                    'is_partial': backorder_info is not None,
                 },
-                message=f"Action '{request.action}' effectuée sur le transfert {transfer_name}: {current_state} → {new_state}"
+                message=(
+                    f"Action '{request.action}' effectuée sur {transfer_name}: {current_state} → {new_state}"
+                    + (f". Reliquat créé : {backorder_info['name']}" if backorder_info else "")
+                )
             )
             
         except ValueError as ve:
@@ -3083,227 +3221,6 @@ async def update_inventory_transfer_state(
             detail=f"Erreur lors de la mise à jour: {str(e)}"
         )
 
-# ===== LIVRAISONS PARTIELLES (BACKORDER) =====
-
-@router.post("/inventory/transfers/{transfer_id}/validate-partial", response_model=ApiResponse)
-async def validate_partial_transfer(
-    transfer_id: int = Path(..., description="ID du transfert (stock.picking)"),
-    request: PartialDeliveryRequest = Body(...),
-    current_user: dict = Depends(require_scope("pos"))
-):
-    """
-    Valider une livraison partielle et générer un reliquat (backorder) automatiquement.
-
-    Permet de livrer une quantité inférieure à la quantité prévue. Odoo crée alors
-    un nouveau transfert (reliquat) pour la quantité restante, rattaché au même
-    besoin d'approvisionnement initial.
-
-    **Exemple de flux :**
-    1. Transfert initial : 50 000 L commandés
-    2. `validate-partial` avec qty_done=30 000 → transfert validé (30 000 L) + reliquat créé (20 000 L)
-    3. `validate-partial` sur le reliquat avec qty_done=20 000 → transfert clôturé complètement
-
-    **Corps de la requête :**
-    ```json
-    {
-      "lines": [
-        {"move_line_id": 1234, "qty_done": 30000}
-      ],
-      "create_backorder": true
-    }
-    ```
-
-    **Réponse :**
-    - `transfer` : état final du transfert validé
-    - `backorder` : reliquat créé (null si livraison complète ou create_backorder=false)
-    - `is_partial` : true si un reliquat a été généré
-
-    **Requires:** Authentification JWT avec scope 'pos'
-    """
-    try:
-        client = get_odoo_client(current_user)
-
-        # 1. Vérifier que le transfert existe et est validable
-        picking = client.execute_kw(
-            'stock.picking', 'search_read',
-            [[('id', '=', transfer_id)]],
-            {'fields': ['id', 'name', 'state', 'move_line_ids', 'backorder_id', 'backorder_ids'], 'limit': 1}
-        )
-        if not picking:
-            raise HTTPException(status_code=404, detail=f"Transfert {transfer_id} introuvable")
-
-        picking = picking[0]
-        transfer_name = picking['name']
-        current_state = picking['state']
-
-        if current_state not in ['assigned', 'confirmed', 'partially_available']:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Le transfert {transfer_name} ne peut pas être validé partiellement "
-                    f"(état actuel: {current_state}). "
-                    f"Il doit être en état 'assigned' (prêt), 'confirmed' ou 'partially_available'."
-                )
-            )
-
-        # 2. Vérifier que les move_line_id fournis appartiennent bien à ce transfert
-        valid_line_ids = set(picking.get('move_line_ids') or [])
-        for line in request.lines:
-            if line.move_line_id not in valid_line_ids:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"La ligne {line.move_line_id} n'appartient pas au transfert {transfer_name}. "
-                        f"Lignes valides : {sorted(valid_line_ids)}"
-                    )
-                )
-
-        logger.info(
-            f"Validation partielle du transfert {transfer_name} (ID: {transfer_id}) — "
-            f"{len(request.lines)} ligne(s), create_backorder={request.create_backorder}"
-        )
-
-        # 3. Écrire qty_done sur chaque stock.move.line
-        for line in request.lines:
-            client.execute_kw(
-                'stock.move.line', 'write',
-                [[line.move_line_id], {'qty_done': line.qty_done}]
-            )
-            logger.info(f"  move_line {line.move_line_id} → qty_done={line.qty_done}")
-
-        # 4. Appeler button_validate
-        # Odoo peut retourner :
-        #  - False/True                          → validé directement (livraison complète)
-        #  - {'res_model': 'stock.backorder.confirmation'}  → reliquat à confirmer
-        #  - {'res_model': 'stock.immediate.transfer'}      → wizard de transfert immédiat
-        validate_result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-        logger.info(f"button_validate résultat: {type(validate_result).__name__} = {validate_result}")
-
-        # 5. Gérer les wizards retournés par Odoo
-        backorder_picking = None
-
-        if isinstance(validate_result, dict):
-            res_model = validate_result.get('res_model', '')
-
-            if res_model == 'stock.backorder.confirmation':
-                # Odoo demande confirmation pour créer le reliquat
-                if request.create_backorder:
-                    # Créer le wizard et confirmer la création du reliquat
-                    try:
-                        # Odoo 16/17 : le wizard est déjà créé, on récupère son ID depuis le context
-                        wizard_id = validate_result.get('res_id')
-                        if not wizard_id:
-                            ctx = validate_result.get('context', {})
-                            wizard_id = ctx.get('active_id') or ctx.get('default_pick_id')
-                        if not wizard_id:
-                            wizard_id = client.execute_kw(
-                                'stock.backorder.confirmation', 'create',
-                                [{'pick_ids': [(4, transfer_id)], 'show_transfers': False}]
-                            )
-                        client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                        logger.info(f"Reliquat confirmé via wizard {wizard_id}")
-                    except Exception as e:
-                        logger.warning(f"Wizard backorder échoué ({e}) — tentative directe")
-                        # Fallback : chercher le backorder créé ou déclencher action_generate_immediate_wizard
-                        try:
-                            client.execute_kw('stock.picking', '_action_generate_backorder_wizard', [[transfer_id]])
-                        except Exception:
-                            pass
-                else:
-                    # Ne pas créer de reliquat : valider sans la quantité restante
-                    try:
-                        wizard_id = validate_result.get('res_id')
-                        if not wizard_id:
-                            wizard_id = client.execute_kw(
-                                'stock.backorder.confirmation', 'create',
-                                [{'pick_ids': [(4, transfer_id)], 'show_transfers': False}]
-                            )
-                        client.execute_kw(
-                            'stock.backorder.confirmation', 'process_cancel_backorder', [[wizard_id]]
-                        )
-                        logger.info(f"Validation sans reliquat (process_cancel_backorder)")
-                    except Exception as e:
-                        logger.warning(f"process_cancel_backorder échoué: {e}")
-
-            elif res_model == 'stock.immediate.transfer':
-                # Wizard de transfert immédiat (toutes les qty_done à zéro → Odoo demande quoi faire)
-                try:
-                    wizard_id = validate_result.get('res_id')
-                    if not wizard_id:
-                        wizard_id = client.execute_kw(
-                            'stock.immediate.transfer', 'create',
-                            [{'pick_ids': [(4, transfer_id)]}]
-                        )
-                    client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
-                    logger.info(f"Immediate transfer wizard traité: {wizard_id}")
-                except Exception as e:
-                    logger.warning(f"Immediate transfer wizard échoué: {e}")
-
-            else:
-                logger.info(f"Wizard inconnu retourné par button_validate: {res_model} — on continue")
-
-        # 6. Relire l'état final du transfert
-        final_picking = client.execute_kw(
-            'stock.picking', 'read', [[transfer_id]],
-            {'fields': ['id', 'name', 'state', 'date_done', 'backorder_ids', 'backorder_id']}
-        )
-        final_state = final_picking[0] if final_picking else {}
-        actual_state = final_state.get('state', 'unknown')
-
-        # 7. Récupérer le backorder s'il a été créé
-        backorder_ids = final_state.get('backorder_ids') or []
-        # Filtrer les reliquats non-annulés
-        if backorder_ids:
-            backorders = client.execute_kw(
-                'stock.picking', 'read', [backorder_ids],
-                {'fields': ['id', 'name', 'state', 'scheduled_date', 'move_line_ids']}
-            )
-            # Prendre le reliquat le plus récent (dernier ID)
-            open_backorders = [b for b in backorders if b.get('state') not in ('cancel', 'done')]
-            if open_backorders:
-                bo = open_backorders[-1]
-                backorder_picking = {
-                    'id': bo['id'],
-                    'name': bo['name'],
-                    'state': bo['state'],
-                    'scheduled_date': bo.get('scheduled_date') or None,
-                    'move_line_count': len(bo.get('move_line_ids') or []),
-                }
-
-        is_partial = backorder_picking is not None
-        logger.info(
-            f"Validation partielle terminée — {transfer_name}: {current_state} → {actual_state}, "
-            f"reliquat: {backorder_picking['name'] if backorder_picking else 'aucun'}"
-        )
-
-        return ApiResponse(
-            success=True,
-            data={
-                'transfer': {
-                    'id': transfer_id,
-                    'name': transfer_name,
-                    'previous_state': current_state,
-                    'state': actual_state,
-                    'date_done': final_state.get('date_done') or None,
-                },
-                'backorder': backorder_picking,
-                'is_partial': is_partial,
-                'lines_validated': len(request.lines),
-            },
-            message=(
-                f"Livraison partielle validée ({transfer_name}). "
-                + (f"Reliquat créé : {backorder_picking['name']}." if is_partial else "Livraison complète.")
-            )
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur validation partielle du transfert {transfer_id}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur lors de la validation partielle: {str(e)}"
-        )
 
 
 # ===== GESTION DES CAMIONS (FLEET) =====
