@@ -2845,7 +2845,21 @@ async def get_transfers_by_truck(
                     transfer['picking_type_details'] = {}
             else:
                 transfer['picking_type_details'] = {}
-        
+
+            # Calcul des quantités : demandée (move) vs à livrer (move_line)
+            transfer['quantity_demanded'] = sum(
+                float(m.get('product_uom_qty') or 0)
+                for m in transfer.get('move_details', [])
+            )
+            transfer['quantity_to_deliver'] = sum(
+                float(ml.get('quantity') or 0)
+                for ml in transfer.get('move_line_details', [])
+            )
+            transfer['is_partial_delivery'] = (
+                transfer['quantity_to_deliver'] > 0 and
+                abs(transfer['quantity_to_deliver'] - transfer['quantity_demanded']) > 0.01
+            )
+
         # Formater les résultats
         def clean_odoo_value(value):
             return None if value is False else value
