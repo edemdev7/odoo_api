@@ -3036,7 +3036,7 @@ async def update_inventory_transfer_state(
             'stock.picking',
             'search_read',
             [[('id', '=', transfer_id)]],
-            {'fields': ['id', 'name', 'state', 'picking_type_code'], 'limit': 1}
+            {'fields': ['id', 'name', 'state', 'picking_type_code', 'move_ids', 'move_line_ids'], 'limit': 1}
         )
         
         if not transfer:
@@ -3198,6 +3198,27 @@ async def update_inventory_transfer_state(
                             'quantity_remaining': round(qty_demanded - qty_to_deliver, 3) if is_partial else 0,
                         }
 
+            state_changed = new_state != current_state
+
+            # Faux succès : action=done mais l'état n'a pas changé → échec réel
+            if request.action == "done" and not state_changed:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "validation_failed",
+                        "message": (
+                            f"Le transfert {transfer_name} n'a pas pu être validé "
+                            f"(état actuel: {new_state}). "
+                            f"Vérifiez que les quantités (qty_done) sont correctement renseignées "
+                            f"ou que le stock est disponible."
+                        ),
+                        "transfer_id": transfer_id,
+                        "transfer_name": transfer_name,
+                        "state": new_state,
+                        "is_partial_delivery": is_partial if request.action == "done" else None,
+                    }
+                )
+
             return ApiResponse(
                 success=True,
                 data={
@@ -3206,7 +3227,7 @@ async def update_inventory_transfer_state(
                     'action': request.action,
                     'previous_state': current_state,
                     'new_state': new_state,
-                    'state_changed': new_state != current_state,
+                    'state_changed': state_changed,
                     'backorder': backorder_info,
                     'is_partial': backorder_info is not None,
                 },
