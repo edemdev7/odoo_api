@@ -3137,13 +3137,9 @@ async def update_inventory_transfer_state(
                             )
 
                             if isinstance(validate_result2, dict):
-                                # Tentative 2: wizard + ligne inline + process().
-                                # On crée le wizard avec la ligne directement dans le create (commande (0,0,{}))
-                                # pour s'assurer que la One2many est bien liée dans la même transaction.
-                                logger.info(
-                                    "skip_backorder_confirmation ignoré par cette version Odoo "
-                                    "→ wizard + ligne inline"
-                                )
+                                logger.info("skip_backorder_confirmation ignoré → tentatives wizard")
+
+                                # Créer le wizard avec pick_ids + ligne inline
                                 wizard_id = client.execute_kw(
                                     'stock.backorder.confirmation', 'create',
                                     [{
@@ -3155,19 +3151,56 @@ async def update_inventory_transfer_state(
                                         })]
                                     }]
                                 )
-                                # Lire le wizard pour vérifier que les lignes sont bien liées
                                 wiz_data = client.execute_kw(
                                     'stock.backorder.confirmation', 'read',
                                     [[wizard_id]],
                                     {'fields': ['pick_ids', 'backorder_confirmation_line_ids']}
                                 )
                                 logger.info(
-                                    f"Wizard {wizard_id}: "
-                                    f"pick_ids={wiz_data[0].get('pick_ids')}, "
+                                    f"Wizard {wizard_id}: pick_ids={wiz_data[0].get('pick_ids')}, "
                                     f"lines={wiz_data[0].get('backorder_confirmation_line_ids')}"
                                 )
-                                client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                                logger.info(f"process() appelé sur wizard {wizard_id}")
+
+                                # Tentative A: process() — crée reliquat, appelle _action_done en interne (Odoo 16)
+                                # ou button_validate(skip_backorder_confirmation) en interne (Odoo 17)
+                                proc_result = client.execute_kw(
+                                    'stock.backorder.confirmation', 'process', [[wizard_id]]
+                                )
+                                logger.info(f"process() → {type(proc_result).__name__}: {proc_result}")
+
+                                # Vérification immédiate après process()
+                                chk = client.execute_kw(
+                                    'stock.picking', 'read', [[transfer_id]],
+                                    {'fields': ['state', 'date_done', 'backorder_ids']}
+                                )
+                                logger.info(
+                                    f"État immédiat après process(): state={chk[0]['state']}, "
+                                    f"date_done={chk[0]['date_done']}, "
+                                    f"backorder_ids={chk[0]['backorder_ids']}"
+                                )
+
+                                # Tentative B: process_cancel_backorder() si picking toujours assigned
+                                # En Odoo 16/17 : appelle self.pick_ids._action_done() directement
+                                # (bouton "Pas de reliquat" du wizard) — bypass button_validate
+                                if chk[0]['state'] != 'done':
+                                    logger.info("process() inefficace → tentative process_cancel_backorder()")
+                                    pcb_result = client.execute_kw(
+                                        'stock.backorder.confirmation',
+                                        'process_cancel_backorder',
+                                        [[wizard_id]]
+                                    )
+                                    logger.info(
+                                        f"process_cancel_backorder() → "
+                                        f"{type(pcb_result).__name__}: {pcb_result}"
+                                    )
+                                    chk2 = client.execute_kw(
+                                        'stock.picking', 'read', [[transfer_id]],
+                                        {'fields': ['state', 'date_done']}
+                                    )
+                                    logger.info(
+                                        f"État immédiat après process_cancel_backorder(): "
+                                        f"state={chk2[0]['state']}, date_done={chk2[0]['date_done']}"
+                                    )
                             else:
                                 logger.info(
                                     f"Reliquat: skip_backorder_confirmation accepté "
