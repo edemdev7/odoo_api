@@ -3151,8 +3151,15 @@ async def update_inventory_transfer_state(
                         f"qty_done écrit sur {len(move_lines)} move_line(s)"
                     )
 
-                # Valider
-                validate_result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                # Valider.
+                # skip_sanity_check=True : bypass le contrôle "Pas assez de stock"
+                # (utilisé par Odoo en interne dans process_cancel_backorder).
+                # Nécessaire pour les livraisons partielles où la réduction de product_uom_qty
+                # a libéré la réservation stock avant validation.
+                validate_result = client.execute_kw(
+                    'stock.picking', 'button_validate', [[transfer_id]],
+                    {'context': {'skip_sanity_check': True}}
+                )
                 logger.info(f"button_validate → {type(validate_result).__name__}: {validate_result}")
 
                 # Gérer les wizards Odoo (reliquat ou transfert immédiat)
