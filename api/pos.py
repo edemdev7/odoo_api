@@ -1585,6 +1585,93 @@ async def adjust_product_stock(
 
 # ===== GESTION DES INVENTAIRES (STOCK.PICKING) =====
 
+def _check_source_stock_availability(client, move_lines: list) -> list:
+    """
+    Vérifie que l'emplacement source contient physiquement les quantités déclarées.
+
+    Odoo autorise le stock négatif sur les emplacements internes : écrire qty_done
+    directement fait descendre le quant sous zéro sans lever d'erreur. Ce contrôle
+    empêche par exemple de déclarer la livraison de 1 000 000 L depuis un camion
+    qui n'en contient que 30 000.
+
+    Le stock disponible est calculé par (produit, emplacement) en agrégeant les
+    quants de l'emplacement et de ses sous-emplacements :
+        disponible = quantity - reserved_quantity + réservation propre au transfert
+
+    La réservation propre au transfert est réintégrée : elle est légitime puisque
+    c'est précisément ce transfert qu'on est en train de valider.
+
+    Retourne une liste de dicts décrivant les manquants (vide si tout est bon).
+    """
+    if not move_lines:
+        return []
+
+    # Agréger les quantités demandées par (produit, emplacement source)
+    needs: dict[tuple, dict] = {}
+    for ml in move_lines:
+        qty = float(ml.get('quantity') or 0)
+        if qty <= 0:
+            continue
+        prod = ml.get('product_id')
+        loc = ml.get('location_id')
+        if not prod or not loc:
+            continue
+        prod_id = prod[0] if isinstance(prod, list) else prod
+        prod_name = prod[1] if isinstance(prod, list) else str(prod)
+        loc_id = loc[0] if isinstance(loc, list) else loc
+        loc_name = loc[1] if isinstance(loc, list) else str(loc)
+        uom = ml.get('product_uom_id')
+        uom_name = uom[1] if isinstance(uom, list) else 'Unité'
+
+        key = (prod_id, loc_id)
+        if key not in needs:
+            needs[key] = {
+                'product_id': prod_id,
+                'product_name': prod_name,
+                'location_id': loc_id,
+                'location_name': loc_name,
+                'uom': uom_name,
+                'requested': 0.0,
+            }
+        needs[key]['requested'] += qty
+
+    shortages = []
+    for (prod_id, loc_id), need in needs.items():
+        try:
+            quants = client.execute_kw(
+                'stock.quant', 'search_read',
+                [[('location_id', 'child_of', loc_id), ('product_id', '=', prod_id)]],
+                {'fields': ['quantity', 'reserved_quantity']}
+            )
+        except Exception as e:
+            logger.warning(
+                f"Contrôle stock impossible (produit {prod_id}, emplacement {loc_id}): {e}"
+            )
+            continue
+
+        on_hand = sum(float(q.get('quantity') or 0) for q in quants)
+        reserved = sum(float(q.get('reserved_quantity') or 0) for q in quants)
+        requested = need['requested']
+
+        # La réservation de ce transfert fait partie de `reserved` : on la réintègre
+        # pour ne pas la compter deux fois.
+        available = on_hand - max(reserved - requested, 0.0)
+
+        if requested - available > 0.01:
+            shortages.append({
+                'product': need['product_name'],
+                'location': need['location_name'],
+                'uom': need['uom'],
+                'quantity_requested': round(requested, 3),
+                'quantity_available': round(available, 3),
+                'quantity_on_hand': round(on_hand, 3),
+                'quantity_reserved_by_others': round(max(reserved - requested, 0.0), 3),
+                'missing': round(requested - available, 3),
+            })
+
+    return shortages
+
+
 def _build_product_summary(move_details: list, move_line_details: list) -> list:
     """
     Construit le résumé produit d'un transfert avec les bonnes quantités.
@@ -3095,17 +3182,42 @@ async def update_inventory_transfer_state(
                 if ml_ids:
                     move_lines = client.execute_kw(
                         'stock.move.line', 'read', [ml_ids],
-                        {'fields': ['id', 'quantity', 'qty_done', 'move_id']}
+                        {'fields': ['id', 'quantity', 'qty_done', 'move_id', 'product_id',
+                                    'location_id', 'product_uom_id']}
                     )
                 if m_ids:
                     moves = client.execute_kw(
                         'stock.move', 'read', [m_ids],
-                        {'fields': ['id', 'product_uom_qty']}
+                        {'fields': ['id', 'product_uom_qty', 'product_id']}
                     )
 
                 qty_demanded = sum(float(m.get('product_uom_qty') or 0) for m in moves)
                 qty_to_deliver = sum(float(ml.get('quantity') or 0) for ml in move_lines)
                 is_partial = qty_to_deliver > 0 and abs(qty_to_deliver - qty_demanded) > 0.01
+
+                # ===== CONTRÔLE DE DISPONIBILITÉ RÉELLE =====
+                # Odoo autorise le stock négatif sur les emplacements internes : écrire
+                # qty_done directement fait passer le quant en négatif sans erreur.
+                # On vérifie donc explicitement que le véhicule/emplacement source
+                # contient physiquement la quantité déclarée avant de valider.
+                _stock_errors = _check_source_stock_availability(client, move_lines)
+                if _stock_errors:
+                    logger.warning(
+                        f"🚫 Validation bloquée — stock insuffisant sur {transfer_name}: {_stock_errors}"
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "insufficient_source_stock",
+                            "message": (
+                                "Quantité déclarée supérieure au stock réellement disponible "
+                                "dans le véhicule. Validation bloquée."
+                            ),
+                            "transfer_id": transfer_id,
+                            "transfer_name": transfer_name,
+                            "shortages": _stock_errors,
+                        }
+                    )
 
                 if is_partial:
                     # Écrire qty_done = quantity sur chaque move_line.
