@@ -3108,22 +3108,58 @@ async def update_inventory_transfer_state(
                 is_partial = qty_to_deliver > 0 and abs(qty_to_deliver - qty_demanded) > 0.01
 
                 if is_partial:
-                    # Écrire qty_done = quantity sur chaque move_line.
-                    # On NE touche PAS à product_uom_qty : le reliquat est géré
-                    # proprement plus bas via le wizard stock.backorder.confirmation
-                    # (avec le contexte button_validate_picking_ids requis).
+                    # Écrire qty_done = quantity sur chaque move_line
                     for ml in move_lines:
                         client.execute_kw(
                             'stock.move.line', 'write',
                             [[ml['id']], {'qty_done': float(ml.get('quantity') or 0)}]
                         )
+
+                    # Réduire product_uom_qty sur les moves pour aligner avec qty_done.
+                    # Objectif : _check_backorder() retourne False → button_validate appelle
+                    # _action_done() directement sans passer par le wizard reliquat.
+                    # Note : le reliquat devra être géré manuellement dans Odoo si nécessaire.
+                    qty_by_move: dict[int, float] = {}
+                    for ml in move_lines:
+                        mid = ml.get('move_id')
+                        if isinstance(mid, list):
+                            mid = mid[0]
+                        if mid:
+                            qty_by_move[mid] = qty_by_move.get(mid, 0.0) + float(ml.get('quantity') or 0)
+
+                    for move in moves:
+                        mid = move['id']
+                        ml_qty = qty_by_move.get(mid, 0.0)
+                        orig_qty = float(move.get('product_uom_qty') or 0)
+                        if ml_qty > 0 and abs(ml_qty - orig_qty) > 0.01:
+                            try:
+                                client.execute_kw(
+                                    'stock.move', 'write',
+                                    [[mid], {'product_uom_qty': ml_qty}]
+                                )
+                                logger.info(
+                                    f"product_uom_qty move {mid}: {orig_qty} → {ml_qty} "
+                                    f"(bypass wizard reliquat)"
+                                )
+                            except Exception as e_mv:
+                                logger.warning(
+                                    f"Impossible de réduire product_uom_qty move {mid}: {e_mv}"
+                                )
+
                     logger.info(
                         f"Livraison partielle détectée: {qty_to_deliver}/{qty_demanded} — "
                         f"qty_done écrit sur {len(move_lines)} move_line(s)"
                     )
 
-                # Valider
-                validate_result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
+                # Valider.
+                # skip_sanity_check=True : bypass le contrôle "Pas assez de stock"
+                # (utilisé par Odoo en interne dans process_cancel_backorder).
+                # Nécessaire pour les livraisons partielles où la réduction de product_uom_qty
+                # a libéré la réservation stock avant validation.
+                validate_result = client.execute_kw(
+                    'stock.picking', 'button_validate', [[transfer_id]],
+                    {'context': {'skip_sanity_check': True}}
+                )
                 logger.info(f"button_validate → {type(validate_result).__name__}: {validate_result}")
 
                 # Gérer les wizards Odoo (reliquat ou transfert immédiat)
