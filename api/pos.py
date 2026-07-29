@@ -3137,34 +3137,37 @@ async def update_inventory_transfer_state(
                             )
 
                             if isinstance(validate_result2, dict):
-                                # Tentative 2: wizard + ligne manuelle + process().
-                                # Nécessaire en Odoo 16 où button_validate ignore le flag.
-                                # @api.onchange('pick_ids') n'est pas déclenché via XML-RPC create,
-                                # donc les lignes backorder_confirmation_line_ids sont vides → process() ne fait rien.
-                                # On crée la ligne manuellement puis on appelle process() :
-                                # process() → _action_done() en interne (appel ORM, pas XML-RPC) → ça marche.
+                                # Tentative 2: wizard + ligne inline + process().
+                                # On crée le wizard avec la ligne directement dans le create (commande (0,0,{}))
+                                # pour s'assurer que la One2many est bien liée dans la même transaction.
                                 logger.info(
                                     "skip_backorder_confirmation ignoré par cette version Odoo "
-                                    "→ wizard + ligne manuelle"
+                                    "→ wizard + ligne inline"
                                 )
                                 wizard_id = client.execute_kw(
                                     'stock.backorder.confirmation', 'create',
-                                    [{'pick_ids': [(6, 0, [transfer_id])], 'show_transfers': False}]
+                                    [{
+                                        'pick_ids': [(4, transfer_id)],
+                                        'show_transfers': False,
+                                        'backorder_confirmation_line_ids': [(0, 0, {
+                                            'picking_id': transfer_id,
+                                            'to_backorder': True,
+                                        })]
+                                    }]
                                 )
+                                # Lire le wizard pour vérifier que les lignes sont bien liées
                                 wiz_data = client.execute_kw(
                                     'stock.backorder.confirmation', 'read',
-                                    [[wizard_id]], {'fields': ['backorder_confirmation_line_ids']}
+                                    [[wizard_id]],
+                                    {'fields': ['pick_ids', 'backorder_confirmation_line_ids']}
                                 )
-                                if not wiz_data[0].get('backorder_confirmation_line_ids'):
-                                    client.execute_kw(
-                                        'stock.backorder.confirmation.line', 'create',
-                                        [{'backorder_confirmation_id': wizard_id,
-                                          'picking_id': transfer_id,
-                                          'to_backorder': True}]
-                                    )
-                                    logger.info(f"Ligne reliquat créée manuellement (wizard {wizard_id})")
+                                logger.info(
+                                    f"Wizard {wizard_id}: "
+                                    f"pick_ids={wiz_data[0].get('pick_ids')}, "
+                                    f"lines={wiz_data[0].get('backorder_confirmation_line_ids')}"
+                                )
                                 client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                                logger.info(f"Reliquat traité via wizard {wizard_id} + ligne manuelle")
+                                logger.info(f"process() appelé sur wizard {wizard_id}")
                             else:
                                 logger.info(
                                     f"Reliquat: skip_backorder_confirmation accepté "
