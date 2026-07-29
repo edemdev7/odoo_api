@@ -3126,35 +3126,27 @@ async def update_inventory_transfer_state(
                 # Gérer les wizards Odoo (reliquat ou transfert immédiat)
                 if isinstance(validate_result, dict):
                     res_model = validate_result.get('res_model', '')
-                    wizard_id = validate_result.get('res_id')
+                    # Le contexte retourné par button_validate contient les clés nécessaires
+                    # pour que default_get() crée correctement les lignes du wizard.
+                    # Sans ce contexte, backorder_confirmation_line_ids reste vide
+                    # et process() n'itère sur rien → picking reste assigned.
+                    wizard_context = validate_result.get('context', {})
                     try:
                         if res_model == 'stock.backorder.confirmation':
-                            # NE PAS créer un nouveau wizard via XML-RPC : les lignes
-                            # backorder_confirmation_line_ids ne sont pas recalculées
-                            # (compute non déclenché), process() n'itère sur rien → picking reste assigned.
-                            # On appelle directement action_backorder_confirm sur le picking,
-                            # c'est exactement ce qu'appelle le wizard en interne.
-                            try:
-                                client.execute_kw(
-                                    'stock.picking', 'action_backorder_confirm', [[transfer_id]]
-                                )
-                                logger.info(f"Reliquat confirmé via action_backorder_confirm sur picking {transfer_id}")
-                            except Exception as e_direct:
-                                # Fallback : wizard si la méthode directe n'existe pas
-                                logger.warning(f"action_backorder_confirm échoué ({e_direct}), tentative via wizard")
-                                if not wizard_id:
-                                    wizard_id = client.execute_kw(
-                                        'stock.backorder.confirmation', 'create',
-                                        [{'pick_ids': [(6, 0, [transfer_id])], 'show_transfers': False}]
-                                    )
-                                client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                                logger.info(f"Reliquat confirmé via wizard fallback {wizard_id}")
+                            wizard_id = client.execute_kw(
+                                'stock.backorder.confirmation', 'create',
+                                [{}],
+                                {'context': wizard_context}
+                            )
+                            client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
+                            logger.info(f"Reliquat confirmé via wizard {wizard_id} (contexte: {wizard_context})")
+
                         elif res_model == 'stock.immediate.transfer':
-                            if not wizard_id:
-                                wizard_id = client.execute_kw(
-                                    'stock.immediate.transfer', 'create',
-                                    [{'pick_ids': [(4, transfer_id)]}]
-                                )
+                            wizard_id = client.execute_kw(
+                                'stock.immediate.transfer', 'create',
+                                [{}],
+                                {'context': wizard_context}
+                            )
                             client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
                             logger.info(f"Immediate transfer wizard traité: {wizard_id}")
                     except Exception as e_wiz:
@@ -3254,7 +3246,10 @@ async def update_inventory_transfer_state(
             logger.error(f"❌ Erreur validation: {ve}")
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            logger.error(f"❌ Erreur lors de l'action '{request.action}' sur transfert {transfer_id}: {e}")
+            logger.error(
+                f"❌ Erreur lors de l'action '{request.action}' sur transfert {transfer_id}: {e}",
+                exc_info=True
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Erreur lors de l'action '{request.action}': {str(e)}"
