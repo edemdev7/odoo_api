@@ -3122,110 +3122,73 @@ async def update_inventory_transfer_state(
                         f"qty_done écrit sur {len(move_lines)} move_line(s)"
                     )
 
-                # Valider
-                validate_result = client.execute_kw('stock.picking', 'button_validate', [[transfer_id]])
-                logger.info(f"button_validate → {type(validate_result).__name__}: {validate_result}")
+                # Valider directement avec les bons flags de contexte.
+                #
+                # Code Odoo (stock/models/stock_picking.py) :
+                #   def _pre_action_done_hook(self):
+                #       if not self.env.context.get('skip_immediate'):
+                #           ... → wizard stock.immediate.transfer
+                #       if not self.env.context.get('skip_backorder'):
+                #           ... → wizard stock.backorder.confirmation
+                #       return True
+                #
+                # C'est exactement ce que fait process() du wizard en interne :
+                #   self.pick_ids.with_context(skip_backorder=True).button_validate()
+                #
+                # En passant skip_backorder + skip_immediate dès le premier appel,
+                # button_validate va directement en _action_done() : le picking passe
+                # à 'done' avec les qty_done partielles, et Odoo crée le reliquat
+                # automatiquement pour le reste.
+                validate_context = {
+                    'skip_backorder': True,
+                    'skip_immediate': True,
+                }
+                validate_result = client.execute_kw(
+                    'stock.picking', 'button_validate', [[transfer_id]],
+                    {'context': validate_context}
+                )
+                logger.info(
+                    f"button_validate(skip_backorder=True) → "
+                    f"{type(validate_result).__name__}: {validate_result}"
+                )
 
-                # Gérer les wizards Odoo (reliquat ou transfert immédiat)
+                # Si Odoo retourne encore un wizard, cette version utilise d'autres clés
+                # de contexte : on traite le wizard explicitement.
                 if isinstance(validate_result, dict):
                     res_model = validate_result.get('res_model', '')
+                    wizard_context = dict(validate_result.get('context') or {})
+                    wizard_context['button_validate_picking_ids'] = [transfer_id]
                     try:
                         if res_model == 'stock.backorder.confirmation':
-                            # Tentative 1: re-appeler button_validate avec skip_backorder_confirmation.
-                            # Fonctionne en Odoo 17+ (call_kw applique le contexte via with_context).
-                            # Si Odoo ignore le flag, il retourne encore un dict → on tombe en tentative 2.
-                            validate_result2 = client.execute_kw(
-                                'stock.picking', 'button_validate', [[transfer_id]],
-                                {'context': {'skip_backorder_confirmation': True}}
-                            )
-
-                            if isinstance(validate_result2, dict):
-                                logger.info("skip_backorder_confirmation ignoré → tentatives wizard")
-
-                                # Créer le wizard avec pick_ids + ligne inline
-                                # Contexte critique : button_validate_picking_ids doit être présent
-                                # à la création ET à l'appel de process() pour que _process()
-                                # sache sur quel picking rejouer la validation interne.
-                                bv_context = {
-                                    'button_validate_picking_ids': [transfer_id],
-                                    'default_show_transfers': False,
-                                }
-                                wizard_id = client.execute_kw(
-                                    'stock.backorder.confirmation', 'create',
-                                    [{
-                                        'pick_ids': [(4, transfer_id)],
-                                        'show_transfers': False,
-                                        'backorder_confirmation_line_ids': [(0, 0, {
-                                            'picking_id': transfer_id,
-                                            'to_backorder': True,
-                                        })]
-                                    }],
-                                    {'context': bv_context}
-                                )
-                                wiz_data = client.execute_kw(
-                                    'stock.backorder.confirmation', 'read',
-                                    [[wizard_id]],
-                                    {'fields': ['pick_ids', 'backorder_confirmation_line_ids']}
-                                )
-                                logger.info(
-                                    f"Wizard {wizard_id}: pick_ids={wiz_data[0].get('pick_ids')}, "
-                                    f"lines={wiz_data[0].get('backorder_confirmation_line_ids')}"
-                                )
-
-                                # Tentative A: process() avec button_validate_picking_ids en contexte
-                                proc_result = client.execute_kw(
-                                    'stock.backorder.confirmation', 'process', [[wizard_id]],
-                                    {'context': bv_context}
-                                )
-                                logger.info(f"process() → {type(proc_result).__name__}: {proc_result}")
-
-                                # Vérification immédiate après process()
-                                chk = client.execute_kw(
-                                    'stock.picking', 'read', [[transfer_id]],
-                                    {'fields': ['state', 'date_done', 'backorder_ids']}
-                                )
-                                logger.info(
-                                    f"État après process(): state={chk[0]['state']}, "
-                                    f"date_done={chk[0]['date_done']}, "
-                                    f"backorder_ids={chk[0]['backorder_ids']}"
-                                )
-
-                                # Tentative B: process_cancel_backorder() avec même contexte
-                                if chk[0]['state'] != 'done':
-                                    logger.info("process() inefficace → process_cancel_backorder()")
-                                    pcb_result = client.execute_kw(
-                                        'stock.backorder.confirmation',
-                                        'process_cancel_backorder',
-                                        [[wizard_id]],
-                                        {'context': bv_context}
-                                    )
-                                    logger.info(
-                                        f"process_cancel_backorder() → "
-                                        f"{type(pcb_result).__name__}: {pcb_result}"
-                                    )
-                                    chk2 = client.execute_kw(
-                                        'stock.picking', 'read', [[transfer_id]],
-                                        {'fields': ['state', 'date_done']}
-                                    )
-                                    logger.info(
-                                        f"État après process_cancel_backorder(): "
-                                        f"state={chk2[0]['state']}, date_done={chk2[0]['date_done']}"
-                                    )
-                            else:
-                                logger.info(
-                                    f"Reliquat: skip_backorder_confirmation accepté "
-                                    f"→ {validate_result2}"
-                                )
-
-                        elif res_model == 'stock.immediate.transfer':
-                            wizard_context = validate_result.get('context', {})
                             wizard_id = client.execute_kw(
-                                'stock.immediate.transfer', 'create',
-                                [{}],
+                                'stock.backorder.confirmation', 'create',
+                                [{
+                                    'pick_ids': [(4, transfer_id)],
+                                    'show_transfers': False,
+                                    'backorder_confirmation_line_ids': [(0, 0, {
+                                        'picking_id': transfer_id,
+                                        'to_backorder': True,
+                                    })]
+                                }],
                                 {'context': wizard_context}
                             )
-                            client.execute_kw('stock.immediate.transfer', 'process', [[wizard_id]])
-                            logger.info(f"Immediate transfer wizard traité: {wizard_id}")
+                            client.execute_kw(
+                                'stock.backorder.confirmation', 'process', [[wizard_id]],
+                                {'context': wizard_context}
+                            )
+                            logger.info(f"Wizard reliquat {wizard_id} traité")
+
+                        elif res_model == 'stock.immediate.transfer':
+                            wizard_id = client.execute_kw(
+                                'stock.immediate.transfer', 'create',
+                                [{'pick_ids': [(4, transfer_id)]}],
+                                {'context': wizard_context}
+                            )
+                            client.execute_kw(
+                                'stock.immediate.transfer', 'process', [[wizard_id]],
+                                {'context': wizard_context}
+                            )
+                            logger.info(f"Wizard transfert immédiat {wizard_id} traité")
                     except Exception as e_wiz:
                         logger.warning(f"Gestion wizard échouée: {e_wiz}")
 
@@ -3329,6 +3292,22 @@ async def update_inventory_transfer_state(
                 f"❌ Erreur lors de l'action '{request.action}' sur transfert {transfer_id}: {e}",
                 exc_info=True
             )
+            msg = str(e)
+            # Erreurs métier Odoo (stock insuffisant, etc.) → 400, pas 500
+            if 'as assez de stock' in msg or 'not enough' in msg.lower() or 'Not enough' in msg:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "insufficient_stock",
+                        "message": (
+                            "Stock insuffisant dans l'emplacement source pour valider "
+                            "ce transfert. Vérifiez la disponibilité du produit dans Odoo."
+                        ),
+                        "transfer_id": transfer_id,
+                        "transfer_name": transfer_name,
+                        "odoo_error": msg,
+                    }
+                )
             raise HTTPException(
                 status_code=500,
                 detail=f"Erreur lors de l'action '{request.action}': {str(e)}"
