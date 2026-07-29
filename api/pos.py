@@ -3312,6 +3312,8 @@ async def update_inventory_transfer_state(
         except ValueError as ve:
             logger.error(f"❌ Erreur validation: {ve}")
             raise HTTPException(status_code=400, detail=str(ve))
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(
                 f"❌ Erreur lors de l'action '{request.action}' sur transfert {transfer_id}: {e}",
