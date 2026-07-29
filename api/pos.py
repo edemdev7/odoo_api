@@ -3126,22 +3126,28 @@ async def update_inventory_transfer_state(
                 # Gérer les wizards Odoo (reliquat ou transfert immédiat)
                 if isinstance(validate_result, dict):
                     res_model = validate_result.get('res_model', '')
-                    # Le contexte retourné par button_validate contient les clés nécessaires
-                    # pour que default_get() crée correctement les lignes du wizard.
-                    # Sans ce contexte, backorder_confirmation_line_ids reste vide
-                    # et process() n'itère sur rien → picking reste assigned.
-                    wizard_context = validate_result.get('context', {})
                     try:
                         if res_model == 'stock.backorder.confirmation':
-                            wizard_id = client.execute_kw(
-                                'stock.backorder.confirmation', 'create',
-                                [{}],
-                                {'context': wizard_context}
+                            # En Odoo 17, process() → _process(pickings_from_lines).
+                            # Le problème : backorder_confirmation_line_ids reste vide
+                            # (créé via @api.onchange non déclenché sur create XML-RPC),
+                            # donc _process() est appelé avec un recordset vide → rien ne se passe.
+                            #
+                            # Solution : re-appeler button_validate avec skip_backorder_confirmation=True.
+                            # Odoo's call_kw extrait 'context' des kwargs → with_context() appliqué.
+                            # button_validate voit le flag → bypasse le wizard → appelle _action_done()
+                            # directement → picking validé avec qty_done partiel + reliquat auto-créé.
+                            validate_result2 = client.execute_kw(
+                                'stock.picking', 'button_validate', [[transfer_id]],
+                                {'context': {'skip_backorder_confirmation': True}}
                             )
-                            client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
-                            logger.info(f"Reliquat confirmé via wizard {wizard_id} (contexte: {wizard_context})")
+                            logger.info(
+                                f"Reliquat: button_validate(skip_backorder_confirmation=True) "
+                                f"→ {type(validate_result2).__name__}: {validate_result2}"
+                            )
 
                         elif res_model == 'stock.immediate.transfer':
+                            wizard_context = validate_result.get('context', {})
                             wizard_id = client.execute_kw(
                                 'stock.immediate.transfer', 'create',
                                 [{}],
