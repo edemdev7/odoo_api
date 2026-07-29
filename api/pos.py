@@ -3128,23 +3128,48 @@ async def update_inventory_transfer_state(
                     res_model = validate_result.get('res_model', '')
                     try:
                         if res_model == 'stock.backorder.confirmation':
-                            # En Odoo 17, process() → _process(pickings_from_lines).
-                            # Le problème : backorder_confirmation_line_ids reste vide
-                            # (créé via @api.onchange non déclenché sur create XML-RPC),
-                            # donc _process() est appelé avec un recordset vide → rien ne se passe.
-                            #
-                            # Solution : re-appeler button_validate avec skip_backorder_confirmation=True.
-                            # Odoo's call_kw extrait 'context' des kwargs → with_context() appliqué.
-                            # button_validate voit le flag → bypasse le wizard → appelle _action_done()
-                            # directement → picking validé avec qty_done partiel + reliquat auto-créé.
+                            # Tentative 1: re-appeler button_validate avec skip_backorder_confirmation.
+                            # Fonctionne en Odoo 17+ (call_kw applique le contexte via with_context).
+                            # Si Odoo ignore le flag, il retourne encore un dict → on tombe en tentative 2.
                             validate_result2 = client.execute_kw(
                                 'stock.picking', 'button_validate', [[transfer_id]],
                                 {'context': {'skip_backorder_confirmation': True}}
                             )
-                            logger.info(
-                                f"Reliquat: button_validate(skip_backorder_confirmation=True) "
-                                f"→ {type(validate_result2).__name__}: {validate_result2}"
-                            )
+
+                            if isinstance(validate_result2, dict):
+                                # Tentative 2: wizard + ligne manuelle + process().
+                                # Nécessaire en Odoo 16 où button_validate ignore le flag.
+                                # @api.onchange('pick_ids') n'est pas déclenché via XML-RPC create,
+                                # donc les lignes backorder_confirmation_line_ids sont vides → process() ne fait rien.
+                                # On crée la ligne manuellement puis on appelle process() :
+                                # process() → _action_done() en interne (appel ORM, pas XML-RPC) → ça marche.
+                                logger.info(
+                                    "skip_backorder_confirmation ignoré par cette version Odoo "
+                                    "→ wizard + ligne manuelle"
+                                )
+                                wizard_id = client.execute_kw(
+                                    'stock.backorder.confirmation', 'create',
+                                    [{'pick_ids': [(6, 0, [transfer_id])], 'show_transfers': False}]
+                                )
+                                wiz_data = client.execute_kw(
+                                    'stock.backorder.confirmation', 'read',
+                                    [[wizard_id]], {'fields': ['backorder_confirmation_line_ids']}
+                                )
+                                if not wiz_data[0].get('backorder_confirmation_line_ids'):
+                                    client.execute_kw(
+                                        'stock.backorder.confirmation.line', 'create',
+                                        [{'backorder_confirmation_id': wizard_id,
+                                          'picking_id': transfer_id,
+                                          'to_backorder': True}]
+                                    )
+                                    logger.info(f"Ligne reliquat créée manuellement (wizard {wizard_id})")
+                                client.execute_kw('stock.backorder.confirmation', 'process', [[wizard_id]])
+                                logger.info(f"Reliquat traité via wizard {wizard_id} + ligne manuelle")
+                            else:
+                                logger.info(
+                                    f"Reliquat: skip_backorder_confirmation accepté "
+                                    f"→ {validate_result2}"
+                                )
 
                         elif res_model == 'stock.immediate.transfer':
                             wizard_context = validate_result.get('context', {})
