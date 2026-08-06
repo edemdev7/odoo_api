@@ -1585,6 +1585,35 @@ async def adjust_product_stock(
 
 # ===== GESTION DES INVENTAIRES (STOCK.PICKING) =====
 
+# États d'un transfert en attente de libération par un gestionnaire de stock.
+# Avec la réservation manuelle activée sur le type d'opération Odoo, un reliquat
+# est créé dans l'un de ces états et n'en sort que lorsque le gestionnaire clique
+# « Vérifier la disponibilité ». Tant qu'il y est, il reste invisible du chauffeur.
+PENDING_MANAGER_STATES = ['draft', 'waiting', 'confirmed']
+
+# États exposés par défaut aux endpoints chauffeur (liste de travail + historique).
+DRIVER_VISIBLE_STATES = ['assigned', 'partially_available', 'done']
+
+
+def _apply_driver_state_filter(domain: list, state: str | None, include_pending: bool = False) -> list:
+    """
+    Restreint un domaine stock.picking aux transferts réellement exploitables.
+
+    Sans filtre explicite, on masque les transferts en attente de validation
+    gestionnaire (draft / waiting / confirmed). C'est ce qui empêche un reliquat
+    tout juste créé d'apparaître chez le chauffeur avant son arbitrage dans Odoo.
+
+    - state fourni        : on respecte la demande de l'appelant telle quelle
+    - include_pending=True: on n'applique aucune restriction (usage back-office)
+    - sinon               : on limite aux états visibles chauffeur
+    """
+    if state:
+        domain.append(('state', '=', state))
+    elif not include_pending:
+        domain.append(('state', 'in', DRIVER_VISIBLE_STATES))
+    return domain
+
+
 def _check_source_stock_availability(client, move_lines: list) -> list:
     """
     Vérifie que l'emplacement source contient physiquement les quantités déclarées.
@@ -1714,6 +1743,14 @@ async def get_pos_inventory_transfers(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     partner_id: Optional[int] = None,
+    include_pending: bool = Query(
+        False,
+        description=(
+            "Inclure les transferts en attente de validation gestionnaire "
+            "(brouillon/en attente/confirmé). Usage back-office uniquement — "
+            "à laisser à false pour l'app chauffeur."
+        )
+    ),
     page: int = Query(1, ge=1, description="Numéro de page (commence à 1)"),
     page_size: int = Query(50, ge=1, le=200, description="Nombre d'éléments par page (max 200)"),
     current_user: dict = Depends(require_scope("pos"))
@@ -1862,10 +1899,11 @@ async def get_pos_inventory_transfers(
             # Si pas d'auto-filter et pas de picking_type_code fourni, ne pas en ajouter
             logger.info(f"Pas de filtrage automatique picking_type (PDV avec warehouse spécifique)")
         
-        # Ajouter les filtres optionnels
-        if state:
-            domain.append(('state', '=', state))
-        
+        # Ajouter les filtres optionnels.
+        # Sans état explicite, on masque les transferts en attente de validation
+        # gestionnaire (reliquats non encore libérés dans Odoo).
+        _apply_driver_state_filter(domain, state, include_pending)
+
         if picking_type_code:
             domain.append(('picking_type_code', '=', picking_type_code))
             logger.info(f"Filtrage par picking_type_code: {picking_type_code}")
@@ -2468,6 +2506,14 @@ async def get_transfers_by_truck(
     state: Optional[str] = Query(None, description="État du transfert"),
     date_from: Optional[str] = Query(None, description="Date de début (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Date de fin (YYYY-MM-DD)"),
+    include_pending: bool = Query(
+        False,
+        description=(
+            "Inclure les transferts en attente de validation gestionnaire "
+            "(brouillon/en attente/confirmé). Usage back-office uniquement — "
+            "à laisser à false pour l'app chauffeur."
+        )
+    ),
     page: int = Query(1, ge=1, description="Numéro de page"),
     page_size: int = Query(50, ge=1, le=200, description="Éléments par page"),
     current_user: dict = Depends(require_scope("pos"))
@@ -2588,10 +2634,11 @@ async def get_transfers_by_truck(
                 # Créer le domaine pour tous les types de transferts
                 test_domain = create_multi_type_domain(base_conditions)
                 
-                # Ajouter les filtres optionnels
-                if state:
-                    test_domain.append(('state', '=', state))
-                
+                # Ajouter les filtres optionnels.
+                # Sans état explicite, on masque les transferts en attente de
+                # validation gestionnaire (reliquats non encore libérés dans Odoo).
+                _apply_driver_state_filter(test_domain, state, include_pending)
+
                 if date_from:
                     test_domain.append(('date', '>=', f"{date_from} 00:00:00"))
                 
@@ -2625,13 +2672,12 @@ async def get_transfers_by_truck(
             else:
                 domain = [('picking_type_code', 'in', transfer_types)]
             
-            if state:
-                domain.append(('state', '=', state))
+            _apply_driver_state_filter(domain, state, include_pending)
             if date_from:
                 domain.append(('date', '>=', f"{date_from} 00:00:00"))
             if date_to:
                 domain.append(('date', '<=', f"{date_to} 23:59:59"))
-        
+
         # Récupérer le nom de la base de données
         from core.security import get_odoo_config_from_user
         db_config = get_odoo_config_from_user(current_user)
@@ -3172,7 +3218,25 @@ async def update_inventory_transfer_state(
                 # Si l'admin a fixé une quantité inférieure à la demande initiale dans Odoo
                 # (stock.move.line.quantity < stock.move.product_uom_qty), on écrit qty_done
                 # avant de valider pour que Odoo génère le reliquat automatiquement.
-                if current_state not in ['assigned', 'confirmed', 'partially_available'] and not request.force:
+                # Seuls les transferts en 'assigned' (Prêt) sont validables par le chauffeur.
+                # Un reliquat fraîchement créé arrive en 'confirmed' / 'waiting' tant que le
+                # gestionnaire de stock ne l'a pas libéré (réservation manuelle côté Odoo).
+                # On refuse explicitement ces états pour que l'app affiche un message clair.
+                if current_state in PENDING_MANAGER_STATES and not request.force:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "pending_manager_validation",
+                            "message": (
+                                "Ce transfert est en attente de validation par un gestionnaire "
+                                "de stock. Il ne pourra être livré qu'une fois libéré dans Odoo."
+                            ),
+                            "transfer_id": transfer_id,
+                            "transfer_name": transfer_name,
+                            "state": current_state,
+                        }
+                    )
+                if current_state not in ['assigned', 'partially_available'] and not request.force:
                     raise ValueError(f"Le transfert doit être assigné pour être validé (état actuel: {current_state})")
 
                 # Lire move_lines et moves pour détecter une livraison partielle
@@ -3347,13 +3411,26 @@ async def update_inventory_transfer_state(
                     open_bo = [b for b in backorders if b.get('state') not in ('cancel', 'done')]
                     if open_bo:
                         bo = open_bo[-1]
+                        # Avec la réservation manuelle côté Odoo, le reliquat naît en
+                        # 'confirmed'/'waiting' : il attend l'arbitrage d'un gestionnaire
+                        # de stock et n'est pas encore livrable par le chauffeur.
+                        bo_pending = bo['state'] in PENDING_MANAGER_STATES
                         backorder_info = {
                             'id': bo['id'],
                             'name': bo['name'],
                             'state': bo['state'],
                             'scheduled_date': bo.get('scheduled_date') or None,
                             'quantity_remaining': round(qty_demanded - qty_to_deliver, 3) if is_partial else 0,
+                            'pending_manager_validation': bo_pending,
+                            'status_label': (
+                                "En attente de validation par un gestionnaire de stock"
+                                if bo_pending else "Prêt à livrer"
+                            ),
                         }
+                        logger.info(
+                            f"📦 Reliquat {bo['name']} créé (état: {bo['state']}, "
+                            f"en attente gestionnaire: {bo_pending})"
+                        )
 
             state_changed = new_state != current_state
 
