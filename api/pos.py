@@ -4106,6 +4106,284 @@ async def get_all_trucks(
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
 
+# ===== ÉVOLUTION DES STOCKS PAR SESSION =====
+
+@router.get("/sessions/{session_id}/stock-evolution", response_model=ApiResponse)
+async def get_session_stock_evolution(
+    session_id: int = Path(..., description="ID de la session POS"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Évolution des stocks sur une session — support du point journalier.
+
+    Pour chaque produit du point de vente, retourne :
+    - **product_name**    : libellé du produit
+    - **unit_price**      : prix de vente POS en vigueur
+    - **stock_initial**   : stock à l'ouverture de la session
+    - **quantity_sold**   : quantité écoulée depuis l'ouverture
+
+    Le stock initial n'est pas photographié à l'ouverture : il est reconstruit
+    depuis l'historique Odoo, ce qui permet d'interroger aussi les sessions
+    déjà ouvertes avant la mise en service de cet endpoint.
+
+        stock_initial = stock_actuel + sorties_session − entrées_session
+
+    Les composants du calcul sont exposés dans la réponse pour permettre le
+    contrôle : `stock_actuel`, `entrees_session`, `sorties_session`.
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # --- Session ---
+        sessions = client.execute_kw(
+            'pos.session', 'search_read',
+            [[('id', '=', session_id)]],
+            {'fields': ['id', 'name', 'state', 'start_at', 'stop_at', 'config_id'], 'limit': 1}
+        )
+        if not sessions:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} non trouvée")
+
+        session = sessions[0]
+        start_at = session.get('start_at')
+        if not start_at:
+            raise HTTPException(
+                status_code=400,
+                detail=f"La session {session.get('name')} n'a pas de date d'ouverture exploitable"
+            )
+
+        config = session.get('config_id')
+        pos_id = config[0] if isinstance(config, list) else config
+        pos_name = config[1] if isinstance(config, list) else str(config)
+
+        # --- Emplacement de stock du PDV ---
+        pos_config = client.execute_kw(
+            'pos.config', 'search_read',
+            [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name', 'warehouse_id', 'iface_available_categ_ids'], 'limit': 1}
+        )
+        if not pos_config:
+            raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
+        pos_config = pos_config[0]
+
+        stock_location_id, location_name = None, "Emplacement inconnu"
+        warehouse = pos_config.get('warehouse_id')
+        if warehouse:
+            wh_id = warehouse[0] if isinstance(warehouse, list) else warehouse
+            try:
+                wh = client.execute_kw(
+                    'stock.warehouse', 'read', [[wh_id]],
+                    {'fields': ['lot_stock_id', 'name']}
+                )
+                if wh:
+                    stock_location_id = wh[0]['lot_stock_id'][0]
+                    location_name = f"Stock {wh[0]['name']}"
+            except Exception as e:
+                logger.warning(f"Entrepôt du PDV {pos_id} illisible: {e}")
+
+        if not stock_location_id:
+            fallback = client.execute_kw(
+                'stock.location', 'search_read',
+                [[('usage', '=', 'internal')]],
+                {'fields': ['id', 'complete_name'], 'limit': 1}
+            )
+            if not fallback:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Impossible de déterminer l'emplacement de stock du point de vente"
+                )
+            stock_location_id = fallback[0]['id']
+            location_name = fallback[0].get('complete_name') or location_name
+
+        # --- Produits du PDV ---
+        domain = [
+            ('available_in_pos', '=', True),
+            ('sale_ok', '=', True),
+            ('active', '=', True),
+        ]
+        allowed_categ_ids = pos_config.get('iface_available_categ_ids') or []
+        if allowed_categ_ids:
+            try:
+                template_ids = client.execute_kw(
+                    'product.template', 'search',
+                    [[('pos_categ_ids', 'in', allowed_categ_ids)]]
+                )
+                if template_ids:
+                    domain.append(('product_tmpl_id', 'in', template_ids))
+            except Exception as e:
+                logger.warning(f"Filtrage par catégorie POS impossible: {e}")
+
+        products = client.execute_kw(
+            'product.product', 'search_read', [domain],
+            {'fields': ['id', 'name', 'default_code', 'list_price', 'uom_id', 'categ_id'],
+             'order': 'name asc'}
+        )
+        if not products:
+            return ApiResponse(
+                success=True,
+                data={'session': {'id': session_id, 'name': session.get('name'),
+                                  'state': session.get('state'), 'start_at': start_at,
+                                  'pos_name': pos_name},
+                      'products': []},
+                message=f"Aucun produit configuré sur le point de vente '{pos_name}'"
+            )
+
+        product_ids = [p['id'] for p in products]
+
+        # --- Quantités vendues sur la session ---
+        sold_qty: dict[int, float] = {}
+        sold_amount: dict[int, float] = {}
+        try:
+            sold_rows = client.execute_kw(
+                'pos.order.line', 'read_group',
+                [[('order_id.session_id', '=', session_id),
+                  ('product_id', 'in', product_ids)],
+                 ['qty', 'price_subtotal_incl'],
+                 ['product_id']],
+                {'lazy': False}
+            )
+            for row in sold_rows:
+                prod = row.get('product_id')
+                pid = prod[0] if isinstance(prod, list) else prod
+                if pid:
+                    sold_qty[pid] = float(row.get('qty') or 0)
+                    sold_amount[pid] = float(row.get('price_subtotal_incl') or 0)
+        except Exception as e:
+            logger.warning(f"Lecture des ventes de la session {session_id} impossible: {e}")
+
+        # --- Stock actuel ---
+        current_stock: dict[int, float] = {}
+        quants = client.execute_kw(
+            'stock.quant', 'search_read',
+            [[('location_id', 'child_of', stock_location_id),
+              ('product_id', 'in', product_ids)]],
+            {'fields': ['product_id', 'quantity']}
+        )
+        for q in quants:
+            prod = q.get('product_id')
+            pid = prod[0] if isinstance(prod, list) else prod
+            if pid:
+                current_stock[pid] = current_stock.get(pid, 0.0) + float(q.get('quantity') or 0)
+
+        # --- Mouvements depuis l'ouverture ---
+        moves_in: dict[int, float] = {}
+        moves_out: dict[int, float] = {}
+        try:
+            move_lines = client.execute_kw(
+                'stock.move.line', 'search_read',
+                [[('state', '=', 'done'),
+                  ('date', '>=', start_at),
+                  ('product_id', 'in', product_ids),
+                  '|',
+                  ('location_id', 'child_of', stock_location_id),
+                  ('location_dest_id', 'child_of', stock_location_id)]],
+                {'fields': ['product_id', 'quantity', 'qty_done',
+                            'location_id', 'location_dest_id']}
+            )
+            # Emplacements rattachés au PDV, pour classer entrée / sortie
+            local_ids = set(client.execute_kw(
+                'stock.location', 'search',
+                [[('id', 'child_of', stock_location_id)]]
+            ))
+            for ml in move_lines:
+                prod = ml.get('product_id')
+                pid = prod[0] if isinstance(prod, list) else prod
+                if not pid:
+                    continue
+                qty = float(ml.get('quantity') or 0) or float(ml.get('qty_done') or 0)
+                if qty <= 0:
+                    continue
+                src = ml.get('location_id')
+                dst = ml.get('location_dest_id')
+                src_id = src[0] if isinstance(src, list) else src
+                dst_id = dst[0] if isinstance(dst, list) else dst
+                src_local = src_id in local_ids
+                dst_local = dst_id in local_ids
+                if src_local and not dst_local:
+                    moves_out[pid] = moves_out.get(pid, 0.0) + qty
+                elif dst_local and not src_local:
+                    moves_in[pid] = moves_in.get(pid, 0.0) + qty
+        except Exception as e:
+            logger.warning(f"Lecture des mouvements de la session {session_id} impossible: {e}")
+
+        # --- Assemblage ---
+        lines = []
+        for p in products:
+            pid = p['id']
+            stock_now = round(current_stock.get(pid, 0.0), 3)
+            qty_in = round(moves_in.get(pid, 0.0), 3)
+            qty_out = round(moves_out.get(pid, 0.0), 3)
+            qty_sold = round(sold_qty.get(pid, 0.0), 3)
+            stock_initial = round(stock_now + qty_out - qty_in, 3)
+
+            # Les ventes POS ne sont destockées qu'au moment où Odoo génère le
+            # mouvement. Tant que ce n'est pas fait, elles n'apparaissent pas dans
+            # `qty_out` : on le signale plutôt que de fausser silencieusement le calcul.
+            sales_not_destocked = qty_sold > qty_out + 0.01
+
+            # On n'affiche que les produits ayant une réalité sur la session
+            if stock_initial == 0 and qty_sold == 0 and stock_now == 0:
+                continue
+
+            lines.append({
+                'product_id': pid,
+                'product_name': p['name'],
+                'product_code': p.get('default_code'),
+                'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
+                'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
+                'unit_price': round(float(p.get('list_price') or 0), 2),
+                'stock_initial': stock_initial,
+                'quantity_sold': qty_sold,
+                'amount_sold': round(sold_amount.get(pid, 0.0), 2),
+                'stock_actuel': stock_now,
+                'entrees_session': qty_in,
+                'sorties_session': qty_out,
+                'sales_not_destocked': sales_not_destocked,
+            })
+
+        total_sold = round(sum(l['quantity_sold'] for l in lines), 3)
+        total_amount = round(sum(l['amount_sold'] for l in lines), 2)
+
+        logger.info(
+            f"📊 Évolution stock session {session.get('name')}: "
+            f"{len(lines)} produit(s), {total_sold} vendu(s)"
+        )
+
+        return ApiResponse(
+            success=True,
+            data={
+                'session': {
+                    'id': session_id,
+                    'name': session.get('name'),
+                    'state': session.get('state'),
+                    'start_at': start_at,
+                    'stop_at': session.get('stop_at') or None,
+                    'pos_id': pos_id,
+                    'pos_name': pos_name,
+                    'location_name': location_name,
+                },
+                'totals': {
+                    'products_count': len(lines),
+                    'total_quantity_sold': total_sold,
+                    'total_amount_sold': total_amount,
+                },
+                'products': lines,
+            },
+            message=(
+                f"Évolution des stocks — session {session.get('name')} : "
+                f"{len(lines)} produit(s), {total_sold} unité(s) vendue(s)"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur évolution stock session {session_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du calcul de l'évolution des stocks: {str(e)}"
+        )
+
+
 # ===== GESTION DES PRODUITS POUR POMPES =====
 
 # IDs des product.category pour le filtrage station-service
