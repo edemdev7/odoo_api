@@ -1623,12 +1623,13 @@ def _check_source_stock_availability(client, move_lines: list) -> list:
     empêche par exemple de déclarer la livraison de 1 000 000 L depuis un camion
     qui n'en contient que 30 000.
 
-    Le stock disponible est calculé par (produit, emplacement) en agrégeant les
-    quants de l'emplacement et de ses sous-emplacements :
-        disponible = quantity - reserved_quantity + réservation propre au transfert
+    Le contrôle porte sur la quantité physiquement présente dans l'emplacement
+    source et ses sous-emplacements (somme des quants). Les réservations ne sont
+    pas déduites : elles sont remontées à titre informatif uniquement.
 
-    La réservation propre au transfert est réintégrée : elle est légitime puisque
-    c'est précisément ce transfert qu'on est en train de valider.
+    Ce choix est délibéré. Un emplacement peut porter des réservations orphelines
+    supérieures à son stock réel, ce qui bloquerait à tort des livraisons pourtant
+    déjà réservées et marquées « Prêt » par Odoo.
 
     Retourne une liste de dicts décrivant les manquants (vide si tout est bon).
     """
@@ -1682,20 +1683,25 @@ def _check_source_stock_availability(client, move_lines: list) -> list:
         reserved = sum(float(q.get('reserved_quantity') or 0) for q in quants)
         requested = need['requested']
 
-        # La réservation de ce transfert fait partie de `reserved` : on la réintègre
-        # pour ne pas la compter deux fois.
-        available = on_hand - max(reserved - requested, 0.0)
-
-        if requested - available > 0.01:
+        # On compare à la quantité PHYSIQUEMENT présente, pas au disponible net.
+        #
+        # Déduire les réservations concurrentes produirait des faux positifs : un
+        # emplacement peut porter des réservations orphelines très supérieures à son
+        # stock réel (7005 L réservés pour 10 L en stock, par exemple). Or si Odoo a
+        # placé le transfert en « Prêt », c'est qu'il a déjà réservé pour lui — les
+        # sur-réservations d'autres transferts ne doivent pas bloquer cette livraison.
+        #
+        # L'objectif métier est de refuser une quantité que le véhicule ne contient
+        # pas physiquement (déclarer 1 000 000 L depuis une citerne de 30 000 L).
+        if requested - on_hand > 0.01:
             shortages.append({
                 'product': need['product_name'],
                 'location': need['location_name'],
                 'uom': need['uom'],
                 'quantity_requested': round(requested, 3),
-                'quantity_available': round(available, 3),
                 'quantity_on_hand': round(on_hand, 3),
-                'quantity_reserved_by_others': round(max(reserved - requested, 0.0), 3),
-                'missing': round(requested - available, 3),
+                'quantity_reserved_total': round(reserved, 3),
+                'missing': round(requested - on_hand, 3),
             })
 
     return shortages
