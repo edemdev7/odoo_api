@@ -13,21 +13,24 @@ from core.encryption import encrypt_webhook_data
 
 logger = logging.getLogger(__name__)
 
-# Secret partagé avec le consommateur du webhook (OPEN SI).
-# Jamais en dur dans le code : uniquement via variable d'environnement.
-ODOO_WEBHOOK_SECRET = os.getenv("ODOO_WEBHOOK_SECRET", "")
-
-# Le secret est une chaîne hexadécimale, ce qui laisse deux lectures possibles
-# pour la clé HMAC — et elles ne produisent pas la même signature :
-#   "raw" → la chaîne telle quelle (64 octets utf-8)
-#   "hex" → les 32 octets obtenus en décodant l'hexadécimal
-# Le destinataire impose son choix ; on s'aligne via cette variable.
-ODOO_WEBHOOK_SECRET_ENCODING = os.getenv("ODOO_WEBHOOK_SECRET_ENCODING", "raw").lower()
+# Le secret et son encodage sont lus À CHAQUE APPEL, jamais figés à l'import.
+#
+# Figer la valeur au niveau module créait un piège : si `load_dotenv()` s'exécute
+# après l'import de ce module, ou si la variable est déjà présente dans
+# l'environnement du service (systemd), le processus conserve une valeur périmée
+# malgré la modification du fichier .env.
 
 
 def _secret_to_key(secret: str) -> bytes:
-    """Convertit le secret en clé HMAC selon l'encodage configuré."""
-    if ODOO_WEBHOOK_SECRET_ENCODING == "hex":
+    """
+    Convertit le secret en clé HMAC selon l'encodage configuré.
+
+    ODOO_WEBHOOK_SECRET_ENCODING :
+      "raw" → la chaîne telle quelle (défaut, correspond au createHmac de Node)
+      "hex" → les octets obtenus en décodant l'hexadécimal
+    """
+    encoding = os.getenv("ODOO_WEBHOOK_SECRET_ENCODING", "raw").lower()
+    if encoding == "hex":
         try:
             return bytes.fromhex(secret)
         except ValueError:
@@ -36,6 +39,19 @@ def _secret_to_key(secret: str) -> bytes:
                 "n'est pas de l'hexadécimal valide — repli sur l'encodage brut"
             )
     return secret.encode('utf-8')
+
+
+def secret_fingerprint(secret: str) -> str:
+    """
+    Empreinte du secret réellement utilisé, sans jamais l'exposer.
+
+    C'est le HMAC de la chaîne 'test' avec ce secret : la même sonde peut être
+    calculée de l'autre côté pour vérifier que les deux parties utilisent bien
+    la même valeur, sans avoir à se la réenvoyer.
+    """
+    if not secret:
+        return "<vide>"
+    return hmac.new(secret.encode('utf-8'), b'test', hashlib.sha256).hexdigest()[:16]
 
 
 def compute_webhook_signature(payload: str, secret: Optional[str] = None) -> Optional[str]:
@@ -49,7 +65,7 @@ def compute_webhook_signature(payload: str, secret: Optional[str] = None) -> Opt
     Retourne None si aucun secret n'est configuré — l'envoi reste possible, mais
     non signé, ce qui sera probablement rejeté par le destinataire.
     """
-    key = secret if secret is not None else ODOO_WEBHOOK_SECRET
+    key = secret if secret is not None else os.getenv("ODOO_WEBHOOK_SECRET", "")
     if not key:
         return None
     return hmac.new(
@@ -89,7 +105,13 @@ async def send_encrypted_webhook(
     signature = compute_webhook_signature(encrypted)
     if signature:
         headers['x-odoo-signature'] = signature
-        logger.info(f"[WEBHOOK_SENDER] Payload signé (HMAC-SHA256): {signature[:12]}…")
+        current_secret = os.getenv("ODOO_WEBHOOK_SECRET", "")
+        logger.info(
+            f"[WEBHOOK_SENDER] Payload signé (HMAC-SHA256): {signature[:12]}… | "
+            f"empreinte du secret utilisé: {secret_fingerprint(current_secret)} | "
+            f"encodage: {os.getenv('ODOO_WEBHOOK_SECRET_ENCODING', 'raw')} | "
+            f"longueur payload signé: {len(encrypted)}"
+        )
     else:
         logger.warning(
             "[WEBHOOK_SENDER] ODOO_WEBHOOK_SECRET absent — webhook envoyé sans "
