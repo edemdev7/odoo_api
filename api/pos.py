@@ -4320,6 +4320,20 @@ async def get_session_stock_evolution(
             # `qty_out` : on le signale plutôt que de fausser silencieusement le calcul.
             sales_not_destocked = qty_sold > qty_out + 0.01
 
+            # Stock restant théorique, ventes POS comprises.
+            # Si les ventes ne sont pas encore destockées, `stock_actuel` les ignore :
+            # on les retranche pour donner le stock réellement attendu en rayon.
+            stock_theorique = round(
+                stock_now - (qty_sold if sales_not_destocked else 0.0), 3
+            )
+
+            # Survente : on a écoulé plus que ce qui était disponible sur la session.
+            # Odoo n'empêche pas ce cas (stock négatif autorisé, POS sans contrôle),
+            # d'où l'intérêt de le remonter explicitement pour le point journalier.
+            disponible_total = stock_initial + qty_in
+            oversold = qty_sold - disponible_total > 0.01
+            oversold_quantity = round(qty_sold - disponible_total, 3) if oversold else 0.0
+
             # On n'affiche que les produits ayant une réalité sur la session
             if stock_initial == 0 and qty_sold == 0 and stock_now == 0:
                 continue
@@ -4334,6 +4348,9 @@ async def get_session_stock_evolution(
                 'stock_initial': stock_initial,
                 'quantity_sold': qty_sold,
                 'amount_sold': round(sold_amount.get(pid, 0.0), 2),
+                'stock_theorique': stock_theorique,
+                'oversold': oversold,
+                'oversold_quantity': oversold_quantity,
                 'stock_actuel': stock_now,
                 'entrees_session': qty_in,
                 'sorties_session': qty_out,
@@ -4342,10 +4359,14 @@ async def get_session_stock_evolution(
 
         total_sold = round(sum(l['quantity_sold'] for l in lines), 3)
         total_amount = round(sum(l['amount_sold'] for l in lines), 2)
+        oversold_lines = [l for l in lines if l['oversold']]
 
         logger.info(
             f"📊 Évolution stock session {session.get('name')}: "
             f"{len(lines)} produit(s), {total_sold} vendu(s)"
+            + (f" — ⚠️ {len(oversold_lines)} produit(s) en survente: "
+               f"{', '.join(l['product_name'] for l in oversold_lines)}"
+               if oversold_lines else "")
         )
 
         return ApiResponse(
@@ -4365,6 +4386,7 @@ async def get_session_stock_evolution(
                     'products_count': len(lines),
                     'total_quantity_sold': total_sold,
                     'total_amount_sold': total_amount,
+                    'oversold_products_count': len(oversold_lines),
                 },
                 'products': lines,
             },
