@@ -17,6 +17,26 @@ logger = logging.getLogger(__name__)
 # Jamais en dur dans le code : uniquement via variable d'environnement.
 ODOO_WEBHOOK_SECRET = os.getenv("ODOO_WEBHOOK_SECRET", "")
 
+# Le secret est une chaîne hexadécimale, ce qui laisse deux lectures possibles
+# pour la clé HMAC — et elles ne produisent pas la même signature :
+#   "raw" → la chaîne telle quelle (64 octets utf-8)
+#   "hex" → les 32 octets obtenus en décodant l'hexadécimal
+# Le destinataire impose son choix ; on s'aligne via cette variable.
+ODOO_WEBHOOK_SECRET_ENCODING = os.getenv("ODOO_WEBHOOK_SECRET_ENCODING", "raw").lower()
+
+
+def _secret_to_key(secret: str) -> bytes:
+    """Convertit le secret en clé HMAC selon l'encodage configuré."""
+    if ODOO_WEBHOOK_SECRET_ENCODING == "hex":
+        try:
+            return bytes.fromhex(secret)
+        except ValueError:
+            logger.error(
+                "[WEBHOOK_SENDER] ODOO_WEBHOOK_SECRET_ENCODING=hex mais le secret "
+                "n'est pas de l'hexadécimal valide — repli sur l'encodage brut"
+            )
+    return secret.encode('utf-8')
+
 
 def compute_webhook_signature(payload: str, secret: Optional[str] = None) -> Optional[str]:
     """
@@ -33,7 +53,7 @@ def compute_webhook_signature(payload: str, secret: Optional[str] = None) -> Opt
     if not key:
         return None
     return hmac.new(
-        key.encode('utf-8'),
+        _secret_to_key(key),
         payload.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
