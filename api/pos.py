@@ -4233,9 +4233,14 @@ async def get_session_stock_evolution(
         sold_qty: dict[int, float] = {}
         sold_amount: dict[int, float] = {}
         try:
+            # Seules les commandes réellement abouties comptent.
+            # 'draft'  → panier en cours, non encaissé
+            # 'cancel' → vente annulée ou échouée
+            # Les inclure gonflait artificiellement les quantités vendues.
             sold_rows = client.execute_kw(
                 'pos.order.line', 'read_group',
                 [[('order_id.session_id', '=', session_id),
+                  ('order_id.state', 'in', ['paid', 'done', 'invoiced']),
                   ('product_id', 'in', product_ids)],
                  ['qty', 'price_subtotal_incl'],
                  ['product_id']],
