@@ -4334,9 +4334,10 @@ async def get_session_stock_evolution(
             oversold = qty_sold - disponible_total > 0.01
             oversold_quantity = round(qty_sold - disponible_total, 3) if oversold else 0.0
 
-            # On n'affiche que les produits ayant une réalité sur la session
-            if stock_initial == 0 and qty_sold == 0 and stock_now == 0:
-                continue
+            # Aucun produit n'est masqué : sur un écran d'inventaire, voir
+            # « GASOIL — 0 L » est une information, pas du bruit. Filtrer les
+            # lignes à zéro faisait disparaître des références pourtant
+            # rattachées au PDV, ce qui laissait croire à leur suppression.
 
             lines.append({
                 'product_id': pid,
