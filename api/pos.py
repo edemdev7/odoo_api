@@ -1422,7 +1422,7 @@ async def get_product_stock_level(
         
         # Emplacement de stock de la station, dérivé de son code (JO19 → JO19/Stock).
         # L'entrepôt du pos.config pointe vers le siège et ne reflète pas les cuves.
-        stock_location_id, location_name = _resolve_pos_stock_location(client, pos_id)
+        stock_location_id, location_name, _fiable = _resolve_pos_stock_location(client, pos_id)
 
         # Récupérer les informations de stock, sous-emplacements compris
         stock_quants = client.execute_kw(
@@ -1689,7 +1689,12 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
     On dérive donc l'emplacement du code du PDV, comme le fait déjà la recherche
     de transferts, et on ne se rabat sur l'entrepôt qu'en dernier recours.
 
-    Retourne (location_id, location_name).
+    Retourne (location_id, location_name, fiable).
+
+    `fiable` vaut False quand la résolution s'est faite par repli : l'emplacement
+    retourné est alors celui du siège, sans rapport avec le stock réel du point
+    de vente. Les contrôles bloquants doivent s'en abstenir — on ne refuse pas
+    une vente sur la foi d'une donnée qu'on sait fausse.
     """
     pos_config = client.execute_kw(
         'pos.config', 'search_read',
@@ -1719,7 +1724,7 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
                     f"PDV {pos_id} ({pos_name}) → emplacement station "
                     f"{racine['complete_name']} (ID {racine['id']})"
                 )
-                return racine['id'], racine['complete_name']
+                return racine['id'], racine['complete_name'], True
         except Exception as e:
             logger.warning(f"Recherche de l'emplacement station '{code_station}' échouée: {e}")
 
@@ -1738,7 +1743,7 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
                     f"repli sur l'entrepôt {wh[0]['name']} — les stocks remontés "
                     f"peuvent ne pas refléter la station"
                 )
-                return wh[0]['lot_stock_id'][0], f"Stock {wh[0]['name']}"
+                return wh[0]['lot_stock_id'][0], f"Stock {wh[0]['name']}", False
         except Exception as e:
             logger.warning(f"Entrepôt du PDV {pos_id} illisible: {e}")
 
@@ -1753,7 +1758,11 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
             status_code=400,
             detail="Impossible de déterminer l'emplacement de stock du point de vente"
         )
-    return fallback[0]['id'], fallback[0].get('complete_name') or "Emplacement par défaut"
+    return (
+        fallback[0]['id'],
+        fallback[0].get('complete_name') or "Emplacement par défaut",
+        False,
+    )
 
 
 def _pos_theoretical_stock(client, session_id: int, location_id: int,
@@ -1893,7 +1902,19 @@ def _check_pos_sale_stock(client, pos_id: int, session_id: int,
     if not stockables:
         return []
 
-    location_id, location_name = _resolve_pos_stock_location(client, pos_id)
+    location_id, location_name, fiable = _resolve_pos_stock_location(client, pos_id)
+
+    # Résolution par repli : l'emplacement retourné est celui du siège, sans
+    # rapport avec le stock de ce point de vente. Bloquer sur cette base
+    # refuserait quasiment toutes les ventes — on s'abstient.
+    # Le contrôle s'activera de lui-même dès que le PDV aura son emplacement.
+    if not fiable:
+        logger.warning(
+            f"⚠️ PDV {pos_id} : contrôle de stock non appliqué — emplacement résolu "
+            f"par repli ({location_name}), donnée non fiable pour ce point de vente"
+        )
+        return []
+
     stocks = _pos_theoretical_stock(
         client, session_id, location_id, list(stockables.keys()), session_start
     )
@@ -4710,7 +4731,9 @@ async def get_session_stock_evolution(
         # Emplacement de la station, dérivé de son code (JO19 → JO19/Stock).
         # Voir _resolve_pos_stock_location : l'entrepôt du pos.config pointe vers
         # le siège et ne reflète pas les cuves de la station.
-        stock_location_id, location_name = _resolve_pos_stock_location(client, pos_id)
+        stock_location_id, location_name, location_fiable = _resolve_pos_stock_location(
+            client, pos_id
+        )
 
         # --- Produits du PDV ---
         domain = [
@@ -4905,6 +4928,9 @@ async def get_session_stock_evolution(
                     'pos_id': pos_id,
                     'pos_name': pos_name,
                     'location_name': location_name,
+                    # False = emplacement résolu par repli sur l'entrepôt du siège :
+                    # les quantités ne reflètent pas ce point de vente.
+                    'location_reliable': location_fiable,
                 },
                 'totals': {
                     'products_count': len(lines),
