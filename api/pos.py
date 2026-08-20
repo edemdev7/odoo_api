@@ -1420,49 +1420,16 @@ async def get_product_stock_level(
                 message="Produit de type service/consommable - Stock illimité"
             )
         
-        # Récupérer l'emplacement de stock du PDV
-        warehouse_id = pos_config.get('warehouse_id')
-        stock_location_id = None
-        location_name = "Stock principal"
-        
-        if warehouse_id:
-            warehouse_id = warehouse_id[0] if isinstance(warehouse_id, list) else warehouse_id
-            try:
-                warehouse_info = client.execute_kw(
-                    'stock.warehouse',
-                    'read',
-                    [warehouse_id],
-                    {'fields': ['lot_stock_id', 'name']}
-                )
-                if warehouse_info:
-                    stock_location_id = warehouse_info[0]['lot_stock_id'][0]
-                    location_name = f"Stock {warehouse_info[0]['name']}"
-            except Exception as e:
-                logger.warning(f"Erreur récupération entrepôt: {e}")
-        
-        if not stock_location_id:
-            # Récupérer l'emplacement de stock par défaut
-            stock_locations = client.execute_kw(
-                'stock.location',
-                'search_read',
-                [[('usage', '=', 'internal')]],
-                {'fields': ['id', 'name'], 'limit': 1}
-            )
-            if stock_locations:
-                stock_location_id = stock_locations[0]['id']
-                location_name = stock_locations[0]['name']
-        
-        if not stock_location_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Impossible de déterminer l'emplacement de stock du PDV"
-            )
-        
-        # Récupérer les informations de stock
+        # Emplacement de stock de la station, dérivé de son code (JO19 → JO19/Stock).
+        # L'entrepôt du pos.config pointe vers le siège et ne reflète pas les cuves.
+        stock_location_id, location_name = _resolve_pos_stock_location(client, pos_id)
+
+        # Récupérer les informations de stock, sous-emplacements compris
         stock_quants = client.execute_kw(
             'stock.quant',
             'search_read',
-            [[('product_id', '=', product_id), ('location_id', '=', stock_location_id)]],
+            [[('product_id', '=', product_id),
+              ('location_id', 'child_of', stock_location_id)]],
             {'fields': ['quantity', 'reserved_quantity']}
         )
         
@@ -1711,8 +1678,18 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
     """
     Emplacement de stock d'un point de vente.
 
-    Retourne (location_id, location_name). Se rabat sur le premier emplacement
-    interne si le PDV n'a pas d'entrepôt configuré.
+    Chaque station dispose de son propre emplacement, nommé d'après son code :
+    le PDV « JO19 » stocke dans `JO19/Stock`, « JO70 COVE » dans `JO70/Stock`.
+
+    L'entrepôt configuré sur le `pos.config` ne convient pas : il pointe vers
+    celui du siège (BURWA), dont l'emplacement `BURWA/IMMO` ne contient pas les
+    cuves des stations. S'y fier renvoyait des stocks quasi nuls alors que les
+    stations sont approvisionnées.
+
+    On dérive donc l'emplacement du code du PDV, comme le fait déjà la recherche
+    de transferts, et on ne se rabat sur l'entrepôt qu'en dernier recours.
+
+    Retourne (location_id, location_name).
     """
     pos_config = client.execute_kw(
         'pos.config', 'search_read',
@@ -1722,6 +1699,31 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
     if not pos_config:
         raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
 
+    pos_name = pos_config[0].get('name') or ''
+
+    # 1. Emplacement dédié à la station, dérivé de son code (« JO19 COVE » → « JO19/ »)
+    code_station = pos_name.split()[0] if pos_name.split() else None
+    if code_station:
+        try:
+            candidats = client.execute_kw(
+                'stock.location', 'search_read',
+                [[('complete_name', '=like', f'{code_station}/%'),
+                  ('usage', '=', 'internal')]],
+                {'fields': ['id', 'complete_name']}
+            )
+            if candidats:
+                # Le plus haut dans l'arborescence : les sous-emplacements
+                # seront couverts par les recherches en `child_of`.
+                racine = min(candidats, key=lambda c: len(c.get('complete_name') or ''))
+                logger.info(
+                    f"PDV {pos_id} ({pos_name}) → emplacement station "
+                    f"{racine['complete_name']} (ID {racine['id']})"
+                )
+                return racine['id'], racine['complete_name']
+        except Exception as e:
+            logger.warning(f"Recherche de l'emplacement station '{code_station}' échouée: {e}")
+
+    # 2. Repli sur l'entrepôt configuré
     warehouse = pos_config[0].get('warehouse_id')
     if warehouse:
         wh_id = warehouse[0] if isinstance(warehouse, list) else warehouse
@@ -1731,10 +1733,16 @@ def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
                 {'fields': ['lot_stock_id', 'name']}
             )
             if wh:
+                logger.warning(
+                    f"PDV {pos_id} ({pos_name}) : aucun emplacement station trouvé, "
+                    f"repli sur l'entrepôt {wh[0]['name']} — les stocks remontés "
+                    f"peuvent ne pas refléter la station"
+                )
                 return wh[0]['lot_stock_id'][0], f"Stock {wh[0]['name']}"
         except Exception as e:
             logger.warning(f"Entrepôt du PDV {pos_id} illisible: {e}")
 
+    # 3. Dernier recours
     fallback = client.execute_kw(
         'stock.location', 'search_read',
         [[('usage', '=', 'internal')]],
@@ -4699,34 +4707,10 @@ async def get_session_stock_evolution(
             raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
         pos_config = pos_config[0]
 
-        stock_location_id, location_name = None, "Emplacement inconnu"
-        warehouse = pos_config.get('warehouse_id')
-        if warehouse:
-            wh_id = warehouse[0] if isinstance(warehouse, list) else warehouse
-            try:
-                wh = client.execute_kw(
-                    'stock.warehouse', 'read', [[wh_id]],
-                    {'fields': ['lot_stock_id', 'name']}
-                )
-                if wh:
-                    stock_location_id = wh[0]['lot_stock_id'][0]
-                    location_name = f"Stock {wh[0]['name']}"
-            except Exception as e:
-                logger.warning(f"Entrepôt du PDV {pos_id} illisible: {e}")
-
-        if not stock_location_id:
-            fallback = client.execute_kw(
-                'stock.location', 'search_read',
-                [[('usage', '=', 'internal')]],
-                {'fields': ['id', 'complete_name'], 'limit': 1}
-            )
-            if not fallback:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Impossible de déterminer l'emplacement de stock du point de vente"
-                )
-            stock_location_id = fallback[0]['id']
-            location_name = fallback[0].get('complete_name') or location_name
+        # Emplacement de la station, dérivé de son code (JO19 → JO19/Stock).
+        # Voir _resolve_pos_stock_location : l'entrepôt du pos.config pointe vers
+        # le siège et ne reflète pas les cuves de la station.
+        stock_location_id, location_name = _resolve_pos_stock_location(client, pos_id)
 
         # --- Produits du PDV ---
         domain = [
