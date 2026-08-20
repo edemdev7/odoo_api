@@ -1707,6 +1707,213 @@ def _check_source_stock_availability(client, move_lines: list) -> list:
     return shortages
 
 
+def _resolve_pos_stock_location(client, pos_id: int) -> tuple:
+    """
+    Emplacement de stock d'un point de vente.
+
+    Retourne (location_id, location_name). Se rabat sur le premier emplacement
+    interne si le PDV n'a pas d'entrepôt configuré.
+    """
+    pos_config = client.execute_kw(
+        'pos.config', 'search_read',
+        [[('id', '=', pos_id)]],
+        {'fields': ['id', 'name', 'warehouse_id'], 'limit': 1}
+    )
+    if not pos_config:
+        raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
+
+    warehouse = pos_config[0].get('warehouse_id')
+    if warehouse:
+        wh_id = warehouse[0] if isinstance(warehouse, list) else warehouse
+        try:
+            wh = client.execute_kw(
+                'stock.warehouse', 'read', [[wh_id]],
+                {'fields': ['lot_stock_id', 'name']}
+            )
+            if wh:
+                return wh[0]['lot_stock_id'][0], f"Stock {wh[0]['name']}"
+        except Exception as e:
+            logger.warning(f"Entrepôt du PDV {pos_id} illisible: {e}")
+
+    fallback = client.execute_kw(
+        'stock.location', 'search_read',
+        [[('usage', '=', 'internal')]],
+        {'fields': ['id', 'complete_name'], 'limit': 1}
+    )
+    if not fallback:
+        raise HTTPException(
+            status_code=400,
+            detail="Impossible de déterminer l'emplacement de stock du point de vente"
+        )
+    return fallback[0]['id'], fallback[0].get('complete_name') or "Emplacement par défaut"
+
+
+def _pos_theoretical_stock(client, session_id: int, location_id: int,
+                           product_ids: list, session_start: str = None) -> dict:
+    """
+    Stock théorique disponible par produit sur un point de vente.
+
+    Odoo ne décrémente pas le stock à l'encaissement : les ventes POS ne
+    deviennent des mouvements qu'à la clôture de session, voire jamais selon la
+    configuration. S'appuyer sur le seul `stock.quant` laisserait donc vendre
+    indéfiniment la même quantité sur toute la durée d'une session.
+
+    On retranche donc les ventes de la session qui ne sont pas encore reflétées
+    dans les mouvements de stock :
+
+        disponible = quantité en stock − (ventes session − sorties déjà passées)
+
+    Retourne {product_id: {'on_hand', 'sold', 'moves_out', 'available'}}.
+    """
+    result = {
+        pid: {'on_hand': 0.0, 'sold': 0.0, 'moves_out': 0.0, 'available': 0.0}
+        for pid in product_ids
+    }
+    if not product_ids:
+        return result
+
+    # Stock physique de l'emplacement et de ses sous-emplacements
+    try:
+        quants = client.execute_kw(
+            'stock.quant', 'search_read',
+            [[('location_id', 'child_of', location_id),
+              ('product_id', 'in', product_ids)]],
+            {'fields': ['product_id', 'quantity']}
+        )
+        for q in quants:
+            prod = q.get('product_id')
+            pid = prod[0] if isinstance(prod, list) else prod
+            if pid in result:
+                result[pid]['on_hand'] += float(q.get('quantity') or 0)
+    except Exception as e:
+        logger.warning(f"Lecture des quants impossible (emplacement {location_id}): {e}")
+
+    # Ventes de la session — les paniers en cours comptent aussi : ils
+    # engagent du stock même s'ils ne sont pas encore encaissés.
+    try:
+        sold_rows = client.execute_kw(
+            'pos.order.line', 'read_group',
+            [[('order_id.session_id', '=', session_id),
+              ('order_id.state', '!=', 'cancel'),
+              ('product_id', 'in', product_ids)],
+             ['qty'], ['product_id']],
+            {'lazy': False}
+        )
+        for row in sold_rows:
+            prod = row.get('product_id')
+            pid = prod[0] if isinstance(prod, list) else prod
+            if pid in result:
+                result[pid]['sold'] = float(row.get('qty') or 0)
+    except Exception as e:
+        logger.warning(f"Lecture des ventes de la session {session_id} impossible: {e}")
+
+    # Sorties de stock déjà passées depuis l'ouverture : si les ventes ont
+    # bien été destockées, elles figurent ici et ne doivent pas être déduites
+    # une seconde fois.
+    if session_start:
+        try:
+            local_ids = set(client.execute_kw(
+                'stock.location', 'search', [[('id', 'child_of', location_id)]]
+            ))
+            move_lines = client.execute_kw(
+                'stock.move.line', 'search_read',
+                [[('state', '=', 'done'),
+                  ('date', '>=', session_start),
+                  ('product_id', 'in', product_ids),
+                  ('location_id', 'child_of', location_id)]],
+                {'fields': ['product_id', 'quantity', 'qty_done', 'location_dest_id']}
+            )
+            for ml in move_lines:
+                prod = ml.get('product_id')
+                pid = prod[0] if isinstance(prod, list) else prod
+                if pid not in result:
+                    continue
+                dst = ml.get('location_dest_id')
+                dst_id = dst[0] if isinstance(dst, list) else dst
+                if dst_id in local_ids:
+                    continue  # mouvement interne, pas une sortie
+                qty = float(ml.get('quantity') or 0) or float(ml.get('qty_done') or 0)
+                result[pid]['moves_out'] += max(qty, 0.0)
+        except Exception as e:
+            logger.warning(f"Lecture des mouvements de la session {session_id} impossible: {e}")
+
+    for pid, data in result.items():
+        ventes_non_destockees = max(data['sold'] - data['moves_out'], 0.0)
+        data['available'] = round(data['on_hand'] - ventes_non_destockees, 3)
+        data['on_hand'] = round(data['on_hand'], 3)
+        data['sold'] = round(data['sold'], 3)
+        data['moves_out'] = round(data['moves_out'], 3)
+
+    return result
+
+
+def _check_pos_sale_stock(client, pos_id: int, session_id: int,
+                          session_start: str, lines: list) -> list:
+    """
+    Contrôle bloquant du stock avant enregistrement d'une vente POS.
+
+    Refuse la vente dans deux cas :
+      - la quantité demandée dépasse le disponible théorique
+      - le disponible théorique est déjà nul ou négatif
+
+    Seuls les produits stockables sont contrôlés : un service ou un consommable
+    n'a pas de stock suivi dans Odoo, le contrôle n'aurait aucun sens.
+
+    Retourne la liste des manquants (vide si la vente peut passer).
+    """
+    if not lines:
+        return []
+
+    # Regrouper les quantités par produit : une même référence peut apparaître
+    # sur plusieurs lignes de la même commande.
+    demandes: dict[int, float] = {}
+    for line in lines:
+        pid = getattr(line, 'product_id', None)
+        qty = float(getattr(line, 'qty', 0) or 0)
+        if pid and qty > 0:
+            demandes[pid] = demandes.get(pid, 0.0) + qty
+
+    if not demandes:
+        return []
+
+    produits = client.execute_kw(
+        'product.product', 'search_read',
+        [[('id', 'in', list(demandes.keys()))]],
+        {'fields': ['id', 'name', 'default_code', 'type', 'uom_id']}
+    )
+    stockables = {p['id']: p for p in produits if p.get('type') == 'product'}
+    if not stockables:
+        return []
+
+    location_id, location_name = _resolve_pos_stock_location(client, pos_id)
+    stocks = _pos_theoretical_stock(
+        client, session_id, location_id, list(stockables.keys()), session_start
+    )
+
+    manquants = []
+    for pid, produit in stockables.items():
+        demande = demandes[pid]
+        data = stocks.get(pid, {})
+        disponible = data.get('available', 0.0)
+
+        if disponible <= 0 or demande - disponible > 0.001:
+            manquants.append({
+                'product_id': pid,
+                'product_name': produit.get('name'),
+                'product_code': produit.get('default_code') or None,
+                'uom': produit.get('uom_id', [None, 'Unité'])[1] if produit.get('uom_id') else 'Unité',
+                'location': location_name,
+                'quantity_requested': round(demande, 3),
+                'quantity_available': disponible,
+                'quantity_on_hand': data.get('on_hand', 0.0),
+                'quantity_sold_session': data.get('sold', 0.0),
+                'missing': round(max(demande - disponible, 0.0), 3),
+                'reason': 'stock_epuise' if disponible <= 0 else 'quantite_insuffisante',
+            })
+
+    return manquants
+
+
 def _build_product_summary(move_details: list, move_line_details: list) -> list:
     """
     Construit le résumé produit d'un transfert avec les bonnes quantités.
@@ -4105,6 +4312,333 @@ async def get_all_trucks(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
+
+# ===== INVENTAIRE CAMION (PROFIL CHAUFFEUR) =====
+
+@router.get("/fleet/trucks/{truck_name}/inventory", response_model=ApiResponse)
+async def get_truck_inventory(
+    truck_name: str = Path(..., description="Nom ou immatriculation du camion (ex: AX0043RB)"),
+    include_empty: bool = Query(
+        False,
+        description="Inclure les produits à zéro déjà rattachés au camion"
+    ),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Stock disponible dans un camion, en temps réel.
+
+    Alimente le menu « Inventaire » du profil chauffeur : celui-ci consulte
+    ce que sa citerne contient réellement avant de partir en livraison.
+
+    L'emplacement du camion est résolu par son nom dans `stock.location`
+    (ex: `CAM/AX0043RB`), puis les quants de cet emplacement et de ses
+    sous-emplacements sont agrégés par produit.
+
+    Pour chaque produit :
+    - **quantity_on_hand**   : quantité physiquement présente
+    - **quantity_reserved**  : part déjà engagée par des transferts en cours
+    - **quantity_available** : réellement disponible pour une nouvelle livraison
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # --- Emplacement(s) du camion ---
+        location_ids = client.execute_kw(
+            'stock.location', 'search',
+            [[('name', 'ilike', truck_name), ('usage', '=', 'internal')]]
+        )
+        if not location_ids:
+            # Repli : certains emplacements portent le nom complet (CAM/XXXX)
+            location_ids = client.execute_kw(
+                'stock.location', 'search',
+                [[('complete_name', 'ilike', truck_name), ('usage', '=', 'internal')]]
+            )
+
+        if not location_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Aucun emplacement de stock trouvé pour le camion '{truck_name}'. "
+                    f"Vérifiez que le camion dispose bien d'un emplacement dans Odoo."
+                )
+            )
+
+        locations = client.execute_kw(
+            'stock.location', 'read', [location_ids],
+            {'fields': ['id', 'name', 'complete_name']}
+        )
+        location_names = [l.get('complete_name') or l.get('name') for l in locations]
+        logger.info(
+            f"🚚 Inventaire camion '{truck_name}': "
+            f"{len(location_ids)} emplacement(s) — {', '.join(location_names)}"
+        )
+
+        # --- Quants du camion ---
+        quants = client.execute_kw(
+            'stock.quant', 'search_read',
+            [[('location_id', 'child_of', location_ids)]],
+            {'fields': ['product_id', 'quantity', 'reserved_quantity', 'location_id']}
+        )
+
+        agrege: dict[int, dict] = {}
+        for q in quants:
+            prod = q.get('product_id')
+            if not prod:
+                continue
+            pid = prod[0] if isinstance(prod, list) else prod
+            if pid not in agrege:
+                agrege[pid] = {'on_hand': 0.0, 'reserved': 0.0}
+            agrege[pid]['on_hand'] += float(q.get('quantity') or 0)
+            agrege[pid]['reserved'] += float(q.get('reserved_quantity') or 0)
+
+        produits = []
+        if agrege:
+            produits = client.execute_kw(
+                'product.product', 'search_read',
+                [[('id', 'in', list(agrege.keys()))]],
+                {'fields': ['id', 'name', 'default_code', 'uom_id', 'categ_id', 'list_price'],
+                 'order': 'name asc'}
+            )
+
+        lignes = []
+        for p in produits:
+            pid = p['id']
+            data = agrege.get(pid, {})
+            on_hand = round(data.get('on_hand', 0.0), 3)
+            reserved = round(data.get('reserved', 0.0), 3)
+            available = round(on_hand - reserved, 3)
+
+            if not include_empty and abs(on_hand) < 0.001 and abs(reserved) < 0.001:
+                continue
+
+            lignes.append({
+                'product_id': pid,
+                'product_name': p['name'],
+                'product_code': p.get('default_code') or None,
+                'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
+                'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
+                'unit_price': round(float(p.get('list_price') or 0), 2),
+                'quantity_on_hand': on_hand,
+                'quantity_reserved': reserved,
+                'quantity_available': available,
+                'is_negative': on_hand < 0,
+            })
+
+        total_disponible = round(sum(l['quantity_available'] for l in lignes), 3)
+        anomalies = [l['product_name'] for l in lignes if l['is_negative']]
+
+        if anomalies:
+            logger.warning(
+                f"⚠️ Inventaire camion '{truck_name}': quantités négatives sur "
+                f"{', '.join(anomalies)}"
+            )
+
+        return ApiResponse(
+            success=True,
+            data={
+                'truck_name': truck_name,
+                'locations': location_names,
+                'totals': {
+                    'products_count': len(lignes),
+                    'total_quantity_available': total_disponible,
+                    'negative_products_count': len(anomalies),
+                },
+                'products': lignes,
+                'last_update': datetime.now().isoformat(),
+            },
+            message=(
+                f"Inventaire du camion {truck_name} : {len(lignes)} produit(s), "
+                f"{total_disponible} unité(s) disponible(s)"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur inventaire camion '{truck_name}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération de l'inventaire: {str(e)}"
+        )
+
+
+@router.get("/fleet/drivers/{driver_id}/inventory", response_model=ApiResponse)
+async def get_driver_inventory(
+    driver_id: int = Path(..., description="ID du partenaire (res.partner) du chauffeur"),
+    include_empty: bool = Query(False, description="Inclure les produits à zéro"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Inventaire du ou des camions affectés à un chauffeur.
+
+    Point d'entrée du menu « Inventaire » côté chauffeur : à partir de son seul
+    identifiant, retourne le contenu de sa citerne sans qu'il ait à connaître
+    l'immatriculation ni l'emplacement Odoo correspondant.
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        # --- Camions du chauffeur ---
+        # Même stratégie que /fleet/trucks/by-driver : fleet.vehicle par driver_id,
+        # puis repli sur les homonymes du partenaire (un même chauffeur peut exister
+        # sous plusieurs fiches res.partner).
+        driver_info = client.execute_kw(
+            'res.partner', 'search_read',
+            [[('id', '=', driver_id)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        if not driver_info:
+            raise HTTPException(status_code=404, detail=f"Chauffeur {driver_id} non trouvé")
+        driver_name = driver_info[0]['name']
+
+        vehicules = client.execute_kw(
+            'fleet.vehicle', 'search_read',
+            [[('driver_id', '=', driver_id), ('active', '=', True)]],
+            {'fields': ['id', 'name', 'license_plate', 'driver_id']}
+        )
+
+        if not vehicules:
+            logger.info(
+                f"Aucun camion avec driver_id {driver_id}, recherche par nom: {driver_name}"
+            )
+            homonymes = client.execute_kw(
+                'res.partner', 'search_read',
+                [[('name', '=', driver_name)]],
+                {'fields': ['id'], 'limit': 10}
+            )
+            for partenaire in homonymes:
+                if partenaire['id'] == driver_id:
+                    continue
+                vehicules += client.execute_kw(
+                    'fleet.vehicle', 'search_read',
+                    [[('driver_id', '=', partenaire['id']), ('active', '=', True)]],
+                    {'fields': ['id', 'name', 'license_plate', 'driver_id']}
+                )
+
+        if not vehicules:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Aucun camion affecté au chauffeur {driver_name} (ID {driver_id})"
+            )
+
+        # L'emplacement de stock porte l'immatriculation (ex: CAM/AX0043RB),
+        # d'où la priorité donnée à license_plate sur le libellé du véhicule.
+        noms_camions = []
+        for v in vehicules:
+            identifiant = v.get('license_plate') or v.get('name')
+            if identifiant and identifiant not in noms_camions:
+                noms_camions.append(identifiant)
+
+        logger.info(
+            f"🚚 Chauffeur {driver_name} ({driver_id}): "
+            f"{len(noms_camions)} camion(s) — {', '.join(noms_camions)}"
+        )
+
+        # --- Inventaire de chaque camion ---
+        inventaires = []
+        for nom_camion in noms_camions:
+            location_ids = client.execute_kw(
+                'stock.location', 'search',
+                [[('name', 'ilike', nom_camion), ('usage', '=', 'internal')]]
+            )
+            if not location_ids:
+                location_ids = client.execute_kw(
+                    'stock.location', 'search',
+                    [[('complete_name', 'ilike', nom_camion), ('usage', '=', 'internal')]]
+                )
+            if not location_ids:
+                logger.warning(f"Camion '{nom_camion}': aucun emplacement de stock")
+                inventaires.append({
+                    'truck_name': nom_camion,
+                    'locations': [],
+                    'products': [],
+                    'warning': "Aucun emplacement de stock rattaché à ce camion dans Odoo",
+                })
+                continue
+
+            quants = client.execute_kw(
+                'stock.quant', 'search_read',
+                [[('location_id', 'child_of', location_ids)]],
+                {'fields': ['product_id', 'quantity', 'reserved_quantity']}
+            )
+            agrege: dict[int, dict] = {}
+            for q in quants:
+                prod = q.get('product_id')
+                if not prod:
+                    continue
+                pid = prod[0] if isinstance(prod, list) else prod
+                if pid not in agrege:
+                    agrege[pid] = {'on_hand': 0.0, 'reserved': 0.0}
+                agrege[pid]['on_hand'] += float(q.get('quantity') or 0)
+                agrege[pid]['reserved'] += float(q.get('reserved_quantity') or 0)
+
+            produits = []
+            if agrege:
+                produits = client.execute_kw(
+                    'product.product', 'search_read',
+                    [[('id', 'in', list(agrege.keys()))]],
+                    {'fields': ['id', 'name', 'default_code', 'uom_id', 'categ_id'],
+                     'order': 'name asc'}
+                )
+
+            lignes = []
+            for p in produits:
+                data = agrege.get(p['id'], {})
+                on_hand = round(data.get('on_hand', 0.0), 3)
+                reserved = round(data.get('reserved', 0.0), 3)
+                if not include_empty and abs(on_hand) < 0.001 and abs(reserved) < 0.001:
+                    continue
+                lignes.append({
+                    'product_id': p['id'],
+                    'product_name': p['name'],
+                    'product_code': p.get('default_code') or None,
+                    'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
+                    'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
+                    'quantity_on_hand': on_hand,
+                    'quantity_reserved': reserved,
+                    'quantity_available': round(on_hand - reserved, 3),
+                    'is_negative': on_hand < 0,
+                })
+
+            locations = client.execute_kw(
+                'stock.location', 'read', [location_ids],
+                {'fields': ['complete_name', 'name']}
+            )
+            inventaires.append({
+                'truck_name': nom_camion,
+                'locations': [l.get('complete_name') or l.get('name') for l in locations],
+                'products': lignes,
+                'products_count': len(lignes),
+                'total_quantity_available': round(
+                    sum(l['quantity_available'] for l in lignes), 3
+                ),
+            })
+
+        total_produits = sum(len(i.get('products', [])) for i in inventaires)
+
+        return ApiResponse(
+            success=True,
+            data={
+                'driver_id': driver_id,
+                'driver_name': driver_name,
+                'trucks_count': len(inventaires),
+                'trucks': inventaires,
+                'last_update': datetime.now().isoformat(),
+            },
+            message=(
+                f"{len(inventaires)} camion(s), {total_produits} produit(s) en stock"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur inventaire chauffeur {driver_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération de l'inventaire: {str(e)}"
+        )
+
 
 # ===== ÉVOLUTION DES STOCKS PAR SESSION =====
 
@@ -6690,7 +7224,7 @@ async def create_pos_order_only(
         # Vérifier que la session existe et est ouverte
         session_data = client.execute_kw(
             'pos.session', 'read', [request.session_id],
-            {'fields': ['id', 'state', 'config_id', 'user_id']}
+            {'fields': ['id', 'state', 'config_id', 'user_id', 'start_at']}
         )
         if not session_data:
             raise HTTPException(status_code=404, detail="Session POS non trouvée")
@@ -6700,6 +7234,36 @@ async def create_pos_order_only(
             raise HTTPException(status_code=400, detail="La session n'appartient pas à ce point de vente")
         if session['state'] != 'opened':
             raise HTTPException(status_code=400, detail=f"La session n'est pas ouverte (état: {session['state']})")
+
+        # ===== CONTRÔLE DU STOCK AVANT VENTE =====
+        # Odoo n'empêche pas de vendre un article dont le stock est nul ou négatif.
+        # On refuse ici toute vente dont la quantité dépasse le disponible théorique,
+        # ou portant sur un produit dont le stock théorique est déjà à zéro.
+        # Les produits non stockables (service, consommable) sont hors périmètre.
+        _stock_blocking = _check_pos_sale_stock(
+            client=client,
+            pos_id=pos_id,
+            session_id=request.session_id,
+            session_start=session.get('start_at'),
+            lines=request.lines,
+        )
+        if _stock_blocking:
+            logger.warning(
+                f"🚫 Vente refusée sur PDV {pos_id} — stock insuffisant: {_stock_blocking}"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "insufficient_pos_stock",
+                    "message": (
+                        "Vente impossible : le stock disponible en station est "
+                        "insuffisant pour un ou plusieurs produits."
+                    ),
+                    "pos_id": pos_id,
+                    "session_id": request.session_id,
+                    "shortages": _stock_blocking,
+                }
+            )
 
         # Valider les produits et préparer les lignes
         order_lines = []
