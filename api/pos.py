@@ -1783,13 +1783,20 @@ def _pos_theoretical_stock(client, session_id: int, location_id: int,
     Retourne {product_id: {'on_hand', 'sold', 'moves_out', 'available'}}.
     """
     result = {
-        pid: {'on_hand': 0.0, 'sold': 0.0, 'moves_out': 0.0, 'available': 0.0}
+        pid: {'on_hand': 0.0, 'sold': 0.0, 'moves_out': 0.0,
+              'available': 0.0, 'tracked': False}
         for pid in product_ids
     }
     if not product_ids:
         return result
 
-    # Stock physique de l'emplacement et de ses sous-emplacements
+    # Stock physique de l'emplacement et de ses sous-emplacements.
+    #
+    # `tracked` retient si le produit possède une ligne de quant ici. Odoo en crée
+    # une dès qu'un produit transite par un emplacement : son absence signifie que
+    # le produit n'y est pas géré, ce qui est différent d'un stock épuisé. Les
+    # lubrifiants d'une station peuvent ainsi être suivis sur un magasin central
+    # alors que seuls les carburants sont rattachés à la station.
     try:
         quants = client.execute_kw(
             'stock.quant', 'search_read',
@@ -1802,6 +1809,7 @@ def _pos_theoretical_stock(client, session_id: int, location_id: int,
             pid = prod[0] if isinstance(prod, list) else prod
             if pid in result:
                 result[pid]['on_hand'] += float(q.get('quantity') or 0)
+                result[pid]['tracked'] = True
     except Exception as e:
         logger.warning(f"Lecture des quants impossible (emplacement {location_id}): {e}")
 
@@ -1920,10 +1928,19 @@ def _check_pos_sale_stock(client, pos_id: int, session_id: int,
     )
 
     manquants = []
+    non_suivis = []
     for pid, produit in stockables.items():
         demande = demandes[pid]
         data = stocks.get(pid, {})
         disponible = data.get('available', 0.0)
+
+        # Produit non géré à cet emplacement : aucune ligne de quant, même à zéro.
+        # On n'a aucune base pour juger sa disponibilité — bloquer reviendrait à
+        # refuser toutes les ventes de lubrifiants d'une station dont seuls les
+        # carburants sont rattachés à l'emplacement.
+        if not data.get('tracked'):
+            non_suivis.append(produit.get('name'))
+            continue
 
         if disponible <= 0 or demande - disponible > 0.001:
             manquants.append({
@@ -1939,6 +1956,13 @@ def _check_pos_sale_stock(client, pos_id: int, session_id: int,
                 'missing': round(max(demande - disponible, 0.0), 3),
                 'reason': 'stock_epuise' if disponible <= 0 else 'quantite_insuffisante',
             })
+
+    if non_suivis:
+        logger.info(
+            f"PDV {pos_id} : {len(non_suivis)} produit(s) non suivis sur "
+            f"{location_name}, contrôle non applicable — {', '.join(non_suivis[:5])}"
+            + (" …" if len(non_suivis) > 5 else "")
+        )
 
     return manquants
 
@@ -5071,9 +5095,43 @@ async def get_fuel_products(
                 message="Aucun produit trouvé"
             )
 
-        products_list = [
-            {
-                'id': prod['id'],
+        # Stock à l'emplacement de la station, pour compléter `qty_available`
+        # qui agrège toutes les sociétés et tous les emplacements.
+        #
+        # Les deux valeurs coexistent volontairement : à JO19, un lubrifiant
+        # peut afficher 2894 en catalogue et 0 en station, parce qu'il est suivi
+        # sur un magasin central. Masquer l'un des deux chiffres ferait soit
+        # disparaître le produit du catalogue, soit croire à une disponibilité
+        # locale inexistante.
+        stock_station: dict[int, dict] = {}
+        location_name_station = None
+        try:
+            loc_id, location_name_station, _fiable_loc = _resolve_pos_stock_location(
+                client, pos_id
+            )
+            quants = client.execute_kw(
+                'stock.quant', 'search_read',
+                [[('location_id', 'child_of', loc_id),
+                  ('product_id', 'in', [p['id'] for p in products])]],
+                {'fields': ['product_id', 'quantity', 'reserved_quantity']}
+            )
+            for q in quants:
+                prod_ref = q.get('product_id')
+                pid = prod_ref[0] if isinstance(prod_ref, list) else prod_ref
+                if not pid:
+                    continue
+                entree = stock_station.setdefault(pid, {'qte': 0.0, 'res': 0.0})
+                entree['qte'] += float(q.get('quantity') or 0)
+                entree['res'] += float(q.get('reserved_quantity') or 0)
+        except Exception as e:
+            logger.warning(f"Stock station illisible pour le PDV {pos_id}: {e}")
+
+        products_list = []
+        for prod in products:
+            pid = prod['id']
+            local = stock_station.get(pid)
+            products_list.append({
+                'id': pid,
                 'name': prod.get('name', 'N/A'),
                 'code': prod.get('default_code'),
                 'barcode': prod.get('barcode'),
@@ -5084,14 +5142,25 @@ async def get_fuel_products(
                 'unit': prod['uom_id'][1] if prod.get('uom_id') and isinstance(prod['uom_id'], list) else 'Unité',
                 'unit_id': prod['uom_id'][0] if prod.get('uom_id') and isinstance(prod['uom_id'], list) else None,
                 'type': prod.get('type', 'product'),
+                # Stock global toutes sociétés et tous emplacements (inchangé)
                 'stock_quantity': prod.get('qty_available', 0.0),
+                # Stock réel à l'emplacement de la station
+                'stock_station': round(local['qte'] - local['res'], 3) if local else 0.0,
+                'stock_station_on_hand': round(local['qte'], 3) if local else 0.0,
+                # False = produit non suivi à cet emplacement : le stock station
+                # n'est pas significatif, et le contrôle de vente ne s'y applique pas.
+                'tracked_at_station': local is not None,
+                'station_location': location_name_station,
                 'description': prod.get('description_sale')
-            }
-            for prod in products
-        ]
+            })
 
         filtre_label = filtre or 'tous'
-        logger.info(f"POS {pos_name} ({pos_id}) [filtre={filtre_label}]: {len(products_list)} produit(s) retourné(s)")
+        non_suivis = sum(1 for p in products_list if not p['tracked_at_station'])
+        logger.info(
+            f"POS {pos_name} ({pos_id}) [filtre={filtre_label}]: "
+            f"{len(products_list)} produit(s) retourné(s), "
+            f"{non_suivis} non suivi(s) sur {location_name_station or 'emplacement inconnu'}"
+        )
 
         return ApiResponse(
             success=True,
@@ -7654,7 +7723,7 @@ async def create_complete_pos_order(
             'pos.session',
             'read',
             [request.pos_session_id],
-            {'fields': ['id', 'state', 'config_id', 'user_id']}
+            {'fields': ['id', 'state', 'config_id', 'user_id', 'start_at']}
         )
         
         if not session or session[0]['state'] != 'opened':
@@ -7662,9 +7731,37 @@ async def create_complete_pos_order(
                 status_code=400,
                 detail="Session POS non trouvée ou non ouverte"
             )
-        
+
         session_data = session[0]
-        
+
+        # ===== CONTRÔLE DU STOCK AVANT VENTE =====
+        # Même garde-fou que POST /{pos_id}/orders : les ventes mobiles passent
+        # par cet endpoint et doivent être protégées de la même façon.
+        _stock_blocking = _check_pos_sale_stock(
+            client=client,
+            pos_id=pos_id,
+            session_id=request.pos_session_id,
+            session_start=session_data.get('start_at'),
+            lines=request.lines,
+        )
+        if _stock_blocking:
+            logger.warning(
+                f"🚫 Vente refusée sur PDV {pos_id} — stock insuffisant: {_stock_blocking}"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "insufficient_pos_stock",
+                    "message": (
+                        "Vente impossible : le stock disponible en station est "
+                        "insuffisant pour un ou plusieurs produits."
+                    ),
+                    "pos_id": pos_id,
+                    "session_id": request.pos_session_id,
+                    "shortages": _stock_blocking,
+                }
+            )
+
         # Préparer les lignes de commande
         order_lines = []
         total_amount = 0.0
