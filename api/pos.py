@@ -4566,6 +4566,64 @@ async def receive_delivery_note(
 _ETATS_A_LIVRER = ['assigned', 'confirmed', 'waiting', 'partially_available']
 
 
+def _resoudre_emplacements_camion(client, truck_name: str) -> list:
+    """
+    Emplacements de stock correspondant à un camion.
+
+    L'identifiant d'un véhicule combine souvent tracteur et remorque
+    (`AX0042RB/BJ2519RB`), alors qu'Odoo nomme les emplacements d'après une seule
+    immatriculation (`CAM/AX0042RB`). Chercher l'identifiant complet ne donne donc
+    rien : il faut le décomposer et essayer chaque plaque.
+
+    Les deux emplacements sont retournés quand ils existent — sur un ensemble
+    routier, la remorque porte sa propre citerne.
+    """
+    if not truck_name:
+        return []
+
+    def chercher(motif):
+        for champ in ('name', 'complete_name'):
+            try:
+                trouves = client.execute_kw(
+                    'stock.location', 'search',
+                    [[(champ, 'ilike', motif), ('usage', '=', 'internal')]]
+                )
+                if trouves:
+                    return trouves
+            except Exception as e:
+                logger.debug(f"Recherche emplacement sur {champ} échouée: {e}")
+        return []
+
+    # 1. L'identifiant complet, au cas où un emplacement le porte tel quel
+    emplacements = chercher(truck_name)
+    if emplacements:
+        return emplacements
+
+    # 2. Chaque composant de l'identifiant, séparateurs courants
+    parties = []
+    for separateur in ('/', '-', '+', ' '):
+        truck_name = truck_name.replace(separateur, '|')
+    for partie in truck_name.split('|'):
+        partie = partie.strip()
+        # Une immatriculation fait au moins quatre caractères ; en deçà on
+        # risquerait de ramener des emplacements sans rapport.
+        if len(partie) >= 4 and partie not in parties:
+            parties.append(partie)
+
+    trouves = []
+    for partie in parties:
+        for loc_id in chercher(partie):
+            if loc_id not in trouves:
+                trouves.append(loc_id)
+
+    if trouves:
+        logger.info(
+            f"Camion '{truck_name}' : {len(trouves)} emplacement(s) trouvé(s) "
+            f"via les composants {parties}"
+        )
+    return trouves
+
+
 def _inventaire_camion(client, location_ids: list, jour: str,
                        include_empty: bool = False) -> list:
     """
@@ -4732,16 +4790,7 @@ async def get_truck_inventory(
         client = get_odoo_client(current_user)
 
         # --- Emplacement(s) du camion ---
-        location_ids = client.execute_kw(
-            'stock.location', 'search',
-            [[('name', 'ilike', truck_name), ('usage', '=', 'internal')]]
-        )
-        if not location_ids:
-            # Repli : certains emplacements portent le nom complet (CAM/XXXX)
-            location_ids = client.execute_kw(
-                'stock.location', 'search',
-                [[('complete_name', 'ilike', truck_name), ('usage', '=', 'internal')]]
-            )
+        location_ids = _resoudre_emplacements_camion(client, truck_name)
 
         if not location_ids:
             raise HTTPException(
@@ -4894,15 +4943,7 @@ async def get_driver_inventory(
         # --- Inventaire de chaque camion ---
         inventaires = []
         for nom_camion in noms_camions:
-            location_ids = client.execute_kw(
-                'stock.location', 'search',
-                [[('name', 'ilike', nom_camion), ('usage', '=', 'internal')]]
-            )
-            if not location_ids:
-                location_ids = client.execute_kw(
-                    'stock.location', 'search',
-                    [[('complete_name', 'ilike', nom_camion), ('usage', '=', 'internal')]]
-                )
+            location_ids = _resoudre_emplacements_camion(client, nom_camion)
             if not location_ids:
                 logger.warning(f"Camion '{nom_camion}': aucun emplacement de stock")
                 inventaires.append({
