@@ -41,6 +41,24 @@ def _secret_to_key(secret: str) -> bytes:
     return secret.encode('utf-8')
 
 
+def verify_inbound_signature(payload: bytes, signature: str, secret: str) -> bool:
+    """
+    Vérifie la signature HMAC-SHA256 d'un contenu reçu.
+
+    Pendant entrant de `compute_webhook_signature` : l'émetteur signe le contenu
+    binaire avec le secret partagé, on recalcule et on compare.
+
+    La comparaison utilise `compare_digest`, dont le temps d'exécution ne dépend
+    pas de l'endroit où les deux valeurs divergent. Un `==` classique permettrait
+    de deviner la signature attendue octet par octet en mesurant les temps de
+    réponse.
+    """
+    if not signature or not secret:
+        return False
+    attendue = hmac.new(secret.encode('utf-8'), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(attendue, signature.strip().lower())
+
+
 def secret_fingerprint(secret: str) -> str:
     """
     Empreinte du secret réellement utilisé, sans jamais l'exposer.

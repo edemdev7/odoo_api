@@ -1,6 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Path, Body, Query
+from fastapi import (
+    APIRouter, Depends, HTTPException, Path, Body, Query,
+    UploadFile, File, Form, Header,
+)
 from fastapi.responses import Response
 from typing import List, Dict, Any, Optional
+import os
 import time
 import base64
 from datetime import datetime
@@ -21,9 +25,10 @@ from models.schemas import (
 )
 from models.responses import ApiResponse
 from core.security import require_scope
-from core.odoo_client import get_odoo_client
+from core.odoo_client import get_odoo_client, OdooClient
 from core.config import logger
 from core.pump_manager import pump_manager
+from core.webhook_sender import verify_inbound_signature
 from api.accounting import _generate_pdf_via_wizard
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
@@ -4370,6 +4375,189 @@ async def get_all_trucks(
             status_code=500,
             detail=f"Erreur lors de la récupération: {str(e)}"
         )
+
+# ===== RÉCEPTION DU BON DE LIVRAISON DEPUIS OPEN SI =====
+
+# Marqueur inscrit dans la description de la pièce jointe : c'est lui qui permet
+# de retrouver un BL déjà déposé pour le remplacer, sans dépendre du nom du fichier.
+_MARQUEUR_BL = "[OPENSI_BL]"
+
+# Taille maximale acceptée pour un BL. Un bon de livraison signé pèse quelques
+# centaines de kilo-octets ; au-delà de 10 Mo il s'agit d'une anomalie.
+_TAILLE_MAX_BL = 10 * 1024 * 1024
+
+
+@router.post("/inventory/transfers/{transfer_id}/delivery-note", response_model=ApiResponse)
+async def receive_delivery_note(
+    transfer_id: int = Path(..., description="ID du stock.picking concerné"),
+    file: UploadFile = File(..., description="Le BL au format PDF"),
+    reference: Optional[str] = Form(
+        None, description="Référence du document côté OPEN SI, pour la traçabilité"
+    ),
+    x_opensi_signature: Optional[str] = Header(
+        None, description="HMAC-SHA256 (hex) du contenu du fichier"
+    ),
+):
+    """
+    Réception du bon de livraison généré par OPEN SI.
+
+    OPEN SI pousse ici le BL signé une fois la livraison terminée. Le PDF est
+    attaché au transfert dans Odoo, où les équipes métier le retrouvent dans le
+    trombone du bon de livraison et le téléchargent avec leur session habituelle.
+
+    C'est ce sens de circulation qui résout le problème d'authentification : un
+    navigateur ne peut pas porter de jeton Bearer en suivant un lien, alors qu'il
+    télécharge sans difficulté une pièce jointe Odoo.
+
+    **Authentification** — signature HMAC-SHA256 du contenu binaire du fichier,
+    avec le secret partagé `OPENSI_BL_SECRET`, transmise dans l'en-tête
+    `x-opensi-signature`. Aucun jeton JWT n'est requis.
+
+    ```python
+    signature = hmac.new(secret.encode(), pdf_bytes, hashlib.sha256).hexdigest()
+    ```
+
+    **Remplacement** — si un BL a déjà été déposé sur ce transfert, il est
+    remplacé. Le dépôt est donc rejouable sans créer de doublon.
+    """
+    try:
+        contenu = await file.read()
+
+        if not contenu:
+            raise HTTPException(status_code=400, detail="Fichier vide")
+
+        if len(contenu) > _TAILLE_MAX_BL:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Fichier trop volumineux ({len(contenu) // 1024} Ko), "
+                    f"maximum {_TAILLE_MAX_BL // 1024 // 1024} Mo"
+                )
+            )
+
+        # ===== 1. Signature =====
+        secret = os.getenv("OPENSI_BL_SECRET", "")
+        if not secret:
+            logger.error(
+                "OPENSI_BL_SECRET absent de la configuration — dépôt de BL refusé"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Réception des BL non configurée sur ce serveur"
+            )
+
+        if not verify_inbound_signature(contenu, x_opensi_signature or "", secret):
+            logger.warning(
+                f"🚫 Dépôt de BL refusé sur le transfert {transfer_id} — "
+                f"signature invalide ou absente"
+            )
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": "invalid_signature",
+                    "message": (
+                        "Signature absente ou invalide. Attendu : HMAC-SHA256 "
+                        "hexadécimal du contenu binaire du fichier, dans "
+                        "l'en-tête x-opensi-signature."
+                    ),
+                }
+            )
+
+        # ===== 2. Le transfert doit exister =====
+        # Client de service : l'appel vient d'OPEN SI, pas d'un utilisateur
+        # authentifié par JWT. La légitimité est établie par la signature.
+        client = OdooClient()
+        transfert = client.execute_kw(
+            'stock.picking', 'search_read',
+            [[('id', '=', transfer_id)]],
+            {'fields': ['id', 'name', 'state'], 'limit': 1}
+        )
+        if not transfert:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Transfert {transfer_id} introuvable dans Odoo"
+            )
+        transfert = transfert[0]
+        nom_transfert = transfert['name']
+
+        # ===== 3. Remplacer un BL déjà déposé =====
+        remplace = None
+        anciens = client.execute_kw(
+            'ir.attachment', 'search_read',
+            [[('res_model', '=', 'stock.picking'),
+              ('res_id', '=', transfer_id),
+              ('description', 'like', _MARQUEUR_BL)]],
+            {'fields': ['id', 'name']}
+        )
+        if anciens:
+            client.execute_kw('ir.attachment', 'unlink', [[a['id'] for a in anciens]])
+            remplace = [a['name'] for a in anciens]
+            logger.info(
+                f"BL précédent supprimé sur {nom_transfert}: {', '.join(remplace)}"
+            )
+
+        # ===== 4. Attacher le nouveau =====
+        nom_fichier = f"BL_{nom_transfert.replace('/', '-')}.pdf"
+        description = (
+            f"{_MARQUEUR_BL} Bon de livraison signé, déposé par OPEN SI "
+            f"le {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+            + (f" — référence {reference}" if reference else "")
+        )
+
+        attachment_id = client.execute_kw('ir.attachment', 'create', [{
+            'name': nom_fichier,
+            'datas': base64.b64encode(contenu).decode('utf-8'),
+            'res_model': 'stock.picking',
+            'res_id': transfer_id,
+            'mimetype': 'application/pdf',
+            'description': description,
+        }])
+
+        # ===== 5. Tracer dans le fil de discussion =====
+        try:
+            client.execute_kw('stock.picking', 'message_post', [[transfer_id]], {
+                'body': (
+                    f"Bon de livraison signé reçu depuis OPEN SI : {nom_fichier}"
+                    + (f" (référence {reference})" if reference else "")
+                ),
+                'attachment_ids': [attachment_id],
+            })
+        except Exception as e:
+            logger.warning(f"Message de suivi non publié sur {nom_transfert}: {e}")
+
+        logger.info(
+            f"📄 BL reçu pour {nom_transfert} — pièce jointe {attachment_id}, "
+            f"{len(contenu) // 1024} Ko"
+            + (" (remplacement)" if remplace else "")
+        )
+
+        return ApiResponse(
+            success=True,
+            data={
+                'transfer_id': transfer_id,
+                'transfer_name': nom_transfert,
+                'attachment_id': attachment_id,
+                'filename': nom_fichier,
+                'size_bytes': len(contenu),
+                'reference': reference,
+                'replaced': remplace,
+                'download_url': f"/web/content/{attachment_id}?download=true",
+            },
+            message=(
+                f"Bon de livraison attaché au transfert {nom_transfert}"
+                + (" (BL précédent remplacé)" if remplace else "")
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur réception BL sur le transfert {transfer_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'enregistrement du bon de livraison: {str(e)}"
+        )
+
 
 # ===== INVENTAIRE CAMION (PROFIL CHAUFFEUR) =====
 
