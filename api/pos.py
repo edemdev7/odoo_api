@@ -4561,6 +4561,137 @@ async def receive_delivery_note(
 
 # ===== INVENTAIRE CAMION (PROFIL CHAUFFEUR) =====
 
+# États d'un mouvement encore à réaliser : la marchandise est engagée sur une
+# livraison mais n'a pas quitté le camion.
+_ETATS_A_LIVRER = ['assigned', 'confirmed', 'waiting', 'partially_available']
+
+
+def _inventaire_camion(client, location_ids: list, jour: str,
+                       include_empty: bool = False) -> list:
+    """
+    Inventaire d'un camion, du point de vue du chauffeur.
+
+    Trois grandeurs, volontairement peu nombreuses : le chauffeur consulte cet
+    écran sur le terrain, souvent debout à côté de sa citerne.
+
+    - **stock_actuel**  : ce que contient physiquement le camion
+    - **stock_a_livrer**: ce qui est engagé sur des livraisons en attente
+    - **stock_livre**   : ce qui a effectivement été livré dans la journée
+
+    `stock_a_livrer` est lu sur les mouvements en cours plutôt que sur la
+    quantité réservée des quants : Odoo ne réserve qu'à partir de l'état « Prêt »,
+    si bien qu'un transfert confirmé mais non encore réservé n'apparaîtrait pas.
+
+    Retourne une liste de lignes triées par nom de produit.
+    """
+    emplacements = set(client.execute_kw(
+        'stock.location', 'search', [[('id', 'child_of', location_ids)]]
+    ))
+
+    # --- Ce qui est physiquement présent ---
+    actuel: dict[int, float] = {}
+    quants = client.execute_kw(
+        'stock.quant', 'search_read',
+        [[('location_id', 'child_of', location_ids)]],
+        {'fields': ['product_id', 'quantity']}
+    )
+    for q in quants:
+        prod = q.get('product_id')
+        if not prod:
+            continue
+        pid = prod[0] if isinstance(prod, list) else prod
+        actuel[pid] = actuel.get(pid, 0.0) + float(q.get('quantity') or 0)
+
+    # --- Ce qui reste à livrer ---
+    a_livrer: dict[int, float] = {}
+    try:
+        moves = client.execute_kw(
+            'stock.move', 'search_read',
+            [[('state', 'in', _ETATS_A_LIVRER),
+              ('location_id', 'child_of', location_ids)]],
+            {'fields': ['product_id', 'product_uom_qty', 'location_dest_id']}
+        )
+        for m in moves:
+            prod = m.get('product_id')
+            if not prod:
+                continue
+            dst = m.get('location_dest_id')
+            dst_id = dst[0] if isinstance(dst, list) else dst
+            if dst_id in emplacements:
+                continue  # déplacement interne au camion, pas une livraison
+            pid = prod[0] if isinstance(prod, list) else prod
+            a_livrer[pid] = a_livrer.get(pid, 0.0) + float(m.get('product_uom_qty') or 0)
+    except Exception as e:
+        logger.warning(f"Mouvements à livrer illisibles: {e}")
+
+    # --- Ce qui a été livré dans la journée ---
+    livre: dict[int, float] = {}
+    try:
+        lignes_mvt = client.execute_kw(
+            'stock.move.line', 'search_read',
+            [[('state', '=', 'done'),
+              ('date', '>=', f"{jour} 00:00:00"),
+              ('date', '<=', f"{jour} 23:59:59"),
+              ('location_id', 'child_of', location_ids)]],
+            {'fields': ['product_id', 'quantity', 'qty_done', 'location_dest_id']}
+        )
+        for ml in lignes_mvt:
+            prod = ml.get('product_id')
+            if not prod:
+                continue
+            dst = ml.get('location_dest_id')
+            dst_id = dst[0] if isinstance(dst, list) else dst
+            if dst_id in emplacements:
+                continue
+            pid = prod[0] if isinstance(prod, list) else prod
+            qte = float(ml.get('quantity') or 0) or float(ml.get('qty_done') or 0)
+            if qte > 0:
+                livre[pid] = livre.get(pid, 0.0) + qte
+    except Exception as e:
+        logger.warning(f"Mouvements livrés illisibles: {e}")
+
+    # --- Assemblage ---
+    tous_ids = set(actuel) | set(a_livrer) | set(livre)
+    if not tous_ids:
+        return []
+
+    produits = client.execute_kw(
+        'product.product', 'search_read',
+        [[('id', 'in', list(tous_ids))]],
+        {'fields': ['id', 'name', 'default_code', 'uom_id', 'categ_id', 'list_price'],
+         'order': 'name asc'}
+    )
+
+    lignes = []
+    for p in produits:
+        pid = p['id']
+        qte_actuelle = round(actuel.get(pid, 0.0), 3)
+        qte_a_livrer = round(a_livrer.get(pid, 0.0), 3)
+        qte_livree = round(livre.get(pid, 0.0), 3)
+
+        if not include_empty and not any((qte_actuelle, qte_a_livrer, qte_livree)):
+            continue
+
+        lignes.append({
+            'product_id': pid,
+            'product_name': p['name'],
+            'product_code': p.get('default_code') or None,
+            'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
+            'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
+            'unit_price': round(float(p.get('list_price') or 0), 2),
+
+            # ---- Les trois grandeurs de l'écran chauffeur ----
+            'stock_actuel': qte_actuelle,
+            'stock_a_livrer': qte_a_livrer,
+            'stock_livre': qte_livree,
+
+            # Signale une quantité négative : incohérence de données Odoo,
+            # à remonter plutôt qu'à afficher telle quelle au chauffeur.
+            'is_negative': qte_actuelle < 0,
+        })
+
+    return lignes
+
 @router.get("/fleet/trucks/{truck_name}/inventory", response_model=ApiResponse)
 async def get_truck_inventory(
     truck_name: str = Path(..., description="Nom ou immatriculation du camion (ex: AX0043RB)"),
@@ -4577,26 +4708,22 @@ async def get_truck_inventory(
     """
     Inventaire d'un camion — menu « Inventaire » du profil chauffeur.
 
-    Les quatre grandeurs attendues, pour chaque produit :
+    Trois grandeurs par produit, tenues volontairement peu nombreuses : le
+    chauffeur consulte cet écran sur le terrain, souvent debout près de sa citerne.
 
-    - **stock_initial**     : stock disponible au début de la journée
-    - **stock_receptionne** : quantités chargées dans le camion durant la journée
-    - **stock_vendu**       : quantités livrées depuis le camion durant la journée
-    - **stock_final**       : stock disponible à l'instant de la consultation
+    - **stock_actuel**   : quantité approvisionnée dans le camion selon Odoo
+    - **stock_a_livrer** : quantité totale engagée sur des livraisons en attente
+    - **stock_livre**    : quantité effectivement livrée dans la journée
 
-    Elles forment une chaîne vérifiable :
+    `stock_a_livrer` est lu sur les mouvements en cours et non sur la quantité
+    réservée des quants : Odoo ne réserve qu'à partir de l'état « Prêt », si bien
+    qu'un transfert confirmé mais non encore réservé n'apparaîtrait pas.
 
-        stock_final = stock_initial + stock_receptionne − stock_vendu
+    Le paramètre `date` permet de consulter une journée passée ; il n'affecte
+    que `stock_livre`, les deux autres étant des états courants.
 
-    Le stock initial n'est pas photographié le matin : il est reconstitué en
-    remontant les mouvements de la journée à partir du stock actuel. Consulter
-    une journée passée reste donc possible via le paramètre `date`.
-
-    Détail complémentaire :
-    - **quantity_on_hand**   : quantité physiquement présente
-    - **quantity_reserved**  : part déjà engagée par des transferts en cours
-    - **quantity_available** : réellement disponible pour une nouvelle livraison
-    - **is_negative**        : signale une quantité négative, incohérence de données
+    **is_negative** signale une quantité négative — incohérence de données Odoo,
+    à remonter plutôt qu'à afficher telle quelle.
 
     L'emplacement du camion est résolu par son nom dans `stock.location`
     (ex: `CAM/AX0043RB`), sous-emplacements compris.
@@ -4635,127 +4762,18 @@ async def get_truck_inventory(
             f"{len(location_ids)} emplacement(s) — {', '.join(location_names)}"
         )
 
-        # --- Mouvements de la période, pour reconstituer la chaîne ---
-        # Le camion n'a pas de session : la période de référence est la journée,
-        # de minuit à l'instant de la consultation. Un paramètre `date` permet
-        # de consulter une journée passée.
+        # --- Les trois grandeurs, calculées par le helper partagé ---
         jour = date_ref or datetime.now().strftime('%Y-%m-%d')
-        debut_periode = f"{jour} 00:00:00"
-        fin_periode = f"{jour} 23:59:59"
+        lignes = _inventaire_camion(client, location_ids, jour, include_empty)
 
-        recu: dict[int, float] = {}
-        livre: dict[int, float] = {}
-        try:
-            emplacements_camion = set(client.execute_kw(
-                'stock.location', 'search', [[('id', 'child_of', location_ids)]]
-            ))
-            mouvements = client.execute_kw(
-                'stock.move.line', 'search_read',
-                [[('state', '=', 'done'),
-                  ('date', '>=', debut_periode),
-                  ('date', '<=', fin_periode),
-                  '|',
-                  ('location_id', 'child_of', location_ids),
-                  ('location_dest_id', 'child_of', location_ids)]],
-                {'fields': ['product_id', 'quantity', 'qty_done',
-                            'location_id', 'location_dest_id']}
-            )
-            for ml in mouvements:
-                prod = ml.get('product_id')
-                if not prod:
-                    continue
-                pid = prod[0] if isinstance(prod, list) else prod
-                qte = float(ml.get('quantity') or 0) or float(ml.get('qty_done') or 0)
-                if qte <= 0:
-                    continue
-                src = ml.get('location_id')
-                dst = ml.get('location_dest_id')
-                src_id = src[0] if isinstance(src, list) else src
-                dst_id = dst[0] if isinstance(dst, list) else dst
-                src_camion = src_id in emplacements_camion
-                dst_camion = dst_id in emplacements_camion
-                if dst_camion and not src_camion:
-                    recu[pid] = recu.get(pid, 0.0) + qte
-                elif src_camion and not dst_camion:
-                    livre[pid] = livre.get(pid, 0.0) + qte
-        except Exception as e:
-            logger.warning(f"Mouvements du camion '{truck_name}' illisibles: {e}")
-
-        # --- Quants du camion ---
-        quants = client.execute_kw(
-            'stock.quant', 'search_read',
-            [[('location_id', 'child_of', location_ids)]],
-            {'fields': ['product_id', 'quantity', 'reserved_quantity', 'location_id']}
-        )
-
-        agrege: dict[int, dict] = {}
-        for q in quants:
-            prod = q.get('product_id')
-            if not prod:
-                continue
-            pid = prod[0] if isinstance(prod, list) else prod
-            if pid not in agrege:
-                agrege[pid] = {'on_hand': 0.0, 'reserved': 0.0}
-            agrege[pid]['on_hand'] += float(q.get('quantity') or 0)
-            agrege[pid]['reserved'] += float(q.get('reserved_quantity') or 0)
-
-        produits = []
-        if agrege:
-            produits = client.execute_kw(
-                'product.product', 'search_read',
-                [[('id', 'in', list(agrege.keys()))]],
-                {'fields': ['id', 'name', 'default_code', 'uom_id', 'categ_id', 'list_price'],
-                 'order': 'name asc'}
-            )
-
-        lignes = []
-        for p in produits:
-            pid = p['id']
-            data = agrege.get(pid, {})
-            on_hand = round(data.get('on_hand', 0.0), 3)
-            reserved = round(data.get('reserved', 0.0), 3)
-            available = round(on_hand - reserved, 3)
-
-            if not include_empty and abs(on_hand) < 0.001 and abs(reserved) < 0.001:
-                continue
-
-            qte_recue = round(recu.get(pid, 0.0), 3)
-            qte_livree = round(livre.get(pid, 0.0), 3)
-            # Stock final = ce qui est physiquement là maintenant.
-            # Stock initial = on remonte la journée à l'envers.
-            stock_final = on_hand
-            stock_initial = round(stock_final + qte_livree - qte_recue, 3)
-
-            lignes.append({
-                'product_id': pid,
-                'product_name': p['name'],
-                'product_code': p.get('default_code') or None,
-                'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
-                'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
-                'unit_price': round(float(p.get('list_price') or 0), 2),
-
-                # ---- Les quatre grandeurs du menu inventaire ----
-                # stock_final = stock_initial + stock_receptionne − stock_vendu
-                'stock_initial': stock_initial,
-                'stock_receptionne': qte_recue,
-                'stock_vendu': qte_livree,
-                'stock_final': stock_final,
-
-                # ---- Détail ----
-                'quantity_on_hand': on_hand,
-                'quantity_reserved': reserved,
-                'quantity_available': available,
-                'is_negative': on_hand < 0,
-            })
-
-        total_disponible = round(sum(l['quantity_available'] for l in lignes), 3)
         anomalies = [l['product_name'] for l in lignes if l['is_negative']]
-
         if anomalies:
             logger.warning(
                 f"⚠️ Inventaire camion '{truck_name}': quantités négatives sur "
                 f"{', '.join(anomalies)}"
             )
+
+        total_actuel = round(sum(l['stock_actuel'] for l in lignes), 3)
 
         return ApiResponse(
             success=True,
@@ -4765,15 +4783,11 @@ async def get_truck_inventory(
                 'date': jour,
                 'totals': {
                     'products_count': len(lignes),
-                    'total_stock_initial': round(
-                        sum(l['stock_initial'] for l in lignes), 3),
-                    'total_stock_receptionne': round(
-                        sum(l['stock_receptionne'] for l in lignes), 3),
-                    'total_stock_vendu': round(
-                        sum(l['stock_vendu'] for l in lignes), 3),
-                    'total_stock_final': round(
-                        sum(l['stock_final'] for l in lignes), 3),
-                    'total_quantity_available': total_disponible,
+                    'total_stock_actuel': total_actuel,
+                    'total_stock_a_livrer': round(
+                        sum(l['stock_a_livrer'] for l in lignes), 3),
+                    'total_stock_livre': round(
+                        sum(l['stock_livre'] for l in lignes), 3),
                     'negative_products_count': len(anomalies),
                 },
                 'products': lignes,
@@ -4781,7 +4795,7 @@ async def get_truck_inventory(
             },
             message=(
                 f"Inventaire du camion {truck_name} : {len(lignes)} produit(s), "
-                f"{total_disponible} unité(s) disponible(s)"
+                f"{total_actuel} unité(s) en citerne"
             )
         )
 
@@ -4798,6 +4812,10 @@ async def get_truck_inventory(
 @router.get("/fleet/drivers/{driver_id}/inventory", response_model=ApiResponse)
 async def get_driver_inventory(
     driver_id: int = Path(..., description="ID du partenaire (res.partner) du chauffeur"),
+    date_ref: Optional[str] = Query(
+        None, alias="date",
+        description="Journée de référence au format YYYY-MM-DD (défaut : aujourd'hui)"
+    ),
     include_empty: bool = Query(False, description="Inclure les produits à zéro"),
     current_user: dict = Depends(require_scope("pos"))
 ):
@@ -4807,9 +4825,15 @@ async def get_driver_inventory(
     Point d'entrée du menu « Inventaire » côté chauffeur : à partir de son seul
     identifiant, retourne le contenu de sa citerne sans qu'il ait à connaître
     l'immatriculation ni l'emplacement Odoo correspondant.
+
+    Trois grandeurs par produit :
+    - **stock_actuel**   : ce que contient physiquement le camion
+    - **stock_a_livrer** : ce qui est engagé sur des livraisons en attente
+    - **stock_livre**    : ce qui a effectivement été livré dans la journée
     """
     try:
         client = get_odoo_client(current_user)
+        jour = date_ref or datetime.now().strftime('%Y-%m-%d')
 
         # --- Camions du chauffeur ---
         # Même stratégie que /fleet/trucks/by-driver : fleet.vehicle par driver_id,
@@ -4889,50 +4913,9 @@ async def get_driver_inventory(
                 })
                 continue
 
-            quants = client.execute_kw(
-                'stock.quant', 'search_read',
-                [[('location_id', 'child_of', location_ids)]],
-                {'fields': ['product_id', 'quantity', 'reserved_quantity']}
+            lignes_camion = _inventaire_camion(
+                client, location_ids, jour, include_empty
             )
-            agrege: dict[int, dict] = {}
-            for q in quants:
-                prod = q.get('product_id')
-                if not prod:
-                    continue
-                pid = prod[0] if isinstance(prod, list) else prod
-                if pid not in agrege:
-                    agrege[pid] = {'on_hand': 0.0, 'reserved': 0.0}
-                agrege[pid]['on_hand'] += float(q.get('quantity') or 0)
-                agrege[pid]['reserved'] += float(q.get('reserved_quantity') or 0)
-
-            produits = []
-            if agrege:
-                produits = client.execute_kw(
-                    'product.product', 'search_read',
-                    [[('id', 'in', list(agrege.keys()))]],
-                    {'fields': ['id', 'name', 'default_code', 'uom_id', 'categ_id'],
-                     'order': 'name asc'}
-                )
-
-            lignes = []
-            for p in produits:
-                data = agrege.get(p['id'], {})
-                on_hand = round(data.get('on_hand', 0.0), 3)
-                reserved = round(data.get('reserved', 0.0), 3)
-                if not include_empty and abs(on_hand) < 0.001 and abs(reserved) < 0.001:
-                    continue
-                lignes.append({
-                    'product_id': p['id'],
-                    'product_name': p['name'],
-                    'product_code': p.get('default_code') or None,
-                    'category': p.get('categ_id', [None, ''])[1] if p.get('categ_id') else None,
-                    'uom': p.get('uom_id', [None, 'Unité'])[1] if p.get('uom_id') else 'Unité',
-                    'quantity_on_hand': on_hand,
-                    'quantity_reserved': reserved,
-                    'quantity_available': round(on_hand - reserved, 3),
-                    'is_negative': on_hand < 0,
-                })
-
             locations = client.execute_kw(
                 'stock.location', 'read', [location_ids],
                 {'fields': ['complete_name', 'name']}
@@ -4940,13 +4923,15 @@ async def get_driver_inventory(
             inventaires.append({
                 'truck_name': nom_camion,
                 'locations': [l.get('complete_name') or l.get('name') for l in locations],
-                'products': lignes,
-                'products_count': len(lignes),
-                'total_quantity_available': round(
-                    sum(l['quantity_available'] for l in lignes), 3
-                ),
+                'products': lignes_camion,
+                'products_count': len(lignes_camion),
+                'total_stock_actuel': round(
+                    sum(l['stock_actuel'] for l in lignes_camion), 3),
+                'total_stock_a_livrer': round(
+                    sum(l['stock_a_livrer'] for l in lignes_camion), 3),
+                'total_stock_livre': round(
+                    sum(l['stock_livre'] for l in lignes_camion), 3),
             })
-
         total_produits = sum(len(i.get('products', [])) for i in inventaires)
 
         return ApiResponse(
@@ -4954,6 +4939,7 @@ async def get_driver_inventory(
             data={
                 'driver_id': driver_id,
                 'driver_name': driver_name,
+                'date': jour,
                 'trucks_count': len(inventaires),
                 'trucks': inventaires,
                 'last_update': datetime.now().isoformat(),
