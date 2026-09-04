@@ -38,13 +38,24 @@ ODOO_DB1_CONFIG = {
 # DB2: Base Test Franchise (Transferts réceptions)
 ODOO_DB2_CONFIG = {
     "name": "franchise",
-    "url": os.getenv("ODOO_DB2_URL", " https://staging-app.perfect-erp.com"),
+    "url": os.getenv("ODOO_DB2_URL", "https://staging-app.perfect-erp.com"),
     "db": os.getenv("ODOO_DB2_NAME", "staging-app.perfect-erp.com"),
     "username": os.getenv("ODOO_DB2_USERNAME", "api-rest.odoo.com"),
     "api_key": os.getenv("ODOO_DB2_API_KEY", "d3b50d6b6694cecb785a8a87ee8dd388ff0c325e"),
     "transfer_type": "reception",  # Transferts réceptions
     "transfer_type_code": "incoming"
 }
+
+# Normalisation des identifiants de connexion.
+#
+# Une espace ou un retour à la ligne en tête de valeur suffit à rendre une base
+# injoignable, et le symptôme est trompeur : la connexion échoue avec un message
+# de serveur indisponible, sans que rien ne signale la cause réelle. C'est
+# arrivé sur l'URL de la base franchise, qui portait une espace initiale.
+for _config in (ODOO_DB1_CONFIG, ODOO_DB2_CONFIG):
+    for _cle in ("url", "db", "username", "api_key"):
+        if isinstance(_config.get(_cle), str):
+            _config[_cle] = _config[_cle].strip()
 
 # Liste des configurations Odoo (ordre de priorité pour l'authentification)
 ODOO_DATABASES = [ODOO_DB1_CONFIG, ODOO_DB2_CONFIG]
