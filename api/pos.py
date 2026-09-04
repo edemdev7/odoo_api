@@ -7853,6 +7853,8 @@ async def add_payment_to_order(
         amount_due = max(0.0, amount_total - new_paid)
         is_complete = new_paid >= amount_total
 
+        invoice_id = None
+
         if is_complete:
             client.execute_kw('pos.order', 'write', [[order_id], {
                 'state': 'paid',
@@ -7867,6 +7869,27 @@ async def add_payment_to_order(
                 logger.info(f"Mouvement de stock créé pour commande {order_id}")
             except Exception as stock_err:
                 logger.warning(f"Mouvement de stock non créé pour commande {order_id}: {stock_err}")
+
+            # Facturer si le règlement sort du périmètre token / carte.
+            # L'échec de la facturation ne remet pas en cause l'encaissement :
+            # la vente est faite, la facture pourra être régénérée à la demande.
+            try:
+                a_facturer, moyens = _doit_facturer(client, order_id)
+                if a_facturer:
+                    invoice_id = _assurer_facture(client, order_id)
+                    logger.info(
+                        f"Commande {order_id} facturée ({', '.join(moyens)}) "
+                        f"→ facture {invoice_id}"
+                    )
+                else:
+                    logger.info(
+                        f"Commande {order_id} non facturée — "
+                        f"règlement {', '.join(moyens) or 'inconnu'}"
+                    )
+            except Exception as fact_err:
+                logger.warning(
+                    f"Facturation automatique échouée pour la commande {order_id}: {fact_err}"
+                )
         else:
             payment_status = 'partial'
 
@@ -7882,6 +7905,9 @@ async def add_payment_to_order(
                 'amount_return': amount_return,
                 'payment_status': payment_status,
                 'is_complete': is_complete,
+                # Renseigné quand la vente a donné lieu à une facture : le mobile
+                # peut enchaîner directement sur l'impression sans second appel.
+                'invoice_id': invoice_id,
             },
             message=(
                 f"Commande soldée — Rendu: {amount_return}" if is_complete
@@ -7894,6 +7920,137 @@ async def add_payment_to_order(
     except Exception as e:
         logger.error(f"Erreur ajout paiement commande {order_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors du paiement: {str(e)}")
+
+
+# ===== FACTURATION DES VENTES POS =====
+
+# Moyens de paiement qui ne donnent pas lieu à facture : le règlement par token
+# ou par carte est déjà tracé côté back-office, la facture ferait doublon.
+# La liste se règle sans redéploiement, les libellés sont comparés sans casse.
+_PAIEMENTS_SANS_FACTURE = [
+    m.strip().upper()
+    for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE", "TOKEN,CARTE,CARD").split(",")
+    if m.strip()
+]
+
+
+def _moyens_paiement_commande(client, order_id: int) -> list:
+    """Libellés des moyens de paiement effectivement utilisés sur une commande."""
+    try:
+        paiements = client.execute_kw(
+            'pos.payment', 'search_read',
+            [[('pos_order_id', '=', order_id)]],
+            {'fields': ['payment_method_id', 'amount']}
+        )
+    except Exception as e:
+        logger.warning(f"Moyens de paiement illisibles pour la commande {order_id}: {e}")
+        return []
+
+    libelles = []
+    for p in paiements:
+        methode = p.get('payment_method_id')
+        if isinstance(methode, list) and len(methode) > 1:
+            libelles.append(methode[1])
+    return libelles
+
+
+def _doit_facturer(client, order_id: int) -> tuple:
+    """
+    Une commande doit-elle donner lieu à une facture ?
+
+    Règle métier : toute vente réglée autrement que par token ou par carte.
+    Une commande à plusieurs moyens de paiement est facturée dès lors qu'au moins
+    un règlement sort du périmètre exclu — sinon un paiement mixte permettrait
+    d'échapper à la facturation.
+
+    Retourne (doit_facturer, libellés des moyens utilisés).
+    """
+    libelles = _moyens_paiement_commande(client, order_id)
+    if not libelles:
+        return False, []
+
+    for libelle in libelles:
+        majuscule = (libelle or '').upper()
+        if not any(exclu in majuscule for exclu in _PAIEMENTS_SANS_FACTURE):
+            return True, libelles
+
+    return False, libelles
+
+
+def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[int]:
+    """
+    Facture d'une commande POS, créée si elle n'existe pas encore.
+
+    Odoo exige une commande payée : `action_pos_order_invoice` échoue sur un
+    panier encore ouvert. L'appelant doit donc s'assurer de l'état au préalable.
+
+    Retourne l'identifiant de l'`account.move`, ou None en cas d'échec.
+    """
+    commande = client.execute_kw(
+        'pos.order', 'read', [order_id], {'fields': ['account_move', 'state', 'name']}
+    )
+    if not commande:
+        return None
+    commande = commande[0]
+    nom = order_name or commande.get('name') or str(order_id)
+
+    move = commande.get('account_move')
+    facture_id = move[0] if isinstance(move, list) else move
+    if facture_id:
+        return facture_id
+
+    if commande.get('state') not in ('paid', 'done', 'invoiced'):
+        logger.info(
+            f"Facture non générée pour {nom} : commande en état '{commande.get('state')}'"
+        )
+        return None
+
+    # Odoo refuse d'émettre une facture tant qu'un compte bancaire de la société
+    # est marqué non fiable. On lève ce blocage, sans quoi la facturation échoue
+    # sur un message sans rapport avec la vente.
+    try:
+        comptes = client.execute_kw(
+            'res.partner.bank', 'search', [[('allow_out_payment', '=', False)]]
+        )
+        if comptes:
+            client.execute_kw(
+                'res.partner.bank', 'write', [comptes, {'allow_out_payment': True}]
+            )
+    except Exception as e:
+        logger.debug(f"Comptes bancaires non modifiés: {e}")
+
+    client.execute_kw('pos.order', 'action_pos_order_invoice', [[order_id]])
+
+    relu = client.execute_kw('pos.order', 'read', [order_id], {'fields': ['account_move']})
+    move = relu[0].get('account_move') if relu else None
+    facture_id = move[0] if isinstance(move, list) else move
+
+    if facture_id:
+        logger.info(f"📄 Facture {facture_id} générée pour la commande {nom}")
+    else:
+        logger.warning(f"Facture non créée pour la commande {nom}")
+    return facture_id
+
+
+def _qrcode_base64(contenu: str) -> Optional[str]:
+    """
+    QR code encodant `contenu`, en PNG base64 prêt à être affiché ou imprimé.
+
+    Volontairement neutre : il porte les données de la facture et rien d'autre.
+    Le jour où une valeur probante sera exigée — code de vérification fiscal,
+    URL signée — seul le contenu passé ici changera.
+    """
+    try:
+        import segno
+        import io
+        tampon = io.BytesIO()
+        segno.make(contenu, error='m').save(tampon, kind='png', scale=4, border=2)
+        return base64.b64encode(tampon.getvalue()).decode('utf-8')
+    except ImportError:
+        logger.warning("Bibliothèque segno absente — QR code non généré")
+    except Exception as e:
+        logger.warning(f"QR code non généré: {e}")
+    return None
 
 
 @router.get("/{pos_id}/orders/{order_id}/invoice")
@@ -8005,6 +8162,225 @@ async def get_pos_order_invoice(
     except Exception as e:
         logger.error(f"Erreur récupération facture commande {order_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
+
+
+@router.get("/{pos_id}/orders/{order_id}/invoice/details", response_model=ApiResponse)
+async def get_pos_order_invoice_details(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    order_id: int = Path(..., description="ID de la commande POS"),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Données de facturation d'une vente, pour impression au format de l'application.
+
+    Renvoie les informations structurées plutôt qu'un PDF : l'application mobile
+    compose sa propre mise en page, adaptée au ticket d'une imprimante portable,
+    sans reprendre celle d'Odoo.
+
+    La facture est créée si elle n'existe pas encore, à condition que la commande
+    soit payée.
+
+    **Contenu de la réponse**
+
+    - `invoice` : numéro, dates, montants hors taxes, taxes et total, état
+    - `seller` : la société émettrice, avec ses identifiants fiscaux
+    - `customer` : le client, ou « Client comptant » pour une vente anonyme
+    - `lines` : par produit, quantité, prix unitaire, remise et total
+    - `payments` : les règlements enregistrés, par moyen de paiement
+    - `qrcode` : image PNG en base64, et le contenu encodé
+
+    Le QR code porte le numéro de facture, la date, le montant et le client. Il
+    n'a pas de valeur probante : c'est un support de vérification visuelle, à
+    remplacer le jour où un code fiscal sera exigé.
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        commande = client.execute_kw(
+            'pos.order', 'read', [order_id],
+            {'fields': ['id', 'name', 'state', 'session_id', 'account_move',
+                        'amount_total', 'amount_tax', 'partner_id', 'date_order',
+                        'pos_reference', 'lines']}
+        )
+        if not commande:
+            raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
+        commande = commande[0]
+
+        # La commande doit bien appartenir au point de vente appelé
+        session_id = commande['session_id'][0] if isinstance(commande['session_id'], list) else commande['session_id']
+        session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['config_id', 'name']})
+        if not session or session[0]['config_id'][0] != pos_id:
+            raise HTTPException(
+                status_code=400, detail="La commande n'appartient pas à ce point de vente"
+            )
+
+        if commande['state'] not in ('paid', 'done', 'invoiced'):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "order_not_paid",
+                    "message": (
+                        f"La commande {commande['name']} n'est pas payée "
+                        f"(état : {commande['state']}). Une facture ne peut être "
+                        f"émise que sur une vente soldée."
+                    ),
+                    "order_id": order_id,
+                    "state": commande['state'],
+                }
+            )
+
+        facture_id = _assurer_facture(client, order_id, commande['name'])
+        if not facture_id:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Facture non disponible pour la commande {commande['name']}"
+            )
+
+        facture = client.execute_kw(
+            'account.move', 'read', [facture_id],
+            {'fields': ['name', 'invoice_date', 'invoice_date_due', 'state',
+                        'amount_untaxed', 'amount_tax', 'amount_total',
+                        'amount_residual', 'partner_id', 'company_id',
+                        'currency_id', 'ref', 'payment_state']}
+        )[0]
+
+        # --- Émetteur ---
+        societe_id = facture['company_id'][0] if isinstance(facture['company_id'], list) else facture['company_id']
+        societe = client.execute_kw(
+            'res.company', 'read', [societe_id],
+            {'fields': ['name', 'street', 'city', 'phone', 'email', 'vat', 'company_registry']}
+        )[0]
+
+        # --- Client ---
+        partenaire = facture.get('partner_id')
+        if partenaire:
+            partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
+            client_data = client.execute_kw(
+                'res.partner', 'read', [partenaire_id],
+                {'fields': ['name', 'street', 'city', 'phone', 'vat']}
+            )[0]
+        else:
+            client_data = {'name': 'Client comptant'}
+
+        # --- Lignes ---
+        lignes = []
+        if commande.get('lines'):
+            details = client.execute_kw(
+                'pos.order.line', 'read', [commande['lines']],
+                {'fields': ['product_id', 'qty', 'price_unit', 'discount',
+                            'price_subtotal', 'price_subtotal_incl', 'full_product_name']}
+            )
+            for l in details:
+                produit = l.get('product_id')
+                lignes.append({
+                    'product_id': produit[0] if isinstance(produit, list) else produit,
+                    'designation': l.get('full_product_name') or (
+                        produit[1] if isinstance(produit, list) else ''),
+                    'quantity': round(float(l.get('qty') or 0), 3),
+                    'unit_price': round(float(l.get('price_unit') or 0), 2),
+                    'discount': round(float(l.get('discount') or 0), 2),
+                    'total_untaxed': round(float(l.get('price_subtotal') or 0), 2),
+                    'total': round(float(l.get('price_subtotal_incl') or 0), 2),
+                })
+
+        # --- Règlements ---
+        reglements = []
+        try:
+            paiements = client.execute_kw(
+                'pos.payment', 'search_read',
+                [[('pos_order_id', '=', order_id)]],
+                {'fields': ['payment_method_id', 'amount', 'payment_date']}
+            )
+            for p in paiements:
+                methode = p.get('payment_method_id')
+                reglements.append({
+                    'method': methode[1] if isinstance(methode, list) else str(methode),
+                    'amount': round(float(p.get('amount') or 0), 2),
+                    'date': p.get('payment_date') or None,
+                })
+        except Exception as e:
+            logger.warning(f"Règlements illisibles pour la commande {order_id}: {e}")
+
+        # --- QR code ---
+        devise = facture.get('currency_id')
+        devise_nom = devise[1] if isinstance(devise, list) else 'XOF'
+        contenu_qr = "|".join([
+            facture.get('name') or '',
+            str(facture.get('invoice_date') or ''),
+            f"{float(facture.get('amount_total') or 0):.2f}",
+            devise_nom,
+            client_data.get('name') or '',
+        ])
+
+        logger.info(
+            f"🧾 Facture {facture.get('name')} servie pour la commande "
+            f"{commande['name']} — {facture.get('amount_total')} {devise_nom}"
+        )
+
+        return ApiResponse(
+            success=True,
+            data={
+                'order': {
+                    'id': order_id,
+                    'name': commande['name'],
+                    'reference': commande.get('pos_reference'),
+                    'date': commande.get('date_order'),
+                    'session': session[0].get('name'),
+                },
+                'invoice': {
+                    'id': facture_id,
+                    'number': facture.get('name'),
+                    'reference': facture.get('ref') or None,
+                    'date': facture.get('invoice_date'),
+                    'due_date': facture.get('invoice_date_due'),
+                    'state': facture.get('state'),
+                    'payment_state': facture.get('payment_state'),
+                    'currency': devise_nom,
+                    'amount_untaxed': round(float(facture.get('amount_untaxed') or 0), 2),
+                    'amount_tax': round(float(facture.get('amount_tax') or 0), 2),
+                    'amount_total': round(float(facture.get('amount_total') or 0), 2),
+                    'amount_residual': round(float(facture.get('amount_residual') or 0), 2),
+                },
+                'seller': {
+                    'name': societe.get('name'),
+                    'address': ", ".join(
+                        p for p in (societe.get('street'), societe.get('city')) if p
+                    ) or None,
+                    'phone': societe.get('phone') or None,
+                    'email': societe.get('email') or None,
+                    'vat': societe.get('vat') or None,
+                    'registry': societe.get('company_registry') or None,
+                },
+                'customer': {
+                    'name': client_data.get('name'),
+                    'address': ", ".join(
+                        p for p in (client_data.get('street'), client_data.get('city')) if p
+                    ) or None,
+                    'phone': client_data.get('phone') or None,
+                    'vat': client_data.get('vat') or None,
+                },
+                'lines': lignes,
+                'payments': reglements,
+                'qrcode': {
+                    'content': contenu_qr,
+                    'image_base64': _qrcode_base64(contenu_qr),
+                    'format': 'png',
+                },
+                'pdf_url': f"/pos/{pos_id}/orders/{order_id}/invoice",
+            },
+            message=f"Facture {facture.get('name')} — {facture.get('amount_total')} {devise_nom}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Erreur données de facture, commande {order_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des données de facture: {str(e)}"
+        )
 
 
 @router.post("/{pos_id}/create-order", response_model=ApiResponse)
