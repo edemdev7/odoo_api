@@ -7977,6 +7977,50 @@ def _doit_facturer(client, order_id: int) -> tuple:
     return False, libelles
 
 
+# Libellés cherchés pour le client générique des ventes anonymes, dans l'ordre.
+# Odoo exige un partenaire sur toute facture : une vente à la pompe, où le client
+# ne se présente pas, doit donc être rattachée à un compte collectif.
+_NOMS_CLIENT_COMPTANT = [
+    "Client comptant", "Client divers", "Comptant", "Client anonyme",
+]
+
+# Résolu une fois par processus : la fiche ne change pas en cours de service.
+_cache_client_comptant: dict = {}
+
+
+def _partenaire_comptant(client) -> Optional[int]:
+    """
+    Partenaire à porter sur les factures de ventes anonymes.
+
+    Priorité à `POS_DEFAULT_PARTNER_ID` si la variable est renseignée, sinon
+    recherche par libellé. Retourne None si aucun compte collectif n'existe —
+    l'appelant doit alors le signaler explicitement plutôt que de laisser Odoo
+    échouer sur un message obscur.
+    """
+    fixe = os.getenv("POS_DEFAULT_PARTNER_ID", "").strip()
+    if fixe.isdigit():
+        return int(fixe)
+
+    if 'id' in _cache_client_comptant:
+        return _cache_client_comptant['id']
+
+    for nom in _NOMS_CLIENT_COMPTANT:
+        try:
+            trouve = client.execute_kw(
+                'res.partner', 'search',
+                [[('name', '=ilike', nom)]], {'limit': 1}
+            )
+            if trouve:
+                logger.info(f"Client comptant résolu : « {nom} » (ID {trouve[0]})")
+                _cache_client_comptant['id'] = trouve[0]
+                return trouve[0]
+        except Exception as e:
+            logger.debug(f"Recherche du client comptant « {nom} » échouée: {e}")
+
+    _cache_client_comptant['id'] = None
+    return None
+
+
 def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[int]:
     """
     Facture d'une commande POS, créée si elle n'existe pas encore.
@@ -7987,7 +8031,8 @@ def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[in
     Retourne l'identifiant de l'`account.move`, ou None en cas d'échec.
     """
     commande = client.execute_kw(
-        'pos.order', 'read', [order_id], {'fields': ['account_move', 'state', 'name']}
+        'pos.order', 'read', [order_id],
+        {'fields': ['account_move', 'state', 'name', 'partner_id']}
     )
     if not commande:
         return None
@@ -8004,6 +8049,31 @@ def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[in
             f"Facture non générée pour {nom} : commande en état '{commande.get('state')}'"
         )
         return None
+
+    # Odoo refuse d'émettre une facture sans partenaire — « Veuillez renseigner
+    # un partenaire pour la vente ». Une vente à la pompe étant anonyme par
+    # nature, on la rattache au client comptant.
+    partenaire = commande.get('partner_id')
+    partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
+    if not partenaire_id:
+        comptant_id = _partenaire_comptant(client)
+        if not comptant_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "missing_default_partner",
+                    "message": (
+                        "Cette vente est anonyme et aucun client comptant n'est "
+                        "configuré. Odoo exige un partenaire sur toute facture. "
+                        "Créez un contact « Client comptant » dans Odoo, ou "
+                        "renseignez POS_DEFAULT_PARTNER_ID côté serveur."
+                    ),
+                    "order_id": order_id,
+                    "order_name": nom,
+                }
+            )
+        client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': comptant_id}])
+        logger.info(f"Vente anonyme {nom} rattachée au client comptant {comptant_id}")
 
     # Odoo refuse d'émettre une facture tant qu'un compte bancaire de la société
     # est marqué non fiable. On lève ce blocage, sans quoi la facturation échoue
@@ -8377,6 +8447,22 @@ async def get_pos_order_invoice_details(
         logger.error(
             f"Erreur données de facture, commande {order_id}: {e}", exc_info=True
         )
+        message = str(e)
+        # Un refus d'Odoo est une règle métier, pas une panne : le distinguer
+        # permet à l'application d'afficher la cause plutôt qu'une erreur serveur.
+        if 'partenaire' in message.lower() or 'partner' in message.lower():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "invoice_requires_partner",
+                    "message": (
+                        "Odoo refuse d'émettre la facture sans partenaire. "
+                        "Vérifiez qu'un client comptant est configuré."
+                    ),
+                    "order_id": order_id,
+                    "odoo_error": message,
+                }
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la récupération des données de facture: {str(e)}"
