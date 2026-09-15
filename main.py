@@ -124,15 +124,7 @@ app.add_middleware(
 )
 
 # Middleware formatage des nombres (virgule, 3 décimales max)
-app.add_middleware(NumberFormatterMiddleware)
 
-# Inclusion des routers
-app.include_router(auth_router)
-app.include_router(pos_router)
-app.include_router(odoo_router)
-app.include_router(utils_router)
-app.include_router(fuel_monitor_router)
-app.include_router(accounting_router)
 
 
 # Events de démarrage et arrêt
