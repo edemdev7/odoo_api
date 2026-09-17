@@ -1,0 +1,282 @@
+{
+  "success": true,
+  "data": {
+    "categories": [
+      {
+        "id": 85,
+        "name": "ACCESSOIRES DE BOUTEILLES DE GAZ",
+        "complete_name": "ACCESSOIRES DE BOUTEILLES DE GAZ",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 108,
+        "name": "AUTRES",
+        "complete_name": "AUTRES",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 1,
+        "name": "All",
+        "complete_name": "All",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 6,
+        "name": "Deliveries",
+        "complete_name": "All / Deliveries",
+        "parent_id": 1,
+        "parent_name": "All"
+      },
+      {
+        "id": 3,
+        "name": "Expenses",
+        "complete_name": "All / Expenses",
+        "parent_id": 1,
+        "parent_name": "All"
+      },
+      {
+        "id": 2,
+        "name": "Saleable",
+        "complete_name": "All / Saleable",
+        "parent_id": 1,
+        "parent_name": "All"
+      },
+      {
+        "id": 4,
+        "name": "Booking Fees",
+        "complete_name": "All / Saleable / Booking Fees",
+        "parent_id": 2,
+        "parent_name": "All / Saleable"
+      },
+      {
+        "id": 26,
+        "name": "Events",
+        "complete_name": "All / Saleable / Events",
+        "parent_id": 2,
+        "parent_name": "All / Saleable"
+      },
+      {
+        "id": 20,
+        "name": "PoS",
+        "complete_name": "All / Saleable / PoS",
+        "parent_id": 2,
+        "parent_name": "All / Saleable"
+      },
+      {
+        "id": 14,
+        "name": "BOISSON",
+        "complete_name": "BOISSON",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 86,
+        "name": "BOUTEILLES VIDES DE GAZ",
+        "complete_name": "BOUTEILLES VIDES DE GAZ",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 87,
+        "name": "BUTANE VRAC",
+        "complete_name": "BUTANE VRAC",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 106,
+        "name": "CHARGES SALAIRES",
+        "complete_name": "CHARGES SALAIRES",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 25,
+        "name": "COMMISSION TRANSIT",
+        "complete_name": "COMMISSION TRANSIT",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 100,
+        "name": "DIVERS",
+        "complete_name": "DIVERS",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 88,
+        "name": "DROIT DE PASSAGE ESSENCE",
+        "complete_name": "DROIT DE PASSAGE ESSENCE",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 89,
+        "name": "DROIT DE PASSAGE GAS-OIL",
+        "complete_name": "DROIT DE PASSAGE GAS-OIL",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 90,
+        "name": "DROIT DE PASSAGE HINTERLAND",
+        "complete_name": "DROIT DE PASSAGE HINTERLAND",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 91,
+        "name": "DROIT DE PASSAGE JET",
+        "complete_name": "DROIT DE PASSAGE JET",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 109,
+        "name": "DROIT DE STOCKAGE HINTERLAND",
+        "complete_name": "DROIT DE STOCKAGE HINTERLAND",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 23,
+        "name": "ESSENCE",
+        "complete_name": "ESSENCE",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 93,
+        "name": "Essence (Cession bac)",
+        "complete_name": "Essence (Cession bac)",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 94,
+        "name": "FIOUL",
+        "complete_name": "FIOUL",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 107,
+        "name": "FOURNITURES DE BUREAUX",
+        "complete_name": "FOURNITURES DE BUREAUX",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 102,
+        "name": "FUEL",
+        "complete_name": "FUEL",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 95,
+        "name": "GASOIL",
+        "complete_name": "GASOIL",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 22,
+        "name": "GAZ",
+        "complete_name": "GAZ",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 104,
+        "name": "LOCATION",
+        "complete_name": "LOCATION",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 105,
+        "name": "LOYER",
+        "complete_name": "LOYER",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 96,
+        "name": "LUBRIFIANTS",
+        "complete_name": "LUBRIFIANTS",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 24,
+        "name": "MARCHANDISES",
+        "complete_name": "MARCHANDISES",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 15,
+        "name": "MENU",
+        "complete_name": "MENU",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 97,
+        "name": "PASSAGE ESSENCE",
+        "complete_name": "PASSAGE ESSENCE",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 21,
+        "name": "PETIT DÉJEUNER",
+        "complete_name": "PETIT DÉJEUNER",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 98,
+        "name": "PETROLE",
+        "complete_name": "PETROLE",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 110,
+        "name": "PLATEAU",
+        "complete_name": "PLATEAU",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 103,
+        "name": "RECHARGE BOUTEILLE GAZ",
+        "complete_name": "RECHARGE BOUTEILLE GAZ",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 101,
+        "name": "RECHARGE JNP PASS TV",
+        "complete_name": "RECHARGE JNP PASS TV",
+        "parent_id": null,
+        "parent_name": null
+      },
+      {
+        "id": 99,
+        "name": "SERVICE LAVAGE",
+        "complete_name": "SERVICE LAVAGE",
+        "parent_id": null,
+        "parent_name": null
+      }
+    ]
+  },
+  "message": "39 catégorie(s) trouvée(s)",
+  "count": 39
+}
