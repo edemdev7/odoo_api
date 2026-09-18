@@ -19,10 +19,14 @@ class OdooClient:
                 if value:  # Ne remplacer que si la valeur n'est pas None
                     config[key] = value
                     
-        self.url = config["url"]
-        self.db = config["db"]
-        self.username = config["username"]
-        self.api_key = config["api_key"]
+        # L'URL est normalisée ici : espaces parasites et barres obliques
+        # finales. Les points d'accès XML-RPC sont concaténés avec un slash,
+        # si bien qu'une URL terminée par « / » produisait des adresses du type
+        # « ...odoo.com//xmlrpc/2/common », que certains serveurs refusent.
+        self.url = str(config["url"]).strip().rstrip('/')
+        self.db = str(config["db"]).strip()
+        self.username = str(config["username"]).strip()
+        self.api_key = str(config["api_key"]).strip()
         self.uid = None
         self._authenticated = False  # Flag pour lazy authentication
         self._cache_key = f"{self.url}_{self.db}"

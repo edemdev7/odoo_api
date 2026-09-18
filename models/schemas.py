@@ -212,6 +212,15 @@ class PosOrderLine(BaseModel):
     pump_id: Optional[int] = Field(None, description="ID de la pompe utilisée")
     qty: float = Field(..., description="Quantité vendue")
     price_unit: float = Field(..., description="Prix unitaire")
+    amount: Optional[float] = Field(
+        None,
+        description=(
+            "Montant demandé par le client, en francs. À renseigner pour une "
+            "vente au montant — « pour 500 francs d'essence ». La quantité est "
+            "alors recalculée à partir de ce montant, et c'est lui qui est "
+            "facturé. Sans ce champ, la quantité fait foi."
+        )
+    )
     discount: Optional[float] = Field(0.0, description="Remise en pourcentage")
     start_pump_index: Optional[float] = Field(None, description="Index pompe début")
     end_pump_index: Optional[float] = Field(None, description="Index pompe fin")

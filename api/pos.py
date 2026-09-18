@@ -1877,6 +1877,48 @@ def _pos_theoretical_stock(client, session_id: int, location_id: int,
     return result
 
 
+def _resoudre_ligne_vente(line) -> tuple:
+    """
+    Quantité et montant d'une ligne de vente, réconciliés.
+
+    À la pompe, le client demande un montant, pas un volume : « pour 500 francs
+    d'essence ». Le volume en découle, et tombe rarement juste — 500 ÷ 725 donne
+    0,689655… litre.
+
+    Tronquer ce volume à deux décimales produit un écart visible sur la facture :
+    0,68 × 725 = 493, alors que le client a versé 500. Rien sur le document ne
+    permet alors d'expliquer les sept francs manquants.
+
+    Deux cas, donc :
+
+    - `amount` fourni : c'est lui qui fait foi. La quantité est recalculée à
+      partir du prix unitaire, avec assez de décimales pour que le produit
+      retombe sur le montant après arrondi de la devise.
+    - `amount` absent : la quantité fait foi, et le montant en découle.
+
+    Retourne (quantité, montant, montant_demandé_ou_None).
+    """
+    qty = float(getattr(line, 'qty', 0) or 0)
+    prix = float(getattr(line, 'price_unit', 0) or 0)
+    remise = float(getattr(line, 'discount', 0) or 0)
+    montant_demande = getattr(line, 'amount', None)
+
+    if montant_demande is not None and float(montant_demande) > 0 and prix > 0:
+        montant = float(montant_demande)
+        # Le prix effectif tient compte de la remise, sans quoi la quantité
+        # recalculée serait fausse dès qu'une remise s'applique.
+        prix_effectif = prix * (1 - remise / 100) if remise else prix
+        if prix_effectif <= 0:
+            return qty, montant, montant
+        # Quatre décimales : l'écart résiduel reste inférieur au centime, donc
+        # invisible après arrondi du franc CFA.
+        qty_calculee = round(montant / prix_effectif, 4)
+        return qty_calculee, montant, montant
+
+    montant = qty * prix * (1 - remise / 100)
+    return qty, montant, None
+
+
 def _check_pos_sale_stock(client, pos_id: int, session_id: int,
                           session_start: str, lines: list) -> list:
     """
@@ -7665,12 +7707,19 @@ async def create_pos_order_only(
                 raise HTTPException(status_code=400, detail=f"Produit {line.product_id} non trouvé dans Odoo")
 
             product_info = product[0]
-            line_total = line.qty * line.price_unit * (1 - (line.discount or 0) / 100)
+            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(line)
             amount_total += line_total
+
+            if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
+                logger.info(
+                    f"Vente au montant : {montant_demande} pour "
+                    f"{product_info['name']} → quantité recalculée "
+                    f"{line.qty} → {qty_reelle} (prix {line.price_unit})"
+                )
 
             line_vals = {
                 'product_id': line.product_id,
-                'qty': line.qty,
+                'qty': qty_reelle,
                 'price_unit': line.price_unit,
                 'discount': line.discount or 0.0,
                 'price_subtotal': line_total,
@@ -7680,6 +7729,8 @@ async def create_pos_order_only(
 
             # Construire la note de ligne (infos pompe + note manuelle)
             note_parts = []
+            if montant_demande is not None:
+                note_parts.append(f"Vente au montant : {montant_demande:g}")
             if line.pump_id is not None:
                 note_parts.append(f"Pompe #{line.pump_id}")
             if line.start_pump_index is not None and line.end_pump_index is not None:
@@ -8102,25 +8153,10 @@ def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[in
     return facture_id
 
 
-def _qrcode_base64(contenu: str) -> Optional[str]:
-    """
-    QR code encodant `contenu`, en PNG base64 prêt à être affiché ou imprimé.
-
-    Volontairement neutre : il porte les données de la facture et rien d'autre.
-    Le jour où une valeur probante sera exigée — code de vérification fiscal,
-    URL signée — seul le contenu passé ici changera.
-    """
-    try:
-        import segno
-        import io
-        tampon = io.BytesIO()
-        segno.make(contenu, error='m').save(tampon, kind='png', scale=4, border=2)
-        return base64.b64encode(tampon.getvalue()).decode('utf-8')
-    except ImportError:
-        logger.warning("Bibliothèque segno absente — QR code non généré")
-    except Exception as e:
-        logger.warning(f"QR code non généré: {e}")
-    return None
+# Le QR code de la facture n'est pas produit ici : il vient du système de
+# normalisation DGI et se lit dans le champ `secu_qrcode` de l'account.move.
+# Une fonction de génération maison a existé un temps à cet endroit ; elle a été
+# retirée pour qu'on ne soit pas tenté d'imprimer un QR sans valeur probante.
 
 
 @router.get("/{pos_id}/orders/{order_id}/invoice")
@@ -8257,11 +8293,16 @@ async def get_pos_order_invoice_details(
     - `customer` : le client, ou « Client comptant » pour une vente anonyme
     - `lines` : par produit, quantité, prix unitaire, remise et total
     - `payments` : les règlements enregistrés, par moyen de paiement
-    - `qrcode` : image PNG en base64, et le contenu encodé
+    - `fiscal` : mentions de la facture normalisée DGI
 
-    Le QR code porte le numéro de facture, la date, le montant et le client. Il
-    n'a pas de valeur probante : c'est un support de vérification visuelle, à
-    remplacer le jour où un code fiscal sera exigé.
+    **Le bloc fiscal.** Le code MECeF, le NIM et le QR code proviennent du
+    système certifié de la DGI, exposé dans Odoo par le module de normalisation.
+    Ils ne sont pas fabriqués ici : un QR produit par l'API n'aurait aucune
+    valeur probante.
+
+    La normalisation étant une action manuelle dans Odoo, une facture fraîchement
+    émise ne la porte pas. Le champ `fiscal.normalized` permet à l'application de
+    refuser l'impression plutôt que de délivrer un document non conforme.
     """
     try:
         client = get_odoo_client(current_user)
@@ -8269,12 +8310,17 @@ async def get_pos_order_invoice_details(
         commande = client.execute_kw(
             'pos.order', 'read', [order_id],
             {'fields': ['id', 'name', 'state', 'session_id', 'account_move',
-                        'amount_total', 'amount_tax', 'partner_id', 'date_order',
-                        'pos_reference', 'lines']}
+                        'amount_total', 'amount_tax', 'amount_paid', 'amount_return',
+                        'partner_id', 'date_order', 'pos_reference', 'lines',
+                        'user_id', 'employee_id']}
         )
         if not commande:
             raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
         commande = commande[0]
+
+        # Vendeur : l'employé qui a encaissé, à défaut l'utilisateur de la session
+        vendeur = commande.get('employee_id') or commande.get('user_id')
+        nom_vendeur = vendeur[1] if isinstance(vendeur, list) else None
 
         # La commande doit bien appartenir au point de vente appelé
         session_id = commande['session_id'][0] if isinstance(commande['session_id'], list) else commande['session_id']
@@ -8311,7 +8357,10 @@ async def get_pos_order_invoice_details(
             {'fields': ['name', 'invoice_date', 'invoice_date_due', 'state',
                         'amount_untaxed', 'amount_tax', 'amount_total',
                         'amount_residual', 'partner_id', 'company_id',
-                        'currency_id', 'ref', 'payment_state']}
+                        'currency_id', 'ref', 'payment_state',
+                        # Facture normalisée DGI, posés par norma_for_sales_odoo
+                        'is_normalized', 'secu_codemecefdgi', 'secu_nim',
+                        'secu_qrcode', 'normalization_date', 'normalizer_id']}
         )[0]
 
         # --- Émetteur ---
@@ -8338,19 +8387,34 @@ async def get_pos_order_invoice_details(
             details = client.execute_kw(
                 'pos.order.line', 'read', [commande['lines']],
                 {'fields': ['product_id', 'qty', 'price_unit', 'discount',
-                            'price_subtotal', 'price_subtotal_incl', 'full_product_name']}
+                            'price_subtotal', 'price_subtotal_incl',
+                            'full_product_name', 'note']}
             )
             for l in details:
                 produit = l.get('product_id')
+                quantite = round(float(l.get('qty') or 0), 4)
+                prix = round(float(l.get('price_unit') or 0), 2)
+                remise = round(float(l.get('discount') or 0), 2)
+                total = round(float(l.get('price_subtotal_incl') or 0), 2)
+
+                # Le calcul rendu explicite, ce que le modèle JNP ne montrait pas.
+                # Le pompiste et le client peuvent ainsi vérifier que le volume
+                # servi correspond bien au montant versé.
+                calcul = f"{quantite:g} × {prix:g} = {total:g}"
+                if remise:
+                    calcul = f"{quantite:g} × {prix:g} − {remise:g}% = {total:g}"
+
                 lignes.append({
                     'product_id': produit[0] if isinstance(produit, list) else produit,
                     'designation': l.get('full_product_name') or (
                         produit[1] if isinstance(produit, list) else ''),
-                    'quantity': round(float(l.get('qty') or 0), 3),
-                    'unit_price': round(float(l.get('price_unit') or 0), 2),
-                    'discount': round(float(l.get('discount') or 0), 2),
+                    'quantity': quantite,
+                    'unit_price': prix,
+                    'discount': remise,
                     'total_untaxed': round(float(l.get('price_subtotal') or 0), 2),
-                    'total': round(float(l.get('price_subtotal_incl') or 0), 2),
+                    'total': total,
+                    'calculation': calcul,
+                    'note': l.get('note') or None,
                 })
 
         # --- Règlements ---
@@ -8371,16 +8435,43 @@ async def get_pos_order_invoice_details(
         except Exception as e:
             logger.warning(f"Règlements illisibles pour la commande {order_id}: {e}")
 
-        # --- QR code ---
         devise = facture.get('currency_id')
         devise_nom = devise[1] if isinstance(devise, list) else 'XOF'
-        contenu_qr = "|".join([
-            facture.get('name') or '',
-            str(facture.get('invoice_date') or ''),
-            f"{float(facture.get('amount_total') or 0):.2f}",
-            devise_nom,
-            client_data.get('name') or '',
-        ])
+
+        # --- Mentions de la facture normalisée DGI ---
+        #
+        # Le code de vérification et le QR viennent du système certifié, jamais
+        # de nous : un QR fabriqué ici n'aurait aucune valeur probante et ne doit
+        # pas figurer sur un document remis au client.
+        #
+        # La normalisation est une action manuelle dans Odoo. Une facture émise
+        # ne la porte donc pas d'emblée, et `normalized` permet à l'application
+        # de refuser d'imprimer un document non conforme plutôt que d'imprimer
+        # un ticket incomplet.
+        normalisee = bool(facture.get('is_normalized'))
+        normalisateur = facture.get('normalizer_id')
+        fiscal = {
+            'normalized': normalisee,
+            'code_mecef_dgi': facture.get('secu_codemecefdgi') or None,
+            'nim': facture.get('secu_nim') or None,
+            'normalization_date': facture.get('normalization_date') or None,
+            'normalized_by': (
+                normalisateur[1] if isinstance(normalisateur, list) else None
+            ),
+            # PNG en base64, produit par le système de normalisation
+            'qrcode_base64': facture.get('secu_qrcode') or None,
+            'qrcode_format': 'png',
+        }
+        if not normalisee:
+            fiscal['message'] = (
+                "Facture non encore normalisée auprès de la DGI. Le code MECeF "
+                "et le QR code ne sont pas disponibles. La normalisation se fait "
+                "depuis la facture dans Odoo."
+            )
+            logger.warning(
+                f"Facture {facture.get('name')} non normalisée — "
+                f"impression fiscale impossible"
+            )
 
         logger.info(
             f"🧾 Facture {facture.get('name')} servie pour la commande "
@@ -8396,6 +8487,10 @@ async def get_pos_order_invoice_details(
                     'reference': commande.get('pos_reference'),
                     'date': commande.get('date_order'),
                     'session': session[0].get('name'),
+                    'seller': nom_vendeur,
+                    # Reprise du modèle JNP : « Espèces » puis « Monnaie »
+                    'amount_paid': round(float(commande.get('amount_paid') or 0), 2),
+                    'amount_return': round(float(commande.get('amount_return') or 0), 2),
                 },
                 'invoice': {
                     'id': facture_id,
@@ -8431,11 +8526,7 @@ async def get_pos_order_invoice_details(
                 },
                 'lines': lignes,
                 'payments': reglements,
-                'qrcode': {
-                    'content': contenu_qr,
-                    'image_base64': _qrcode_base64(contenu_qr),
-                    'format': 'png',
-                },
+                'fiscal': fiscal,
                 'pdf_url': f"/pos/{pos_id}/orders/{order_id}/invoice",
             },
             message=f"Facture {facture.get('name')} — {facture.get('amount_total')} {devise_nom}"
@@ -8553,22 +8644,30 @@ async def create_complete_pos_order(
             product_info = product[0]
             logger.info(f"✅ Produit validé: ID={product_info['id']}, Nom={product_info['name']}, Type={product_info['type']}")
             
-            line_total = line.qty * line.price_unit * (1 - (line.discount or 0) / 100)
+            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(line)
             total_amount += line_total
-            
+
+            if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
+                logger.info(
+                    f"  → Vente au montant : {montant_demande} → quantité "
+                    f"recalculée {line.qty} → {qty_reelle}"
+                )
+
             # Créer la ligne de commande avec tous les champs nécessaires
             line_vals = {
                 'product_id': line.product_id,
-                'qty': line.qty,
+                'qty': qty_reelle,
                 'price_unit': line.price_unit,
                 'discount': line.discount or 0.0,
                 'price_subtotal': line_total,
                 'price_subtotal_incl': line_total,  # À ajuster selon les taxes
                 'full_product_name': product_info['name'],  # ✨ Nom complet du produit
             }
-            
+
             # Ajouter les informations de pompe dans la note (car les champs personnalisés n'existent pas)
             note_parts = []
+            if montant_demande is not None:
+                note_parts.append(f"Vente au montant : {montant_demande:g}")
             if line.pump_id is not None:
                 note_parts.append(f"Pompe #{line.pump_id}")
                 logger.info(f"  → Pompe ID: {line.pump_id}")
