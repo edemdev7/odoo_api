@@ -1877,6 +1877,40 @@ def _pos_theoretical_stock(client, session_id: int, location_id: int,
     return result
 
 
+# Nom du champ portant la note d'une ligne de vente, résolu une fois par
+# processus. Odoo 17 l'appelle `customer_note` ; d'autres versions utilisent
+# `note`, certaines n'en ont aucun.
+#
+# Le deviner coûte cher : demander un champ inexistant fait échouer la lecture
+# entière avec « Invalid field », et l'écrire fait échouer la création de la
+# vente. On interroge donc le modèle plutôt que de supposer.
+_cache_champ_note: dict = {}
+
+
+def _champ_note_ligne(client) -> Optional[str]:
+    """Champ de note disponible sur `pos.order.line`, ou None s'il n'y en a pas."""
+    if 'nom' in _cache_champ_note:
+        return _cache_champ_note['nom']
+
+    nom = None
+    try:
+        champs = client.execute_kw(
+            'pos.order.line', 'fields_get', [], {'attributes': ['type']}
+        )
+        for candidat in ('customer_note', 'note'):
+            if candidat in champs:
+                nom = candidat
+                break
+    except Exception as e:
+        logger.warning(f"Champs de pos.order.line illisibles: {e}")
+
+    _cache_champ_note['nom'] = nom
+    logger.info(
+        f"Champ de note sur pos.order.line : {nom or 'aucun — notes désactivées'}"
+    )
+    return nom
+
+
 def _resoudre_ligne_vente(line) -> tuple:
     """
     Quantité et montant d'une ligne de vente, réconciliés.
@@ -5128,7 +5162,8 @@ async def get_session_stock_evolution(
 
         products = client.execute_kw(
             'product.product', 'search_read', [domain],
-            {'fields': ['id', 'name', 'default_code', 'list_price', 'uom_id', 'categ_id'],
+            {'fields': ['id', 'name', 'default_code', 'list_price', 'uom_id',
+                        'categ_id', 'type'],
              'order': 'name asc'}
         )
         if not products:
@@ -5247,11 +5282,28 @@ async def get_session_stock_evolution(
             )
 
             # Survente : on a écoulé plus que ce qui était disponible sur la session.
-            # Odoo n'empêche pas ce cas (stock négatif autorisé, POS sans contrôle),
-            # d'où l'intérêt de le remonter explicitement pour le point journalier.
+            #
+            # Le cas ne se pose que pour un produit stockable. Un consommable ou
+            # un service — une recharge de bouteille de gaz, par exemple — n'a pas
+            # de stock suivi dans Odoo : son stock théorique devient négatif par
+            # simple construction, sans qu'aucune anomalie ne se soit produite.
+            # Le contrôle de vente l'ignore pour la même raison, et les deux
+            # doivent dire la même chose.
+            stockable = p.get('type') == 'product'
             disponible_total = stock_initial + qty_in
-            oversold = qty_sold - disponible_total > 0.01
-            oversold_quantity = round(qty_sold - disponible_total, 3) if oversold else 0.0
+            depassement = qty_sold - disponible_total
+            oversold = stockable and depassement > 0.01
+            oversold_quantity = round(depassement, 3) if oversold else 0.0
+
+            if oversold:
+                # Un produit stockable survendu signifie que le contrôle de vente
+                # n'a pas joué : cela mérite une investigation, pas un simple
+                # affichage.
+                logger.warning(
+                    f"⚠️ Survente sur produit stockable : {p['name']} "
+                    f"(initial {stock_initial}, reçu {qty_in}, vendu {qty_sold}) "
+                    f"— le contrôle de vente aurait dû bloquer"
+                )
 
             # Aucun produit n'est masqué : sur un écran d'inventaire, voir
             # « GASOIL — 0 L » est une information, pas du bruit. Filtrer les
@@ -5269,6 +5321,9 @@ async def get_session_stock_evolution(
                 'quantity_sold': qty_sold,
                 'amount_sold': round(sold_amount.get(pid, 0.0), 2),
                 'stock_theorique': stock_theorique,
+                # False pour un consommable ou un service : le stock n'est pas
+                # suivi par Odoo, les quantités ci-dessus ne sont qu'indicatives.
+                'is_storable': stockable,
                 'oversold': oversold,
                 'oversold_quantity': oversold_quantity,
                 'stock_actuel': stock_now,
@@ -7663,6 +7718,16 @@ async def create_pos_order_only(
         if session['state'] != 'opened':
             raise HTTPException(status_code=400, detail=f"La session n'est pas ouverte (état: {session['state']})")
 
+        # Trace de ce qui nous parvient réellement, ligne par ligne.
+        # Le mobile transmet `amount` et `pump_id` à son intermédiaire ; cette
+        # ligne établit s'ils franchissent le dernier saut jusqu'ici.
+        for _i, _l in enumerate(request.lines, 1):
+            logger.info(
+                f"📥 Ligne {_i} reçue : produit={_l.product_id} qty={_l.qty} "
+                f"prix={_l.price_unit} amount={getattr(_l, 'amount', None)} "
+                f"pump_id={getattr(_l, 'pump_id', None)} remise={_l.discount}"
+            )
+
         # ===== CONTRÔLE DU STOCK AVANT VENTE =====
         # Odoo n'empêche pas de vendre un article dont le stock est nul ou négatif.
         # On refuse ici toute vente dont la quantité dépasse le disponible théorique,
@@ -7739,7 +7804,9 @@ async def create_pos_order_only(
             if line.note:
                 note_parts.append(line.note)
             if note_parts:
-                line_vals['note'] = " | ".join(note_parts)
+                champ_note = _champ_note_ligne(client)
+                if champ_note:
+                    line_vals[champ_note] = " | ".join(note_parts)
 
             order_lines.append((0, 0, line_vals))
 
@@ -8384,11 +8451,18 @@ async def get_pos_order_invoice_details(
         # --- Lignes ---
         lignes = []
         if commande.get('lines'):
+            champs_ligne = ['product_id', 'qty', 'price_unit', 'discount',
+                            'price_subtotal', 'price_subtotal_incl',
+                            'full_product_name']
+            # La note n'est demandée que si le modèle la porte : réclamer un
+            # champ inexistant ferait échouer la lecture entière.
+            champ_note = _champ_note_ligne(client)
+            if champ_note:
+                champs_ligne.append(champ_note)
+
             details = client.execute_kw(
                 'pos.order.line', 'read', [commande['lines']],
-                {'fields': ['product_id', 'qty', 'price_unit', 'discount',
-                            'price_subtotal', 'price_subtotal_incl',
-                            'full_product_name', 'note']}
+                {'fields': champs_ligne}
             )
             for l in details:
                 produit = l.get('product_id')
@@ -8414,7 +8488,7 @@ async def get_pos_order_invoice_details(
                     'total_untaxed': round(float(l.get('price_subtotal') or 0), 2),
                     'total': total,
                     'calculation': calcul,
-                    'note': l.get('note') or None,
+                    'note': (l.get(champ_note) if champ_note else None) or None,
                 })
 
         # --- Règlements ---
@@ -8678,8 +8752,10 @@ async def create_complete_pos_order(
                 logger.info(f"  → Index début: {line.start_pump_index}, fin: {line.end_pump_index}")
             
             if note_parts:
-                line_vals['note'] = " | ".join(note_parts)
-            
+                champ_note = _champ_note_ligne(client)
+                if champ_note:
+                    line_vals[champ_note] = " | ".join(note_parts)
+
             logger.info(f"  → Quantité: {line.qty}, Prix unitaire: {line.price_unit}, Total: {line_total}")
             
             order_lines.append((0, 0, line_vals))
