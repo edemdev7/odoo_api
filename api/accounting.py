@@ -975,6 +975,50 @@ async def credit_customer_account(
         if payment_info:
             response_data['payment'] = payment_info
 
+        # ===== FACTURE DU RECHARGEMENT =====
+        #
+        # Le document lui-même, en PDF, plus les données structurées pour qui
+        # préfère composer sa propre mise en page.
+        #
+        # Le PDF est produit par le rapport Odoo : il portera donc les mentions
+        # MECeF dès que la facture sera normalisée, sans rien changer ici.
+        #
+        # L'ensemble est purement additif. Un échec de génération n'invalide pas
+        # le rechargement, qui est déjà acté et lettré : la facture reste
+        # récupérable par /accounting/invoice/{id}/pdf.
+        response_data['invoice_pdf_url'] = f"/accounting/invoice/{invoice_id}/pdf"
+
+        try:
+            response_data['invoice_details'] = build_invoice_details(client, invoice_id)
+            if not response_data['invoice_details']['fiscal']['normalized']:
+                logger.info(
+                    f"Facture {invoice_number} non normalisée — "
+                    f"le PDF ne portera pas encore les mentions MECeF"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Détails de facturation indisponibles pour {invoice_number}: {e}"
+            )
+            response_data['invoice_details'] = None
+
+        try:
+            pdf = _generate_pdf_via_wizard(client, invoice_id)
+            if pdf:
+                response_data['invoice_pdf_base64'] = base64.b64encode(pdf).decode('utf-8')
+                response_data['invoice_pdf_filename'] = (
+                    f"{(invoice_number or f'FAC-{invoice_id}').replace('/', '_')}.pdf"
+                )
+                logger.info(
+                    f"📄 Facture {invoice_number} jointe à la réponse "
+                    f"({len(pdf) // 1024} Ko)"
+                )
+            else:
+                response_data['invoice_pdf_base64'] = None
+                logger.warning(f"PDF non généré pour la facture {invoice_number}")
+        except Exception as e:
+            logger.warning(f"PDF indisponible pour la facture {invoice_number}: {e}")
+            response_data['invoice_pdf_base64'] = None
+
         if credit_request.payment_method == PaymentMethodEnum.bank:
             response_data['note'] = (
                 "Facture créée et validée. En attente de paiement par l'administrateur. "
@@ -1238,6 +1282,71 @@ async def get_pending_invoices(
 # ENDPOINT TÉLÉCHARGEMENT PDF FACTURE
 # ============================================================
 
+@router.get("/invoice/{invoice_id}/details", response_model=ApiResponse)
+async def read_invoice_details(invoice_id: int):
+    """
+    Données de facturation structurées, pour impression au format de l'appelant.
+
+    Pendant de `/pos/{pos_id}/orders/{order_id}/invoice/details`, mais pour une
+    facture quelconque — typiquement celle d'un rechargement de compte émise par
+    `/accounting/credit-account`.
+
+    Renvoie l'émetteur avec ses identifiants fiscaux, le client, les lignes avec
+    leur calcul explicite, les totaux et le bloc `fiscal` de la facture
+    normalisée DGI.
+
+    **Le bloc fiscal.** Le code MECeF, le NIM et le QR code viennent du système
+    certifié, exposé dans Odoo par le module de normalisation. La normalisation
+    étant une action manuelle, une facture fraîchement émise ne la porte pas :
+    `fiscal.normalized` permet de refuser l'impression plutôt que de délivrer un
+    document non conforme.
+    """
+    try:
+        client = OdooClient()
+
+        facture = client.execute_kw(
+            'account.move', 'search_read',
+            [[('id', '=', invoice_id)]],
+            {'fields': ['id', 'name', 'move_type'], 'limit': 1}
+        )
+        if not facture:
+            raise HTTPException(
+                status_code=404, detail=f"Facture {invoice_id} introuvable"
+            )
+        if facture[0].get('move_type') not in ('out_invoice', 'out_refund'):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Le document {facture[0].get('name')} n'est pas une facture "
+                    f"client"
+                )
+            )
+
+        details = build_invoice_details(client, invoice_id)
+        logger.info(
+            f"🧾 Facture {details['invoice']['number']} servie — "
+            f"{details['invoice']['amount_total']} {details['invoice']['currency']}"
+        )
+
+        return ApiResponse(
+            success=True,
+            data=details,
+            message=(
+                f"Facture {details['invoice']['number']} — "
+                f"{details['invoice']['amount_total']} {details['invoice']['currency']}"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur données de facture {invoice_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des données de facture: {str(e)}"
+        )
+
+
 @router.get("/invoice/{invoice_id}/pdf")
 async def download_invoice_pdf(invoice_id: int):
     """
@@ -1310,6 +1419,150 @@ async def download_invoice_pdf(invoice_id: int):
     except Exception as e:
         logger.error(f"❌ Erreur téléchargement PDF: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def build_invoice_details(client: OdooClient, invoice_id: int) -> dict:
+    """
+    Données structurées d'une facture, pour impression au format de l'appelant.
+
+    Renvoie l'émetteur, le client, les lignes, les totaux et les mentions de la
+    facture normalisée DGI. L'application compose sa propre mise en page plutôt
+    que de reprendre celle d'Odoo.
+
+    Le bloc `fiscal` porte le code MECeF, le NIM et le QR code, lus dans les
+    champs posés par le module de normalisation. Ils ne sont jamais fabriqués
+    ici : un QR produit par l'API n'aurait aucune valeur probante. La
+    normalisation étant une action manuelle dans Odoo, `fiscal.normalized`
+    indique si la facture peut être remise en l'état au client.
+
+    Fonctionne pour toute facture client, qu'elle vienne d'une vente en station
+    ou d'un rechargement de compte.
+    """
+    facture = client.execute_kw(
+        'account.move', 'read', [invoice_id],
+        {'fields': ['name', 'invoice_date', 'invoice_date_due', 'state',
+                    'amount_untaxed', 'amount_tax', 'amount_total',
+                    'amount_residual', 'partner_id', 'company_id',
+                    'currency_id', 'ref', 'payment_state', 'invoice_line_ids',
+                    # Facture normalisée DGI, posés par norma_for_sales_odoo
+                    'is_normalized', 'secu_codemecefdgi', 'secu_nim',
+                    'secu_qrcode', 'normalization_date', 'normalizer_id']}
+    )
+    if not facture:
+        raise HTTPException(status_code=404, detail=f"Facture {invoice_id} introuvable")
+    facture = facture[0]
+
+    devise = facture.get('currency_id')
+    devise_nom = devise[1] if isinstance(devise, list) else 'XOF'
+
+    # --- Émetteur ---
+    societe = facture.get('company_id')
+    societe_id = societe[0] if isinstance(societe, list) else societe
+    emetteur = client.execute_kw(
+        'res.company', 'read', [[societe_id]],
+        {'fields': ['name', 'street', 'city', 'phone', 'email', 'vat',
+                    'company_registry']}
+    )[0]
+
+    # --- Client ---
+    partenaire = facture.get('partner_id')
+    if partenaire:
+        partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
+        destinataire = client.execute_kw(
+            'res.partner', 'read', [[partenaire_id]],
+            {'fields': ['name', 'street', 'city', 'phone', 'vat']}
+        )[0]
+    else:
+        destinataire = {'name': 'Client comptant'}
+
+    # --- Lignes ---
+    lignes = []
+    if facture.get('invoice_line_ids'):
+        details = client.execute_kw(
+            'account.move.line', 'read', [facture['invoice_line_ids']],
+            {'fields': ['product_id', 'name', 'quantity', 'price_unit',
+                        'discount', 'price_subtotal', 'price_total']}
+        )
+        for l in details:
+            produit = l.get('product_id')
+            quantite = round(float(l.get('quantity') or 0), 4)
+            prix = round(float(l.get('price_unit') or 0), 2)
+            remise = round(float(l.get('discount') or 0), 2)
+            total = round(float(l.get('price_total') or 0), 2)
+
+            # Le calcul rendu explicite, ce que le modèle JNP ne montrait pas.
+            calcul = f"{quantite:g} × {prix:g} = {total:g}"
+            if remise:
+                calcul = f"{quantite:g} × {prix:g} − {remise:g}% = {total:g}"
+
+            lignes.append({
+                'product_id': produit[0] if isinstance(produit, list) else produit,
+                'designation': l.get('name') or (
+                    produit[1] if isinstance(produit, list) else ''),
+                'quantity': quantite,
+                'unit_price': prix,
+                'discount': remise,
+                'total_untaxed': round(float(l.get('price_subtotal') or 0), 2),
+                'total': total,
+                'calculation': calcul,
+            })
+
+    # --- Mentions de la facture normalisée DGI ---
+    normalisee = bool(facture.get('is_normalized'))
+    normalisateur = facture.get('normalizer_id')
+    fiscal = {
+        'normalized': normalisee,
+        'code_mecef_dgi': facture.get('secu_codemecefdgi') or None,
+        'nim': facture.get('secu_nim') or None,
+        'normalization_date': facture.get('normalization_date') or None,
+        'normalized_by': normalisateur[1] if isinstance(normalisateur, list) else None,
+        'qrcode_base64': facture.get('secu_qrcode') or None,
+        'qrcode_format': 'png',
+    }
+    if not normalisee:
+        fiscal['message'] = (
+            "Facture non encore normalisée auprès de la DGI. Le code MECeF et le "
+            "QR code ne sont pas disponibles. La normalisation se fait depuis la "
+            "facture dans Odoo."
+        )
+
+    return {
+        'invoice': {
+            'id': invoice_id,
+            'number': facture.get('name'),
+            'reference': facture.get('ref') or None,
+            'date': facture.get('invoice_date'),
+            'due_date': facture.get('invoice_date_due'),
+            'state': facture.get('state'),
+            'payment_state': facture.get('payment_state'),
+            'currency': devise_nom,
+            'amount_untaxed': round(float(facture.get('amount_untaxed') or 0), 2),
+            'amount_tax': round(float(facture.get('amount_tax') or 0), 2),
+            'amount_total': round(float(facture.get('amount_total') or 0), 2),
+            'amount_residual': round(float(facture.get('amount_residual') or 0), 2),
+        },
+        'seller': {
+            'name': emetteur.get('name'),
+            'address': ", ".join(
+                p for p in (emetteur.get('street'), emetteur.get('city')) if p
+            ) or None,
+            'phone': emetteur.get('phone') or None,
+            'email': emetteur.get('email') or None,
+            'vat': emetteur.get('vat') or None,
+            'registry': emetteur.get('company_registry') or None,
+        },
+        'customer': {
+            'name': destinataire.get('name'),
+            'address': ", ".join(
+                p for p in (destinataire.get('street'), destinataire.get('city')) if p
+            ) or None,
+            'phone': destinataire.get('phone') or None,
+            'vat': destinataire.get('vat') or None,
+        },
+        'lines': lignes,
+        'fiscal': fiscal,
+        'pdf_url': f"/accounting/invoice/{invoice_id}/pdf",
+    }
 
 
 def _generate_pdf_via_wizard(client: OdooClient, invoice_id: int) -> bytes | None:
