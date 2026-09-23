@@ -27,10 +27,10 @@ ACTIVE_SESSIONS = {}
 # DB1: Base Test JNP Directe (Transferts internes)
 ODOO_DB1_CONFIG = {
     "name": "jnp_directe",
-    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-statging-012026-38221556.dev.odoo.com/"),
-    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-statging-012026-38221556"),
+    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-statging-012026-38540067.dev.odoo.com/"),
+    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-statging-012026-38540067"),
     "username": os.getenv("ODOO_DB1_USERNAME", "api@jnpgroupe.com"),
-    "api_key": os.getenv("ODOO_DB1_API_KEY", "0af00ef69d204b7fb1d7f95ab872cf4a1503581c"),
+    "api_key": os.getenv("ODOO_DB1_API_KEY", "a2aaf93d2209f4b8b1974673400312d3f96b6134"),
     "transfer_type": "internal",  # Transferts internes
     "transfer_type_code": "internal"
 }
