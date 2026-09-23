@@ -1947,9 +1947,11 @@ def _resoudre_ligne_vente(line) -> tuple:
         # Quatre décimales : l'écart résiduel reste inférieur au centime, donc
         # invisible après arrondi du franc CFA.
         qty_calculee = round(montant / prix_effectif, 4)
-        return qty_calculee, montant, montant
+        return qty_calculee, round(montant, 2), montant
 
-    montant = qty * prix * (1 - remise / 100)
+    # Arrondi au centime : sans lui, Odoo enregistre des montants du type
+    # 493.00000000000006 qui ressortent tels quels dans les lectures.
+    montant = round(qty * prix * (1 - remise / 100), 2)
     return qty, montant, None
 
 
