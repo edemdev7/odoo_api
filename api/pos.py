@@ -1911,7 +1911,43 @@ def _champ_note_ligne(client) -> Optional[str]:
     return nom
 
 
-def _resoudre_ligne_vente(line) -> tuple:
+# Nombre de décimales de la devise, résolu une fois par point de vente.
+# Le franc CFA n'en a aucune : un total de 500,03 doit valoir 500, sans quoi
+# l'écart se retrouve sur le ticket du client.
+_cache_precision_devise: dict = {}
+
+
+def _precision_devise(client, pos_id: int) -> int:
+    """Décimales de la devise du point de vente. 0 pour le franc CFA."""
+    if pos_id in _cache_precision_devise:
+        return _cache_precision_devise[pos_id]
+
+    decimales = 2
+    try:
+        config = client.execute_kw(
+            'pos.config', 'read', [[pos_id]], {'fields': ['currency_id']}
+        )
+        devise = config[0].get('currency_id') if config else None
+        if devise:
+            devise_id = devise[0] if isinstance(devise, list) else devise
+            infos = client.execute_kw(
+                'res.currency', 'read', [[devise_id]],
+                {'fields': ['name', 'decimal_places']}
+            )
+            if infos:
+                decimales = int(infos[0].get('decimal_places', 2))
+                logger.info(
+                    f"PDV {pos_id} : devise {infos[0].get('name')} "
+                    f"à {decimales} décimale(s)"
+                )
+    except Exception as e:
+        logger.warning(f"Précision de devise indéterminée pour le PDV {pos_id}: {e}")
+
+    _cache_precision_devise[pos_id] = decimales
+    return decimales
+
+
+def _resoudre_ligne_vente(line, decimales: int = 2) -> tuple:
     """
     Quantité et montant d'une ligne de vente, réconciliés.
 
@@ -1947,11 +1983,14 @@ def _resoudre_ligne_vente(line) -> tuple:
         # Quatre décimales : l'écart résiduel reste inférieur au centime, donc
         # invisible après arrondi du franc CFA.
         qty_calculee = round(montant / prix_effectif, 4)
-        return qty_calculee, round(montant, 2), montant
+        return qty_calculee, round(montant, decimales), montant
 
-    # Arrondi au centime : sans lui, Odoo enregistre des montants du type
-    # 493.00000000000006 qui ressortent tels quels dans les lectures.
-    montant = round(qty * prix * (1 - remise / 100), 2)
+    # Arrondi à la précision de la devise.
+    #
+    # C'est ce qui absorbe la conversion montant vers quantité faite en amont :
+    # 0,6897 L × 725 donne 500,0325, que le franc CFA ramène à 500. Sans cet
+    # arrondi, l'écart de conversion ressortirait tel quel sur le ticket.
+    montant = round(qty * prix * (1 - remise / 100), decimales)
     return qty, montant, None
 
 
@@ -7774,7 +7813,9 @@ async def create_pos_order_only(
                 raise HTTPException(status_code=400, detail=f"Produit {line.product_id} non trouvé dans Odoo")
 
             product_info = product[0]
-            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(line)
+            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(
+                line, _precision_devise(client, pos_id)
+            )
             amount_total += line_total
 
             if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
@@ -8720,7 +8761,9 @@ async def create_complete_pos_order(
             product_info = product[0]
             logger.info(f"✅ Produit validé: ID={product_info['id']}, Nom={product_info['name']}, Type={product_info['type']}")
             
-            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(line)
+            qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(
+                line, _precision_devise(client, pos_id)
+            )
             total_amount += line_total
 
             if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
