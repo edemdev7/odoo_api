@@ -51,3 +51,52 @@ def clean_numbers(obj, parent_key: str = ""):
             return _to_comma_string(obj)
         return _round_float(obj)
     return obj
+
+
+# ---------------------------------------------------------------------------
+# Client d'une vente anonyme
+# ---------------------------------------------------------------------------
+# Odoo exige un partenaire sur toute facture. Une vente à la pompe étant
+# anonyme par nature, elle est rattachée à un compte collectif — « Comptant »,
+# « Client divers », selon le plan comptable de la société. Ce nom sert la
+# comptabilité, pas le client : sur le ticket remis en station, JNP veut un
+# simple tiret, qui laisse la place à une inscription manuscrite.
+#
+# La fiche Odoo n'est pas renommée : seul l'affichage change.
+
+# Libellés reconnus comme comptes collectifs, en minuscules.
+NOMS_COMPTE_COLLECTIF = {
+    "comptant", "client comptant", "client divers", "client anonyme",
+    "divers", "anonyme",
+}
+
+
+def libelle_client_anonyme() -> str:
+    """
+    Ce qui s'affiche à la place du nom sur une vente anonyme.
+
+    Lu à chaque appel plutôt qu'à l'import : une variable d'environnement
+    changée après démarrage doit prendre effet sans redéployer.
+    """
+    import os
+    return os.getenv("POS_ANONYMOUS_CUSTOMER_LABEL", "-")
+
+
+def est_client_generique(nom: str | None) -> bool:
+    """Le nom donné est-il celui d'un compte collectif plutôt qu'un client ?"""
+    if not nom:
+        return True
+    return " ".join(str(nom).split()).lower() in NOMS_COMPTE_COLLECTIF
+
+
+def nom_client_affiche(nom: str | None, generique: bool | None = None) -> str:
+    """
+    Nom du client tel qu'il doit figurer sur la facture.
+
+    `generique` permet à l'appelant qui connaît déjà le compte collectif de
+    la société — par son identifiant, plus fiable qu'un libellé — d'imposer
+    la réponse. Sans lui, la décision se prend sur le nom.
+    """
+    if generique is None:
+        generique = est_client_generique(nom)
+    return libelle_client_anonyme() if generique else nom

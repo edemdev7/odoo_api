@@ -21,7 +21,7 @@ from models.schemas import (
     StockLevelRequest, ProductStockResponse, StockPickingResponse,
     StockPickingStateUpdateRequest, StockPickingListRequest,
     PosOrderCreateSimpleRequest, PosAddPaymentRequest,
-    PosPaymentMethodCreateRequest
+    PosPaymentMethodCreateRequest, PosCustomerRequest
 )
 from models.responses import ApiResponse
 from core.security import require_scope
@@ -29,6 +29,7 @@ from core.odoo_client import get_odoo_client, OdooClient
 from core.config import logger
 from core.pump_manager import pump_manager
 from core.webhook_sender import verify_inbound_signature
+from core.formatters import nom_client_affiche, est_client_generique
 from api.accounting import _generate_pdf_via_wizard
 
 router = APIRouter(prefix="/pos", tags=["Point de Vente"])
@@ -7868,8 +7869,11 @@ async def create_pos_order_only(
             'date_order': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
 
-        if request.partner_id:
-            order_vals['partner_id'] = request.partner_id
+        # Client nommé dès la création : la facture naîtra directement à son
+        # nom, sans reprise ultérieure.
+        partner_id = _client_depuis_requete(client, request)
+        if partner_id:
+            order_vals['partner_id'] = partner_id
         if current_user.get('employee_id'):
             order_vals['employee_id'] = current_user['employee_id']
         if request.note:
@@ -7884,7 +7888,7 @@ async def create_pos_order_only(
                 'order_id': order_id,
                 'pos_reference': order_vals['pos_reference'],
                 'session_id': request.session_id,
-                'partner_id': request.partner_id,
+                'partner_id': partner_id,
                 'amount_total': amount_total,
                 'amount_paid': 0.0,
                 'amount_due': amount_total,
@@ -7989,6 +7993,15 @@ async def add_payment_to_order(
         current_paid = sum(float(p['amount']) for p in existing_payments)
         payment_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+        # Le client est posé avant l'encaissement, donc avant la facturation
+        # automatique déclenchée plus bas : la facture sort au bon nom du
+        # premier coup, sans repasser par un brouillon.
+        client_nomme = None
+        if getattr(request, 'customer', None):
+            client_nomme, _ = _resoudre_client(client, request.customer)
+            client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': client_nomme}])
+            logger.info(f"Commande {order_id} rattachée au client {client_nomme} avant facturation")
+
         # Créer chaque paiement dans Odoo
         payments_added = []
         total_this_call = 0.0
@@ -8069,6 +8082,7 @@ async def add_payment_to_order(
                 # Renseigné quand la vente a donné lieu à une facture : le mobile
                 # peut enchaîner directement sur l'impression sans second appel.
                 'invoice_id': invoice_id,
+                'partner_id': client_nomme,
             },
             message=(
                 f"Commande soldée — Rendu: {amount_return}" if is_complete
@@ -8182,6 +8196,244 @@ def _partenaire_comptant(client) -> Optional[int]:
     return None
 
 
+def _nettoyer_identite(valeur: Optional[str]) -> Optional[str]:
+    """Blancs superflus retirés, chaîne vide ramenée à None."""
+    if valeur is None:
+        return None
+    propre = " ".join(str(valeur).split())
+    return propre or None
+
+
+def _resoudre_client(client, identite) -> tuple:
+    """
+    Contact Odoo correspondant à l'identité saisie au comptoir.
+
+    Une station sert les mêmes clients tous les jours : créer une fiche à
+    chaque passage remplirait le carnet d'adresses de doublons et fausserait
+    les relances. On cherche donc d'abord une fiche existante, par ordre de
+    fiabilité décroissante — l'IFU identifie sans ambiguïté, le téléphone
+    presque, le nom seulement par convention.
+
+    Retourne (partner_id, cree).
+    """
+    nom = _nettoyer_identite(identite.name)
+    if not nom:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "customer_name_required",
+                "message": "Le nom du client est obligatoire.",
+            }
+        )
+
+    telephone = _nettoyer_identite(identite.phone)
+    ifu = _nettoyer_identite(identite.vat)
+    email = _nettoyer_identite(identite.email)
+    adresse = _nettoyer_identite(identite.address)
+
+    if getattr(identite, 'reuse_existing', True):
+        criteres = []
+        if ifu:
+            criteres.append(('IFU', [('vat', '=ilike', ifu)]))
+        if telephone:
+            criteres.append(('téléphone', ['|', ('phone', '=', telephone),
+                                           ('mobile', '=', telephone)]))
+        criteres.append(('nom', [('name', '=ilike', nom)]))
+
+        for libelle, domaine in criteres:
+            try:
+                # Un client du point de vente porte customer_rank > 0. On s'y
+                # limite d'abord pour ne pas rattacher une vente à un employé
+                # ou à un fournisseur homonyme.
+                trouve = client.execute_kw(
+                    'res.partner', 'search',
+                    [domaine + [('customer_rank', '>', 0)]], {'limit': 1}
+                )
+                if not trouve and libelle != 'nom':
+                    trouve = client.execute_kw(
+                        'res.partner', 'search', [domaine], {'limit': 1}
+                    )
+                if trouve:
+                    logger.info(
+                        f"Client « {nom} » rattaché au contact {trouve[0]} "
+                        f"(correspondance {libelle})"
+                    )
+                    return trouve[0], False
+            except Exception as e:
+                logger.debug(f"Recherche client par {libelle} échouée: {e}")
+
+    valeurs = {'name': nom, 'customer_rank': 1}
+    if telephone:
+        valeurs['phone'] = telephone
+    if ifu:
+        valeurs['vat'] = ifu
+    if email:
+        valeurs['email'] = email
+    if adresse:
+        valeurs['street'] = adresse
+
+    partner_id = client.execute_kw('res.partner', 'create', [valeurs])
+    logger.info(f"👤 Contact client {partner_id} créé — « {nom} »")
+    return partner_id, True
+
+
+def _lire_facture_client(client, facture_id: int) -> dict:
+    """
+    État d'une facture du point de vue du changement de client.
+
+    `is_normalized` n'existe que si le module de normalisation DGI est
+    installé : sa lecture est isolée pour que l'absence du module ne fasse
+    pas échouer tout le reste.
+    """
+    base = client.execute_kw(
+        'account.move', 'read', [facture_id],
+        {'fields': ['name', 'state', 'partner_id', 'payment_state']}
+    )[0]
+    base['is_normalized'] = False
+    try:
+        norme = client.execute_kw(
+            'account.move', 'read', [facture_id], {'fields': ['is_normalized']}
+        )[0]
+        base['is_normalized'] = bool(norme.get('is_normalized'))
+    except Exception:
+        pass
+    return base
+
+
+def _appliquer_client_commande(client, order_id: int, partner_id: int) -> dict:
+    """
+    Porte le client sur la commande, et sur sa facture si elle existe déjà.
+
+    Trois situations, de la plus simple à la plus contrainte :
+
+      - pas encore de facture : rien de particulier, elle naîtra au bon nom ;
+      - facture en brouillon : le partenaire s'écrit directement ;
+      - facture comptabilisée : Odoo verrouille le partenaire. On repasse en
+        brouillon puis on recomptabilise, ce qui conserve le numéro. Ce
+        détour se désactive par `POS_ALLOW_INVOICE_REPOST=0`.
+
+    Une facture déjà normalisée auprès de la DGI n'est jamais touchée : elle
+    est scellée fiscalement, et la corriger passe par un avoir.
+    """
+    resultat = {
+        'order_updated': False,
+        'invoice_id': None,
+        'invoice_updated': False,
+        'invoice_state': None,
+        'warning': None,
+    }
+
+    commande = client.execute_kw(
+        'pos.order', 'read', [order_id],
+        {'fields': ['name', 'state', 'account_move']}
+    )
+    if not commande:
+        raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
+    commande = commande[0]
+
+    client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': partner_id}])
+    resultat['order_updated'] = True
+
+    move = commande.get('account_move')
+    facture_id = move[0] if isinstance(move, list) else move
+    if not facture_id:
+        return resultat
+
+    resultat['invoice_id'] = facture_id
+    facture = _lire_facture_client(client, facture_id)
+    resultat['invoice_state'] = facture.get('state')
+
+    if facture.get('is_normalized'):
+        resultat['warning'] = (
+            f"La facture {facture.get('name')} est déjà normalisée auprès de la "
+            f"DGI : son client ne peut plus être modifié. La vente porte "
+            f"désormais le bon contact, mais rectifier la facture demande un avoir."
+        )
+        logger.warning(
+            f"Client non reporté sur la facture normalisée {facture_id} "
+            f"(commande {commande.get('name')})"
+        )
+        return resultat
+
+    etat = facture.get('state')
+
+    if etat == 'draft':
+        client.execute_kw('account.move', 'write', [[facture_id], {'partner_id': partner_id}])
+        resultat['invoice_updated'] = True
+        logger.info(f"Client {partner_id} porté sur la facture brouillon {facture_id}")
+        return resultat
+
+    if etat == 'posted':
+        autorisation = os.getenv("POS_ALLOW_INVOICE_REPOST", "").strip()
+        lettree = facture.get('payment_state') in ('paid', 'in_payment', 'partial')
+
+        if autorisation == "0":
+            resultat['warning'] = (
+                f"La facture {facture.get('name')} est comptabilisée et la reprise "
+                f"est désactivée sur ce serveur. Le client est enregistré sur la "
+                f"vente mais pas sur la facture."
+            )
+            return resultat
+
+        # Une facture lettrée avec son règlement ne se remet pas en brouillon
+        # sans délettrer l'écriture : le paiement se retrouve en suspens et
+        # quelqu'un devra le rapprocher à la main. Le jeu n'en vaut la
+        # chandelle que si on l'a décidé explicitement.
+        if lettree and autorisation != "1":
+            resultat['warning'] = (
+                f"La facture {facture.get('name')} est comptabilisée et déjà "
+                f"lettrée avec son règlement : la modifier délettrerait "
+                f"l'écriture. Le client est enregistré sur la vente, mais la "
+                f"facture reste au nom précédent. Saisissez le nom avant "
+                f"l'encaissement pour éviter ce cas, ou passez par un avoir."
+            )
+            logger.info(
+                f"Reprise de la facture {facture_id} refusée — lettrée "
+                f"(payment_state={facture.get('payment_state')})"
+            )
+            return resultat
+
+        try:
+            client.execute_kw('account.move', 'button_draft', [[facture_id]])
+            client.execute_kw('account.move', 'write', [[facture_id], {'partner_id': partner_id}])
+            client.execute_kw('account.move', 'action_post', [[facture_id]])
+            resultat['invoice_updated'] = True
+            resultat['invoice_state'] = 'posted'
+            logger.info(
+                f"Facture {facture_id} reprise en brouillon pour porter le "
+                f"client {partner_id}, puis recomptabilisée"
+            )
+        except Exception as e:
+            resultat['warning'] = (
+                f"Le client n'a pas pu être reporté sur la facture "
+                f"{facture.get('name')} : {e}"
+            )
+            logger.warning(f"Reprise de la facture {facture_id} échouée: {e}")
+        return resultat
+
+    resultat['warning'] = (
+        f"Facture {facture.get('name')} en état « {etat} » : client non reporté."
+    )
+    return resultat
+
+
+def _client_depuis_requete(client, request, order_id: Optional[int] = None) -> Optional[int]:
+    """
+    Résout le client d'une requête de vente, `partner_id` ayant la priorité.
+
+    Mutualise le traitement entre la création de commande et l'encaissement :
+    l'identité peut arriver par l'un ou l'autre, selon le moment où le client
+    demande une facture à son nom.
+    """
+    if getattr(request, 'partner_id', None):
+        return request.partner_id
+    identite = getattr(request, 'customer', None)
+    if not identite:
+        return None
+    partner_id, _ = _resoudre_client(client, identite)
+    return partner_id
+
+
 def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[int]:
     """
     Facture d'une commande POS, créée si elle n'existe pas encore.
@@ -8267,6 +8519,104 @@ def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[in
 # normalisation DGI et se lit dans le champ `secu_qrcode` de l'account.move.
 # Une fonction de génération maison a existé un temps à cet endroit ; elle a été
 # retirée pour qu'on ne soit pas tenté d'imprimer un QR sans valeur probante.
+
+
+@router.put("/{pos_id}/orders/{order_id}/customer", response_model=ApiResponse)
+async def set_pos_order_customer(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    order_id: int = Path(..., description="ID de la commande POS"),
+    request: PosCustomerRequest = Body(...),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Renseigner le client d'une vente, avant impression du ticket.
+
+    Une vente à la pompe est anonyme : elle part sur le compte collectif
+    « Client comptant », et le ticket ne porte aucun nom. Quand le client
+    demande une facture à son nom, l'application recueille son identité et
+    appelle cet endpoint, puis réimprime depuis `/invoice/details`.
+
+    **Le moment de l'appel change ce qui est possible.** Avant encaissement,
+    l'opération est anodine : la facture n'existe pas encore et naîtra au bon
+    nom. Après, la facture existe et Odoo verrouille son partenaire une fois
+    comptabilisée — elle est alors reprise en brouillon puis recomptabilisée,
+    ce qui conserve son numéro. Une facture déjà normalisée auprès de la DGI
+    n'est en revanche jamais modifiée : elle est scellée, et la rectifier
+    passe par un avoir. Le champ `warning` de la réponse dit lequel de ces
+    cas s'est présenté.
+
+    **Le plus sûr reste de saisir le nom avant de solder la vente**, en
+    passant `customer` à la création de la commande ou à l'encaissement.
+
+    L'IFU (`vat`) n'est pas décoratif : c'est lui qui rend la facture
+    déductible chez un client professionnel.
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        commande = client.execute_kw(
+            'pos.order', 'read', [order_id],
+            {'fields': ['name', 'state', 'session_id', 'partner_id', 'account_move']}
+        )
+        if not commande:
+            raise HTTPException(status_code=404, detail=f"Commande {order_id} non trouvée")
+        commande = commande[0]
+
+        # La commande doit bien appartenir au point de vente appelé
+        session_id = commande['session_id'][0] if isinstance(commande['session_id'], list) else commande['session_id']
+        session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['config_id']})
+        if not session or session[0]['config_id'][0] != pos_id:
+            raise HTTPException(
+                status_code=400, detail="La commande n'appartient pas à ce point de vente"
+            )
+
+        if commande.get('state') == 'cancel':
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "order_cancelled",
+                    "message": f"La commande {commande['name']} est annulée.",
+                    "order_id": order_id,
+                }
+            )
+
+        partner_id, cree = _resoudre_client(client, request)
+        resultat = _appliquer_client_commande(client, order_id, partner_id)
+
+        fiche = client.execute_kw(
+            'res.partner', 'read', [partner_id],
+            {'fields': ['name', 'phone', 'vat', 'email', 'street']}
+        )[0]
+
+        donnees = {
+            'order_id': order_id,
+            'order_name': commande['name'],
+            'customer': {
+                'partner_id': partner_id,
+                'name': fiche.get('name'),
+                'phone': fiche.get('phone') or None,
+                'vat': fiche.get('vat') or None,
+                'email': fiche.get('email') or None,
+                'address': fiche.get('street') or None,
+                'created': cree,
+            },
+        }
+        donnees.update(resultat)
+
+        if resultat['warning']:
+            message = resultat['warning']
+        elif resultat['invoice_updated']:
+            message = f"Client « {fiche.get('name')} » porté sur la vente et sur sa facture"
+        else:
+            message = f"Client « {fiche.get('name')} » enregistré sur la vente"
+
+        return ApiResponse(success=True, data=donnees, message=message)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur affectation client — commande {order_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'affectation du client: {str(e)}")
 
 
 @router.get("/{pos_id}/orders/{order_id}/invoice")
@@ -8482,6 +8832,7 @@ async def get_pos_order_invoice_details(
 
         # --- Client ---
         partenaire = facture.get('partner_id')
+        partenaire_id = None
         if partenaire:
             partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
             client_data = client.execute_kw(
@@ -8490,6 +8841,16 @@ async def get_pos_order_invoice_details(
             )[0]
         else:
             client_data = {'name': 'Client comptant'}
+
+        # Le compte collectif n'est pas un client : le distinguer permet à
+        # l'application de proposer la saisie du nom avant d'imprimer.
+        # L'identifiant est plus sûr que le libellé, mais le libellé rattrape
+        # les cas où une autre société utilise son propre compte collectif.
+        client_generique = (
+            not partenaire_id
+            or partenaire_id == _partenaire_comptant(client)
+            or est_client_generique(client_data.get('name'))
+        )
 
         # --- Lignes ---
         lignes = []
@@ -8634,12 +8995,20 @@ async def get_pos_order_invoice_details(
                     'registry': societe.get('company_registry') or None,
                 },
                 'customer': {
-                    'name': client_data.get('name'),
+                    'partner_id': partenaire_id,
+                    # Sur une vente anonyme, le nom du compte collectif ne
+                    # figure pas sur le ticket : un tiret prend sa place.
+                    'name': nom_client_affiche(
+                        client_data.get('name'), client_generique
+                    ),
                     'address': ", ".join(
                         p for p in (client_data.get('street'), client_data.get('city')) if p
                     ) or None,
                     'phone': client_data.get('phone') or None,
                     'vat': client_data.get('vat') or None,
+                    # true = vente anonyme sur le compte collectif. L'application
+                    # peut alors proposer « Facture au nom de… » avant impression.
+                    'is_generic': client_generique,
                 },
                 'lines': lignes,
                 'payments': reglements,

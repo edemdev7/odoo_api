@@ -22,6 +22,7 @@ from models.responses import ApiResponse
 from core.background_scheduler import get_scheduler
 from core.webhook_sender import send_encrypted_webhook
 from core.config import logger as config_logger  # Charge le .env via load_dotenv()
+from core.formatters import nom_client_affiche, est_client_generique
 
 logger = logging.getLogger(__name__)
 
@@ -1466,6 +1467,7 @@ def build_invoice_details(client: OdooClient, invoice_id: int) -> dict:
 
     # --- Client ---
     partenaire = facture.get('partner_id')
+    partenaire_id = None
     if partenaire:
         partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
         destinataire = client.execute_kw(
@@ -1473,7 +1475,11 @@ def build_invoice_details(client: OdooClient, invoice_id: int) -> dict:
             {'fields': ['name', 'street', 'city', 'phone', 'vat']}
         )[0]
     else:
-        destinataire = {'name': 'Client comptant'}
+        destinataire = {}
+
+    # Une vente anonyme est portée par un compte collectif, dont le nom ne
+    # figure pas sur le document remis au client.
+    client_generique = est_client_generique(destinataire.get('name'))
 
     # --- Lignes ---
     lignes = []
@@ -1552,12 +1558,14 @@ def build_invoice_details(client: OdooClient, invoice_id: int) -> dict:
             'registry': emetteur.get('company_registry') or None,
         },
         'customer': {
-            'name': destinataire.get('name'),
+            'partner_id': partenaire_id,
+            'name': nom_client_affiche(destinataire.get('name'), client_generique),
             'address': ", ".join(
                 p for p in (destinataire.get('street'), destinataire.get('city')) if p
             ) or None,
             'phone': destinataire.get('phone') or None,
             'vat': destinataire.get('vat') or None,
+            'is_generic': client_generique,
         },
         'lines': lignes,
         'fiscal': fiscal,

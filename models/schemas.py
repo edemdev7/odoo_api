@@ -230,9 +230,40 @@ class PosPayment(BaseModel):
     payment_method_id: int = Field(..., description="ID de la méthode de paiement")
     amount: float = Field(..., description="Montant payé avec cette méthode")
 
+class PosCustomerRequest(BaseModel):
+    """
+    Identité du client saisie au comptoir, avant impression du ticket.
+
+    Une vente à la pompe est anonyme par défaut et part sur le compte
+    collectif « Client comptant ». Quand le client demande une facture à
+    son nom, l'application recueille ces champs et la passerelle résout
+    — ou crée — le contact correspondant dans Odoo.
+
+    L'IFU est ce qui distingue une facture à un professionnel : la DGI
+    l'exige pour qu'elle soit déductible chez le client.
+    """
+    name: str = Field(..., min_length=2, max_length=120,
+                      description="Nom ou raison sociale du client")
+    phone: Optional[str] = Field(None, max_length=32, description="Téléphone")
+    vat: Optional[str] = Field(None, max_length=32,
+                               description="IFU / numéro fiscal du client")
+    email: Optional[str] = Field(None, max_length=120)
+    address: Optional[str] = Field(None, max_length=200, description="Adresse")
+    reuse_existing: bool = Field(
+        True,
+        description=(
+            "Réutiliser un contact existant si l'IFU, le téléphone ou le nom "
+            "correspond exactement. Mettre à false pour forcer une fiche neuve."
+        )
+    )
+
 class PosOrderCreateFullRequest(BaseModel):
     pos_session_id: int = Field(..., description="ID de la session POS")
     partner_id: Optional[int] = Field(None, description="ID du client")
+    customer: Optional[PosCustomerRequest] = Field(
+        None,
+        description="Client saisi au comptoir. Ignoré si partner_id est fourni."
+    )
     lines: List[PosOrderLine] = Field(..., description="Lignes de commande")
     payments: List[PosPayment] = Field(..., description="Liste des paiements (peut être multiple)")
     amount_return: Optional[float] = Field(0.0, description="Monnaie rendue")
@@ -247,11 +278,23 @@ class PosOrderCreateSimpleRequest(BaseModel):
     session_id: int = Field(..., description="ID de la session POS")
     lines: List[PosOrderLine] = Field(..., description="Lignes de commande")
     partner_id: Optional[int] = Field(None, description="ID du client (optionnel)")
+    customer: Optional[PosCustomerRequest] = Field(
+        None,
+        description="Client saisi au comptoir. Ignoré si partner_id est fourni."
+    )
     note: Optional[str] = Field(None, description="Note sur la commande")
 
 class PosAddPaymentRequest(BaseModel):
     """Ajouter un ou plusieurs paiements à une commande existante"""
     payments: List[PosPayment] = Field(..., min_length=1, description="Liste des paiements (un ou plusieurs modes)")
+    customer: Optional[PosCustomerRequest] = Field(
+        None,
+        description=(
+            "Client saisi au comptoir. Renseigné ici, il est porté sur la "
+            "commande avant l'émission de la facture : celle-ci sort donc "
+            "directement au bon nom, sans reprise ultérieure."
+        )
+    )
 
 class PosPaymentMethodCreateRequest(BaseModel):
     """Créer un mode de paiement POS"""
