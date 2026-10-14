@@ -4677,6 +4677,69 @@ async def receive_delivery_note(
         )
 
 
+# ===== BOUTEILLES DE GAZ VIDES =====
+#
+# Une recharge de gaz est un échange : le client repart avec une bouteille
+# pleine et laisse la sienne, vide. La station accumule donc des vides, qu'un
+# camion vient reprendre pour les ramener au centre emplisseur. Ce flux de
+# retour a sa propre existence dans Odoo — quatre produits, une catégorie —
+# et c'est lui que le gérant veut voir à la fermeture de sa session.
+#
+# À ne pas confondre avec une vente de bouteille vide : celle-ci part vers
+# `Partners/Customers`, pas vers un camion ou un magasin.
+
+# Catégorie « BOUTEILLES VIDES DE GAZ ». L'identifiant est connu, mais une
+# recherche par libellé le rattrape si la base change.
+_CATEG_BOUTEILLES_VIDES = [86]
+_LIBELLE_CATEG_BOUTEILLES_VIDES = 'BOUTEILLES VIDES'
+
+# Résolu une fois par processus : le catalogue ne bouge pas en cours de service.
+_cache_bouteilles_vides: dict = {}
+
+
+def _produits_bouteilles_vides(client) -> set:
+    """
+    Identifiants des produits « bouteille vide de gaz ».
+
+    La catégorie fait foi. Le repli par libellé couvre le cas d'une base où
+    l'identifiant diffère — une franchise, un environnement de test — plutôt
+    que de rendre la fonctionnalité muette sans rien dire.
+    """
+    if 'ids' in _cache_bouteilles_vides:
+        return _cache_bouteilles_vides['ids']
+
+    ids: set = set()
+
+    try:
+        categories = list(_CATEG_BOUTEILLES_VIDES)
+        trouvees = client.execute_kw(
+            'product.category', 'search',
+            [[('name', 'ilike', _LIBELLE_CATEG_BOUTEILLES_VIDES)]]
+        )
+        for cid in trouvees:
+            if cid not in categories:
+                categories.append(cid)
+
+        produits = client.execute_kw(
+            'product.product', 'search',
+            [[('categ_id', 'in', categories)]]
+        )
+        ids.update(produits)
+
+        # Repli par nom : un produit mal catégorisé reste une bouteille vide.
+        orphelins = client.execute_kw(
+            'product.product', 'search',
+            [[('name', 'ilike', 'BOUTEILLE VIDE')]]
+        )
+        ids.update(orphelins)
+    except Exception as e:
+        logger.warning(f"Produits « bouteille vide » illisibles: {e}")
+
+    _cache_bouteilles_vides['ids'] = ids
+    logger.info(f"Bouteilles vides de gaz : {len(ids)} produit(s) — {sorted(ids)}")
+    return ids
+
+
 # ===== INVENTAIRE CAMION (PROFIL CHAUFFEUR) =====
 
 # États d'un mouvement encore à réaliser : la marchandise est engagée sur une
@@ -5142,6 +5205,17 @@ async def get_session_stock_evolution(
 
     Les composants du calcul sont exposés dans la réponse pour permettre le
     contrôle : `stock_actuel`, `entrees_session`, `sorties_session`.
+
+    **Bouteilles vides de gaz.** Une recharge est un échange : la station
+    accumule les bouteilles vides laissées par les clients, qu'un camion vient
+    reprendre. Pour ces produits — et pour eux seuls — la réponse porte
+    `stock_transfere` : le nombre de vides repartis vers un camion ou un
+    magasin depuis l'ouverture, avec `transfert_destinations` pour savoir où.
+    Une bouteille vide *vendue* à un client n'y figure pas : elle sort vers
+    `Partners/Customers`, ce n'est pas une reprise.
+
+    Sur tout autre produit, `stock_transfere` vaut `null` plutôt que zéro —
+    la notion n'a pas de sens, et l'application masque la ligne.
     """
     try:
         client = get_odoo_client(current_user)
@@ -5208,6 +5282,26 @@ async def get_session_stock_evolution(
                         'categ_id', 'type'],
              'order': 'name asc'}
         )
+
+        # Les bouteilles vides sont ajoutées d'office. Le filtrage par
+        # catégorie POS peut les écarter du catalogue de vente alors que leur
+        # retour est précisément ce qu'on veut suivre : sans cela, la ligne
+        # « Stock transféré » disparaîtrait des stations qui en reprennent.
+        bouteilles_vides = _produits_bouteilles_vides(client)
+        manquantes = bouteilles_vides - {p['id'] for p in products}
+        if manquantes:
+            try:
+                ajout = client.execute_kw(
+                    'product.product', 'search_read',
+                    [[('id', 'in', list(manquantes))]],
+                    {'fields': ['id', 'name', 'default_code', 'list_price',
+                                'uom_id', 'categ_id', 'type']}
+                )
+                products.extend(ajout)
+                products.sort(key=lambda p: (p.get('name') or '').lower())
+            except Exception as e:
+                logger.warning(f"Bouteilles vides non ajoutées au catalogue: {e}")
+
         if not products:
             return ApiResponse(
                 success=True,
@@ -5263,6 +5357,11 @@ async def get_session_stock_evolution(
         # --- Mouvements depuis l'ouverture ---
         moves_in: dict[int, float] = {}
         moves_out: dict[int, float] = {}
+        # Bouteilles vides reprises par un camion ou un magasin : sous-ensemble
+        # des sorties, dont on garde la destination pour que le gérant sache
+        # où ses vides sont partis.
+        transferts: dict[int, float] = {}
+        destinations: dict[int, set] = {}
         try:
             move_lines = client.execute_kw(
                 'stock.move.line', 'search_read',
@@ -5280,6 +5379,28 @@ async def get_session_stock_evolution(
                 'stock.location', 'search',
                 [[('id', 'child_of', stock_location_id)]]
             ))
+
+            # Usage des destinations rencontrées. Une bouteille vide qui sort
+            # vers un emplacement interne — un camion, un magasin — est une
+            # reprise ; la même qui sort vers `Partners/Customers` est une
+            # vente. Sans cette distinction les deux se confondraient.
+            usages: dict[int, dict] = {}
+            dst_rencontrees = set()
+            for ml in move_lines:
+                dst = ml.get('location_dest_id')
+                dst_id = dst[0] if isinstance(dst, list) else dst
+                if dst_id and dst_id not in local_ids:
+                    dst_rencontrees.add(dst_id)
+            if dst_rencontrees:
+                try:
+                    for loc in client.execute_kw(
+                        'stock.location', 'read', [list(dst_rencontrees)],
+                        {'fields': ['usage', 'complete_name']}
+                    ):
+                        usages[loc['id']] = loc
+                except Exception as e:
+                    logger.warning(f"Usage des emplacements illisible: {e}")
+
             for ml in move_lines:
                 prod = ml.get('product_id')
                 pid = prod[0] if isinstance(prod, list) else prod
@@ -5296,6 +5417,13 @@ async def get_session_stock_evolution(
                 dst_local = dst_id in local_ids
                 if src_local and not dst_local:
                     moves_out[pid] = moves_out.get(pid, 0.0) + qty
+                    if pid in bouteilles_vides:
+                        dest = usages.get(dst_id) or {}
+                        if dest.get('usage') == 'internal':
+                            transferts[pid] = transferts.get(pid, 0.0) + qty
+                            nom_dest = dest.get('complete_name')
+                            if nom_dest:
+                                destinations.setdefault(pid, set()).add(nom_dest)
                 elif dst_local and not src_local:
                     moves_in[pid] = moves_in.get(pid, 0.0) + qty
         except Exception as e:
@@ -5352,6 +5480,9 @@ async def get_session_stock_evolution(
             # lignes à zéro faisait disparaître des références pourtant
             # rattachées au PDV, ce qui laissait croire à leur suppression.
 
+            est_bouteille = pid in bouteilles_vides
+            qte_transferee = round(transferts.get(pid, 0.0), 3) if est_bouteille else None
+
             lines.append({
                 'product_id': pid,
                 'product_name': p['name'],
@@ -5372,11 +5503,26 @@ async def get_session_stock_evolution(
                 'entrees_session': qty_in,
                 'sorties_session': qty_out,
                 'sales_not_destocked': sales_not_destocked,
+
+                # ---- Bouteilles vides reprises pendant la session ----
+                # `null` sur tout autre produit : la ligne « Stock transféré »
+                # ne s'affiche que pour le gaz bouteille. Zéro et null ne
+                # veulent pas dire la même chose — zéro, c'est une station qui
+                # n'a rien renvoyé ; null, c'est une notion hors sujet.
+                'is_gas_bottle': est_bouteille,
+                'stock_transfere': qte_transferee,
+                'transfert_destinations': (
+                    sorted(destinations.get(pid, ())) if est_bouteille else None
+                ),
             })
 
         total_sold = round(sum(l['quantity_sold'] for l in lines), 3)
         total_amount = round(sum(l['amount_sold'] for l in lines), 2)
         oversold_lines = [l for l in lines if l['oversold']]
+        lignes_bouteilles = [l for l in lines if l['is_gas_bottle']]
+        total_transfere = round(
+            sum(l['stock_transfere'] or 0 for l in lignes_bouteilles), 3
+        )
 
         logger.info(
             f"📊 Évolution stock session {session.get('name')}: "
@@ -5384,6 +5530,8 @@ async def get_session_stock_evolution(
             + (f" — ⚠️ {len(oversold_lines)} produit(s) en survente: "
                f"{', '.join(l['product_name'] for l in oversold_lines)}"
                if oversold_lines else "")
+            + (f" — 🔄 {total_transfere} bouteille(s) vide(s) reprise(s)"
+               if total_transfere else "")
         )
 
         return ApiResponse(
@@ -5407,6 +5555,10 @@ async def get_session_stock_evolution(
                     'total_quantity_sold': total_sold,
                     'total_amount_sold': total_amount,
                     'oversold_products_count': len(oversold_lines),
+                    # Bouteilles vides reprises par un camion ou un magasin
+                    # pendant la session, tous formats confondus.
+                    'gas_bottles_count': len(lignes_bouteilles),
+                    'total_stock_transfere': total_transfere,
                 },
                 'products': lines,
             },
