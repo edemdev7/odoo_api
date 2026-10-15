@@ -4821,6 +4821,11 @@ def _produits_bouteilles_vides(client) -> set:
 _ETATS_A_LIVRER = ['assigned', 'confirmed', 'waiting', 'partially_available']
 
 
+def _normaliser_plaque(valeur: str) -> str:
+    """Immatriculation réduite à ses caractères utiles : « AX 0042 RB » → « AX0042RB »."""
+    return ''.join(c for c in (valeur or '').upper() if c.isalnum())
+
+
 def _resoudre_emplacements_camion(client, truck_name: str) -> list:
     """
     Emplacements de stock correspondant à un camion.
@@ -4832,6 +4837,17 @@ def _resoudre_emplacements_camion(client, truck_name: str) -> list:
 
     Les deux emplacements sont retournés quand ils existent — sur un ensemble
     routier, la remorque porte sa propre citerne.
+
+    **Les homonymes ne sont pas fusionnés.** Un même véhicule peut porter
+    deux emplacements dont les plaques ne diffèrent que par l'espacement —
+    `CAM/AX0042RB` et `CAM/AX 0042 RB`. La tentation est de les réunir ; c'est
+    une erreur. Sur le parc JNP, le second porte les pièces détachées du
+    véhicule (pneus, filtres, batterie) et non sa marchandise : les fusionner
+    ferait apparaître des pneus dans l'inventaire du chauffeur.
+
+    La résolution s'en tient donc à la correspondance littérale.
+    `_emplacements_homonymes` sert à signaler l'ambiguïté sans trancher à la
+    place de l'exploitant.
     """
     if not truck_name:
         return []
@@ -4855,15 +4871,7 @@ def _resoudre_emplacements_camion(client, truck_name: str) -> list:
         return emplacements
 
     # 2. Chaque composant de l'identifiant, séparateurs courants
-    parties = []
-    for separateur in ('/', '-', '+', ' '):
-        truck_name = truck_name.replace(separateur, '|')
-    for partie in truck_name.split('|'):
-        partie = partie.strip()
-        # Une immatriculation fait au moins quatre caractères ; en deçà on
-        # risquerait de ramener des emplacements sans rapport.
-        if len(partie) >= 4 and partie not in parties:
-            parties.append(partie)
+    parties = _plaques_candidates(truck_name)
 
     trouves = []
     for partie in parties:
@@ -4879,6 +4887,66 @@ def _resoudre_emplacements_camion(client, truck_name: str) -> list:
     return trouves
 
 
+def _plaques_candidates(truck_name: str) -> list:
+    """Composants exploitables d'un identifiant de véhicule."""
+    decoupe = truck_name or ''
+    for separateur in ('/', '-', '+', ' '):
+        decoupe = decoupe.replace(separateur, '|')
+    parties = []
+    for partie in decoupe.split('|'):
+        partie = partie.strip()
+        # Une immatriculation fait au moins quatre caractères ; en deçà on
+        # risquerait de ramener des emplacements sans rapport.
+        if len(partie) >= 4 and partie not in parties:
+            parties.append(partie)
+    return parties
+
+
+def _emplacements_homonymes(client, truck_name: str, retenus: list) -> list:
+    """
+    Emplacements portant la même plaque à l'espacement près, hors sélection.
+
+    Rien n'est fusionné : sur le parc JNP, `CAM/AX 0042 RB` porte les pièces
+    détachées du véhicule quand `CAM/AX0042RB` porte sa marchandise. Les
+    réunir fausserait l'inventaire du chauffeur. Mais les ignorer en silence
+    laisse l'exploitant chercher pourquoi un transfert n'apparaît pas : on
+    les signale, et c'est lui qui tranche.
+    """
+    homonymes = []
+    deja = set(retenus or [])
+    for plaque in [truck_name] + _plaques_candidates(truck_name):
+        attendu = _normaliser_plaque(plaque)
+        if len(attendu) < 4:
+            continue
+        try:
+            candidats = client.execute_kw(
+                'stock.location', 'search_read',
+                # `A%X%0%0%4%2%R%B` laisse passer n'importe quel séparateur ;
+                # la comparaison normalisée qui suit écarte les faux positifs.
+                [[('name', 'ilike', '%'.join(attendu)), ('usage', '=', 'internal')]],
+                {'fields': ['id', 'name', 'complete_name']}
+            )
+        except Exception as e:
+            logger.debug(f"Recherche des homonymes de {plaque} échouée: {e}")
+            continue
+        for c in candidats:
+            if c['id'] in deja or _normaliser_plaque(c.get('name')) != attendu:
+                continue
+            deja.add(c['id'])
+            homonymes.append({
+                'location_id': c['id'],
+                'location_name': c.get('complete_name') or c.get('name'),
+            })
+
+    if homonymes:
+        logger.warning(
+            f"Camion '{truck_name}' : {len(homonymes)} emplacement(s) homonyme(s) "
+            f"non retenus — {', '.join(h['location_name'] for h in homonymes)}. "
+            f"Vérifier lequel porte la marchandise."
+        )
+    return homonymes
+
+
 def _inventaire_camion(client, location_ids: list, jour: str,
                        include_empty: bool = False) -> list:
     """
@@ -4890,6 +4958,14 @@ def _inventaire_camion(client, location_ids: list, jour: str,
     - **stock_actuel**  : ce que contient physiquement le camion
     - **stock_a_livrer**: ce qui est engagé sur des livraisons en attente
     - **stock_livre**   : ce qui a effectivement été livré dans la journée
+
+    Et, sur les seules bouteilles de gaz vides, une quatrième :
+
+    - **stock_transfere** : les vides repris en station dans la journée
+
+    C'est le pendant de la ligne du même nom sur l'inventaire de session : le
+    même mouvement, vu depuis le camion qui charge au lieu de la station qui
+    se décharge. Sur tout autre produit la valeur est `null`, pas zéro.
 
     `stock_a_livrer` est lu sur les mouvements en cours plutôt que sur la
     quantité réservée des quants : Odoo ne réserve qu'à partir de l'état « Prêt »,
@@ -4963,8 +5039,64 @@ def _inventaire_camion(client, location_ids: list, jour: str,
     except Exception as e:
         logger.warning(f"Mouvements livrés illisibles: {e}")
 
+    # --- Bouteilles vides reprises dans la journée ---
+    # Le symétrique de la ligne « Stock transféré » de l'inventaire de session :
+    # là-bas les vides quittent la station, ici ils entrent dans le camion.
+    # On ne compte que les arrivées depuis un autre emplacement interne — un
+    # retour client n'est pas une reprise en station.
+    bouteilles_vides = _produits_bouteilles_vides(client)
+    transferes: dict[int, float] = {}
+    origines: dict[int, set] = {}
+    if bouteilles_vides:
+        try:
+            entrees = client.execute_kw(
+                'stock.move.line', 'search_read',
+                [[('state', '=', 'done'),
+                  ('date', '>=', f"{jour} 00:00:00"),
+                  ('date', '<=', f"{jour} 23:59:59"),
+                  ('product_id', 'in', list(bouteilles_vides)),
+                  ('location_dest_id', 'child_of', location_ids)]],
+                {'fields': ['product_id', 'quantity', 'qty_done', 'location_id']}
+            )
+
+            sources = {}
+            a_lire = set()
+            for ml in entrees:
+                src = ml.get('location_id')
+                src_id = src[0] if isinstance(src, list) else src
+                if src_id and src_id not in emplacements:
+                    a_lire.add(src_id)
+            if a_lire:
+                for loc in client.execute_kw(
+                    'stock.location', 'read', [list(a_lire)],
+                    {'fields': ['usage', 'complete_name']}
+                ):
+                    sources[loc['id']] = loc
+
+            for ml in entrees:
+                prod = ml.get('product_id')
+                if not prod:
+                    continue
+                src = ml.get('location_id')
+                src_id = src[0] if isinstance(src, list) else src
+                if src_id in emplacements:
+                    continue  # déplacement interne au camion
+                source = sources.get(src_id) or {}
+                if source.get('usage') != 'internal':
+                    continue
+                pid = prod[0] if isinstance(prod, list) else prod
+                qte = float(ml.get('quantity') or 0) or float(ml.get('qty_done') or 0)
+                if qte <= 0:
+                    continue
+                transferes[pid] = transferes.get(pid, 0.0) + qte
+                nom_source = source.get('complete_name')
+                if nom_source:
+                    origines.setdefault(pid, set()).add(nom_source)
+        except Exception as e:
+            logger.warning(f"Reprises de bouteilles vides illisibles: {e}")
+
     # --- Assemblage ---
-    tous_ids = set(actuel) | set(a_livrer) | set(livre)
+    tous_ids = set(actuel) | set(a_livrer) | set(livre) | set(transferes)
     if not tous_ids:
         return []
 
@@ -4982,7 +5114,12 @@ def _inventaire_camion(client, location_ids: list, jour: str,
         qte_a_livrer = round(a_livrer.get(pid, 0.0), 3)
         qte_livree = round(livre.get(pid, 0.0), 3)
 
-        if not include_empty and not any((qte_actuelle, qte_a_livrer, qte_livree)):
+        est_bouteille = pid in bouteilles_vides
+        qte_transferee = round(transferes.get(pid, 0.0), 3) if est_bouteille else None
+
+        if not include_empty and not any(
+            (qte_actuelle, qte_a_livrer, qte_livree, qte_transferee or 0)
+        ):
             continue
 
         lignes.append({
@@ -4997,6 +5134,14 @@ def _inventaire_camion(client, location_ids: list, jour: str,
             'stock_actuel': qte_actuelle,
             'stock_a_livrer': qte_a_livrer,
             'stock_livre': qte_livree,
+
+            # ---- Quatrième ligne, bouteilles de gaz vides seulement ----
+            # `null` ailleurs : la ligne ne s'affiche pas sur du carburant.
+            'is_gas_bottle': est_bouteille,
+            'stock_transfere': qte_transferee,
+            'transfert_origines': (
+                sorted(origines.get(pid, ())) if est_bouteille else None
+            ),
 
             # Signale une quantité négative : incohérence de données Odoo,
             # à remonter plutôt qu'à afficher telle quelle au chauffeur.
@@ -5084,6 +5229,13 @@ async def get_truck_inventory(
             data={
                 'truck_name': truck_name,
                 'locations': location_names,
+                # Emplacements portant la même plaque à l'espacement près, non
+                # retenus dans le calcul. Ils ne sont pas fusionnés d'office :
+                # chez JNP l'un porte la marchandise, l'autre les pièces
+                # détachées du véhicule. Liste non vide = à arbitrer dans Odoo.
+                'emplacements_homonymes': _emplacements_homonymes(
+                    client, truck_name, location_ids
+                ),
                 'date': jour,
                 'totals': {
                     'products_count': len(lignes),
@@ -5092,6 +5244,10 @@ async def get_truck_inventory(
                         sum(l['stock_a_livrer'] for l in lignes), 3),
                     'total_stock_livre': round(
                         sum(l['stock_livre'] for l in lignes), 3),
+                    # Bouteilles vides reprises en station dans la journée
+                    'gas_bottles_count': sum(1 for l in lignes if l['is_gas_bottle']),
+                    'total_stock_transfere': round(
+                        sum(l['stock_transfere'] or 0 for l in lignes), 3),
                     'negative_products_count': len(anomalies),
                 },
                 'products': lignes,
@@ -5227,6 +5383,8 @@ async def get_driver_inventory(
                     sum(l['stock_a_livrer'] for l in lignes_camion), 3),
                 'total_stock_livre': round(
                     sum(l['stock_livre'] for l in lignes_camion), 3),
+                'total_stock_transfere': round(
+                    sum(l['stock_transfere'] or 0 for l in lignes_camion), 3),
             })
         total_produits = sum(len(i.get('products', [])) for i in inventaires)
 
