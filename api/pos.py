@@ -1587,6 +1587,63 @@ def _apply_driver_state_filter(domain: list, state: str | None, include_pending:
     return domain
 
 
+def _equilibrer_domaine(sous_domaine: list) -> list:
+    """
+    Préfixe les `&` implicites d'un sous-domaine Odoo.
+
+    Un domaine s'écrit en notation préfixée : `[('a','=',1), ('b','=',2)]` vaut
+    « a ET b » parce qu'Odoo insère les `&` manquants. Dès qu'on veut combiner
+    ce sous-domaine avec un autre par OU, cette tolérance ne suffit plus — il
+    faut une expression unique et équilibrée, sinon les opérateurs se décalent
+    et le domaine ne veut plus rien dire.
+    """
+    feuilles = sum(1 for c in sous_domaine
+                   if isinstance(c, (list, tuple)) and len(c) == 3)
+    operateurs = sum(1 for c in sous_domaine if c in ('&', '|'))
+    manquants = max(feuilles - 1 - operateurs, 0)
+    return ['&'] * manquants + list(sous_domaine)
+
+
+def _ou_domaines(sous_domaines: list) -> list:
+    """Réunit plusieurs sous-domaines Odoo par OU."""
+    valides = [_equilibrer_domaine(d) for d in sous_domaines if d]
+    if not valides:
+        return []
+    if len(valides) == 1:
+        return valides[0]
+    combine = ['|'] * (len(valides) - 1)
+    for d in valides:
+        combine.extend(d)
+    return combine
+
+
+# Présence du champ Studio `x_studio_camion`, résolue une fois par processus.
+_cache_champ_camion: dict = {}
+
+
+def _champ_camion_disponible(client) -> bool:
+    """
+    Le champ Studio `x_studio_camion` existe-t-il sur `stock.picking` ?
+
+    Vérifié une bonne fois : glissé dans un domaine combiné alors qu'il
+    n'existe pas, il ferait échouer toute la recherche et non la seule
+    stratégie concernée.
+    """
+    if 'present' in _cache_champ_camion:
+        return _cache_champ_camion['present']
+    present = False
+    try:
+        champs = client.execute_kw('stock.picking', 'fields_get', [],
+                                   {'attributes': ['type']})
+        present = 'x_studio_camion' in champs
+    except Exception as e:
+        logger.debug(f"Champs de stock.picking illisibles: {e}")
+    _cache_champ_camion['present'] = present
+    logger.info(f"Champ x_studio_camion sur stock.picking : "
+                f"{'présent' if present else 'absent'}")
+    return present
+
+
 def _check_source_stock_availability(client, move_lines: list) -> list:
     """
     Vérifie que l'emplacement source contient physiquement les quantités déclarées.
@@ -2981,19 +3038,16 @@ async def get_transfers_by_truck(
                 'search',
                 [[('name', 'ilike', truck_name)]]
             )
-            
+
             if truck_ids_from_partner:
                 logger.info(f"Trouvé {len(truck_ids_from_partner)} partenaire(s) correspondant à '{truck_name}': {truck_ids_from_partner}")
-                # Essayer d'abord avec x_studio_camion
-                try:
+                if _champ_camion_disponible(client):
                     search_strategies.append(('x_studio_camion', [('x_studio_camion', 'in', truck_ids_from_partner)]))
-                except Exception as e:
-                    logger.debug(f"Champ x_studio_camion non disponible: {e}")
                 # Puis fallback sur partner_id
                 search_strategies.append(('partner_id', [('partner_id', 'in', truck_ids_from_partner)]))
         except Exception as e:
             logger.debug(f"Recherche dans res.partner échouée: {e}")
-        
+
         # Stratégie 2: Chercher dans location_id ou location_dest_id (emplacements du camion)
         try:
             # Chercher les emplacements qui contiennent le nom du camion
@@ -3002,62 +3056,82 @@ async def get_transfers_by_truck(
                 'search',
                 [[('name', 'ilike', truck_name)]]
             )
-            
+
             if location_ids:
                 logger.info(f"Trouvé {len(location_ids)} emplacement(s) correspondant à '{truck_name}': {location_ids}")
+                # `child_of` plutôt que `in` : un camion peut porter des
+                # sous-emplacements, et un transfert parti de l'un d'eux reste
+                # un transfert de ce camion.
                 search_strategies.append(('location', [
                     '|',
-                    ('location_id', 'in', location_ids),
-                    ('location_dest_id', 'in', location_ids)
+                    ('location_id', 'child_of', location_ids),
+                    ('location_dest_id', 'child_of', location_ids)
                 ]))
         except Exception as e:
             logger.debug(f"Recherche dans stock.location échouée: {e}")
-        
+
         # Stratégie 3: Chercher dans origin (référence du transfert)
         search_strategies.append(('origin', [('origin', 'ilike', truck_name)]))
-        
+
         # Stratégie 4: Chercher dans name (numéro du transfert)
         search_strategies.append(('name', [('name', 'ilike', truck_name)]))
-        
-        # Essayer chaque stratégie jusqu'à trouver des résultats
+
+        # --- Réunion des stratégies ---
+        #
+        # Elles étaient autrefois essayées en cascade, la première à renvoyer
+        # un résultat l'emportant. Or un camion existe à la fois comme
+        # partenaire et comme emplacement : la stratégie « partenaire »
+        # trouvait les transferts dont le camion est le destinataire, s'arrêtait
+        # là, et les bons de livraison partis de CAM/<plaque> vers un client
+        # n'étaient jamais cherchés — ils ont pourtant le client pour partenaire
+        # et le camion pour seule source.
+        #
+        # Les stratégies sont donc réunies par OU. Le décompte et la pagination
+        # portent du même coup sur l'ensemble, et non sur la seule stratégie
+        # gagnante.
         domain = []
         total_count = 0
-        
-        for strategy_name, base_conditions in search_strategies:
-            try:
-                # Créer le domaine pour tous les types de transferts
-                test_domain = create_multi_type_domain(base_conditions)
-                
-                # Ajouter les filtres optionnels.
-                # Sans état explicite, on masque les transferts en attente de
-                # validation gestionnaire (reliquats non encore libérés dans Odoo).
-                _apply_driver_state_filter(test_domain, state, include_pending)
+        strategies_retenues = []
 
-                if date_from:
-                    test_domain.append(('date', '>=', f"{date_from} 00:00:00"))
-                
-                if date_to:
-                    test_domain.append(('date', '<=', f"{date_to} 23:59:59"))
-                
-                # Tester ce domaine
-                count = client.execute_kw(
-                    'stock.picking',
-                    'search_count',
-                    [test_domain]
+        if search_strategies:
+            sous_domaines = [conditions for _, conditions in search_strategies]
+            domain = create_multi_type_domain(_ou_domaines(sous_domaines))
+            _apply_driver_state_filter(domain, state, include_pending)
+            if date_from:
+                domain.append(('date', '>=', f"{date_from} 00:00:00"))
+            if date_to:
+                domain.append(('date', '<=', f"{date_to} 23:59:59"))
+
+            try:
+                total_count = client.execute_kw('stock.picking', 'search_count', [domain])
+                strategies_retenues = [nom for nom, _ in search_strategies]
+                logger.info(
+                    f"Recherche camion '{truck_name}' — stratégies réunies "
+                    f"({', '.join(strategies_retenues)}) : {total_count} transfert(s)"
                 )
-                
-                logger.info(f"Stratégie '{strategy_name}': {count} résultat(s)")
-                
-                if count > 0:
-                    domain = test_domain
-                    total_count = count
-                    logger.info(f"✅ Utilisation de la stratégie '{strategy_name}': {count} transfert(s) trouvé(s)")
-                    break
-                    
             except Exception as e:
-                logger.warning(f"Erreur avec stratégie '{strategy_name}': {e}")
-                continue
-        
+                # Le domaine combiné a échoué : on retombe sur l'ancien
+                # comportement en cascade plutôt que de ne rien renvoyer.
+                logger.warning(f"Domaine combiné refusé par Odoo ({e}) — repli en cascade")
+                domain, total_count = [], 0
+                for strategy_name, base_conditions in search_strategies:
+                    try:
+                        test_domain = create_multi_type_domain(base_conditions)
+                        _apply_driver_state_filter(test_domain, state, include_pending)
+                        if date_from:
+                            test_domain.append(('date', '>=', f"{date_from} 00:00:00"))
+                        if date_to:
+                            test_domain.append(('date', '<=', f"{date_to} 23:59:59"))
+                        count = client.execute_kw('stock.picking', 'search_count', [test_domain])
+                        logger.info(f"Stratégie '{strategy_name}': {count} résultat(s)")
+                        if count > 0:
+                            domain, total_count = test_domain, count
+                            strategies_retenues = [strategy_name]
+                            break
+                    except Exception as err:
+                        logger.warning(f"Erreur avec stratégie '{strategy_name}': {err}")
+                        continue
+
         # Si aucun résultat trouvé avec toutes les options
         if total_count == 0:
             # Construire un domaine de base pour le message (avec tous les types demandés)
