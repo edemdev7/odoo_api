@@ -37,7 +37,31 @@ from core.odoo_client import OdooClient  # noqa: E402
 
 LARGEUR = 92
 
-CATEG_BOUTEILLES_VIDES = [86]
+MOTIF_BOUTEILLE_VIDE = 'BOUTEILLE VIDE'
+MOTIFS_HORS_PERIMETRE = ('HORS USAGE', 'REBUT', 'FERRAILLE')
+
+
+def bouteilles_vides(client):
+    """
+    Bouteilles consignees, hors rebut.
+
+    Le nom fait foi : la categorie 86 s'appelle « BOUTEILLES VIDES DE GAZ »
+    mais ne contient que des bouteilles hors usage, tandis que les vraies
+    consignees sont rangees en categorie 85.
+    """
+    ids = set()
+    try:
+        for p in client.execute_kw(
+            'product.product', 'search_read',
+            [[('name', 'ilike', MOTIF_BOUTEILLE_VIDE)]], {'fields': ['id', 'name']}
+        ):
+            nom = (p.get('name') or '').upper()
+            if any(m in nom for m in MOTIFS_HORS_PERIMETRE):
+                continue
+            ids.add(p['id'])
+    except Exception as e:
+        print(f"  Produits « bouteille vide » illisibles: {e}")
+    return ids
 
 
 def titre(t):
@@ -49,24 +73,6 @@ def titre(t):
 
 def normaliser(valeur):
     return ''.join(c for c in (valeur or '').upper() if c.isalnum())
-
-
-def bouteilles_vides(client):
-    ids = set()
-    try:
-        categories = list(CATEG_BOUTEILLES_VIDES)
-        for cid in client.execute_kw(
-            'product.category', 'search', [[('name', 'ilike', 'BOUTEILLES VIDES')]]
-        ):
-            if cid not in categories:
-                categories.append(cid)
-        ids.update(client.execute_kw(
-            'product.product', 'search', [[('categ_id', 'in', categories)]]))
-        ids.update(client.execute_kw(
-            'product.product', 'search', [[('name', 'ilike', 'BOUTEILLE VIDE')]]))
-    except Exception as e:
-        print(f"  Produits « bouteille vide » illisibles: {e}")
-    return ids
 
 
 def main():
@@ -281,25 +287,58 @@ def derniers_mouvements(client, camion, emplacements, jours=10):
         print("  ni valide ni en attente. Le transfert n'a pas touche ce camion.")
         return
 
+    # Le stock.move annonce un trajet, ses lignes en executent un autre quand
+    # le type d'operation impose son emplacement par defaut. Ce sont les
+    # lignes qui deplacent les quants : on affiche l'ecart plutot que de
+    # laisser croire au trajet annonce.
+    lignes_par_move = {}
+    try:
+        for ml in client.execute_kw(
+            'stock.move.line', 'search_read',
+            [[('move_id', 'in', [m['id'] for m in moves])]],
+            {'fields': ['move_id', 'location_id', 'location_dest_id', 'quantity']}
+        ):
+            mv = ml.get('move_id')
+            lignes_par_move.setdefault(
+                mv[0] if isinstance(mv, list) else mv, []).append(ml)
+    except Exception as e:
+        print(f"  Lignes de mouvement illisibles: {e}")
+
+    def nom(valeur):
+        return valeur[1] if isinstance(valeur, list) else '?'
+
     print(f"  {'Date':<17} {'Etat':<10} {'Produit':<28} {'Qte':>7}  Trajet")
     print("  " + "-" * (LARGEUR - 4))
     en_attente = 0
+    desaccords = 0
     for m in moves:
         prod = m.get('product_id')
-        src = m.get('location_id')
-        dst = m.get('location_dest_id')
         qte = m.get('quantity') or m.get('product_uom_qty') or 0
         etat = m.get('state')
         if etat != 'done':
             en_attente += 1
         print(f"  {str(m.get('date'))[:17]:<17} {etat:<10} "
               f"{(prod[1] if isinstance(prod, list) else '?')[:28]:<28} {qte:>7g}  "
-              f"{(src[1] if isinstance(src, list) else '?')} -> "
-              f"{(dst[1] if isinstance(dst, list) else '?')}")
+              f"{nom(m.get('location_id'))} -> {nom(m.get('location_dest_id'))}")
         pick = m.get('picking_id')
         if pick:
             print(f"  {'':<17} {'':<10} transfert : "
                   f"{pick[1] if isinstance(pick, list) else pick}")
+
+        for ml in lignes_par_move.get(m['id'], []):
+            if (nom(ml.get('location_id')) != nom(m.get('location_id'))
+                    or nom(ml.get('location_dest_id')) != nom(m.get('location_dest_id'))):
+                desaccords += 1
+                print(f"  {'':<17} {'':<10} >>> la LIGNE deplace en realite "
+                      f"{nom(ml.get('location_id'))} -> "
+                      f"{nom(ml.get('location_dest_id'))}")
+
+    if desaccords:
+        print(f"""
+  >>> {desaccords} ligne(s) ne suivent pas le trajet annonce par leur
+      mouvement. Le type d'operation a impose son emplacement par defaut.
+      Ce sont les LIGNES qui deplacent les quants : c'est leur trajet qui
+      fait foi, et celui que l'API rapporte.""")
 
     if en_attente:
         print(f"""

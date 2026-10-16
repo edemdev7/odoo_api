@@ -4762,10 +4762,21 @@ async def receive_delivery_note(
 # À ne pas confondre avec une vente de bouteille vide : celle-ci part vers
 # `Partners/Customers`, pas vers un camion ou un magasin.
 
-# Catégorie « BOUTEILLES VIDES DE GAZ ». L'identifiant est connu, mais une
-# recherche par libellé le rattrape si la base change.
-_CATEG_BOUTEILLES_VIDES = [86]
-_LIBELLE_CATEG_BOUTEILLES_VIDES = 'BOUTEILLES VIDES'
+# Le nom fait foi, pas la catégorie. C'est contre-intuitif, et c'est pourtant
+# la seule règle juste sur cette base : la catégorie 86 s'appelle « BOUTEILLES
+# VIDES DE GAZ » mais ne contient que des `GAZ/BOUTEILLE HORS USAGE`, des
+# bouteilles au rebut qui ne repartiront jamais en centre emplisseur. Les
+# consignées — 6, 12.5, 47 et 50 KG — sont rangées en catégorie 85,
+# « ACCESSOIRES DE BOUTEILLES DE GAZ ».
+#
+# Se fier au libellé de la catégorie faisait donc compter les rebuts et
+# manquer les vraies bouteilles. On s'appuie sur le nom du produit, quitte à
+# le rendre paramétrable si la convention change.
+_MOTIF_BOUTEILLE_VIDE = 'BOUTEILLE VIDE'
+
+# Une bouteille hors usage porte « BOUTEILLE » et finit au rebut : elle n'est
+# pas une reprise.
+_MOTIFS_HORS_PERIMETRE = ('HORS USAGE', 'REBUT', 'FERRAILLE')
 
 # Résolu une fois par processus : le catalogue ne bouge pas en cours de service.
 _cache_bouteilles_vides: dict = {}
@@ -4773,39 +4784,56 @@ _cache_bouteilles_vides: dict = {}
 
 def _produits_bouteilles_vides(client) -> set:
     """
-    Identifiants des produits « bouteille vide de gaz ».
+    Identifiants des bouteilles de gaz vides consignées.
 
-    La catégorie fait foi. Le repli par libellé couvre le cas d'une base où
-    l'identifiant diffère — une franchise, un environnement de test — plutôt
-    que de rendre la fonctionnalité muette sans rien dire.
+    Deux variables d'environnement permettent de reprendre la main sans
+    toucher au code, une base pouvant nommer ses produits autrement :
+
+    - `POS_GAS_EMPTY_PRODUCT_IDS` : liste d'identifiants, qui fait alors foi
+    - `POS_GAS_EMPTY_CATEG_IDS`   : catégories à ajouter à la recherche
+
+    Sans elles, la règle est le nom du produit, duquel on retire les
+    bouteilles hors usage.
     """
     if 'ids' in _cache_bouteilles_vides:
         return _cache_bouteilles_vides['ids']
 
+    fixes = os.getenv("POS_GAS_EMPTY_PRODUCT_IDS", "").strip()
+    if fixes:
+        ids = {int(x) for x in fixes.replace(' ', '').split(',') if x.isdigit()}
+        _cache_bouteilles_vides['ids'] = ids
+        logger.info(f"Bouteilles vides imposées par configuration : {sorted(ids)}")
+        return ids
+
     ids: set = set()
-
     try:
-        categories = list(_CATEG_BOUTEILLES_VIDES)
-        trouvees = client.execute_kw(
-            'product.category', 'search',
-            [[('name', 'ilike', _LIBELLE_CATEG_BOUTEILLES_VIDES)]]
+        candidats = client.execute_kw(
+            'product.product', 'search_read',
+            [[('name', 'ilike', _MOTIF_BOUTEILLE_VIDE)]],
+            {'fields': ['id', 'name']}
         )
-        for cid in trouvees:
-            if cid not in categories:
-                categories.append(cid)
 
-        produits = client.execute_kw(
-            'product.product', 'search',
-            [[('categ_id', 'in', categories)]]
-        )
-        ids.update(produits)
+        categories = [int(x) for x in
+                      os.getenv("POS_GAS_EMPTY_CATEG_IDS", "").replace(' ', '').split(',')
+                      if x.isdigit()]
+        if categories:
+            candidats += client.execute_kw(
+                'product.product', 'search_read',
+                [[('categ_id', 'in', categories)]], {'fields': ['id', 'name']}
+            )
 
-        # Repli par nom : un produit mal catégorisé reste une bouteille vide.
-        orphelins = client.execute_kw(
-            'product.product', 'search',
-            [[('name', 'ilike', 'BOUTEILLE VIDE')]]
-        )
-        ids.update(orphelins)
+        rejetes = []
+        for p in candidats:
+            nom = (p.get('name') or '').upper()
+            if any(motif in nom for motif in _MOTIFS_HORS_PERIMETRE):
+                rejetes.append(p['name'])
+                continue
+            ids.add(p['id'])
+
+        if rejetes:
+            logger.info(
+                f"Bouteilles hors périmètre écartées : {sorted(set(rejetes))}"
+            )
     except Exception as e:
         logger.warning(f"Produits « bouteille vide » illisibles: {e}")
 

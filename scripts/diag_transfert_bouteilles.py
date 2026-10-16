@@ -48,28 +48,28 @@ LARGEUR = 92
 # l'identique. Si la regle change dans pos.py, elle doit changer ici aussi —
 # c'est le prix d'un script qui tourne partout.
 
-CATEG_BOUTEILLES_VIDES = [86]
-LIBELLE_CATEG_BOUTEILLES_VIDES = 'BOUTEILLES VIDES'
+MOTIF_BOUTEILLE_VIDE = 'BOUTEILLE VIDE'
+MOTIFS_HORS_PERIMETRE = ('HORS USAGE', 'REBUT', 'FERRAILLE')
 
 
-def produits_bouteilles_vides(client) -> set:
-    """Identifiants des produits « bouteille vide de gaz »."""
-    ids: set = set()
+def bouteilles_vides(client):
+    """
+    Bouteilles consignees, hors rebut.
+
+    Le nom fait foi : la categorie 86 s'appelle « BOUTEILLES VIDES DE GAZ »
+    mais ne contient que des bouteilles hors usage, tandis que les vraies
+    consignees sont rangees en categorie 85.
+    """
+    ids = set()
     try:
-        categories = list(CATEG_BOUTEILLES_VIDES)
-        for cid in client.execute_kw(
-            'product.category', 'search',
-            [[('name', 'ilike', LIBELLE_CATEG_BOUTEILLES_VIDES)]]
+        for p in client.execute_kw(
+            'product.product', 'search_read',
+            [[('name', 'ilike', MOTIF_BOUTEILLE_VIDE)]], {'fields': ['id', 'name']}
         ):
-            if cid not in categories:
-                categories.append(cid)
-
-        ids.update(client.execute_kw(
-            'product.product', 'search', [[('categ_id', 'in', categories)]]
-        ))
-        ids.update(client.execute_kw(
-            'product.product', 'search', [[('name', 'ilike', 'BOUTEILLE VIDE')]]
-        ))
+            nom = (p.get('name') or '').upper()
+            if any(m in nom for m in MOTIFS_HORS_PERIMETRE):
+                continue
+            ids.add(p['id'])
     except Exception as e:
         print(f"  Produits « bouteille vide » illisibles: {e}")
     return ids
@@ -188,7 +188,7 @@ def analyser(client, emplacement, depuis, libelle_periode, entete=''):
         print("  ATTENTION : emplacement resolu par repli sur l'entrepot du siege.")
         print("  Les quantites ci-dessous ne refletent pas cette station.\n")
 
-    bouteilles = produits_bouteilles_vides(client)
+    bouteilles = bouteilles_vides(client)
     if not bouteilles:
         print("  Aucun produit « bouteille vide » identifie. Rien a calculer.")
         return
