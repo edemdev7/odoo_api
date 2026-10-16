@@ -5413,6 +5413,258 @@ async def get_driver_inventory(
         )
 
 
+# ===== HISTORIQUE DES SESSIONS =====
+
+# États d'une commande réellement aboutie. Un panier en cours ou une vente
+# annulée ne doit pas peser dans un cumul de ventes.
+_ETATS_VENTE_ABOUTIE = ['paid', 'done', 'invoiced']
+
+
+def _ventes_par_session(client, session_ids: list) -> dict:
+    """Cumuls de ventes par session : nombre de commandes et montants."""
+    cumuls = {sid: {'orders_count': 0, 'amount_total': 0.0,
+                    'amount_paid': 0.0, 'amount_return': 0.0}
+              for sid in session_ids}
+    if not session_ids:
+        return cumuls
+    try:
+        lignes = client.execute_kw(
+            'pos.order', 'read_group',
+            [[('session_id', 'in', session_ids),
+              ('state', 'in', _ETATS_VENTE_ABOUTIE)],
+             ['amount_total', 'amount_paid', 'amount_return'],
+             ['session_id']],
+            {'lazy': False}
+        )
+        for l in lignes:
+            sess = l.get('session_id')
+            sid = sess[0] if isinstance(sess, list) else sess
+            if sid not in cumuls:
+                continue
+            cumuls[sid] = {
+                'orders_count': int(l.get('__count') or 0),
+                'amount_total': round(float(l.get('amount_total') or 0), 2),
+                'amount_paid': round(float(l.get('amount_paid') or 0), 2),
+                'amount_return': round(float(l.get('amount_return') or 0), 2),
+            }
+    except Exception as e:
+        logger.warning(f"Cumuls de ventes illisibles: {e}")
+    return cumuls
+
+
+def _paiements_par_session(client, session_ids: list) -> dict:
+    """
+    Répartition par moyen de paiement, session par session.
+
+    `pos.payment` porte un champ `session_id` related ; s'il venait à
+    disparaître d'une version à l'autre, la répartition est simplement
+    omise — elle enrichit la réponse sans la conditionner.
+    """
+    par_session: dict = {sid: [] for sid in session_ids}
+    if not session_ids:
+        return par_session
+    try:
+        lignes = client.execute_kw(
+            'pos.payment', 'read_group',
+            [[('session_id', 'in', session_ids)],
+             ['amount'],
+             ['session_id', 'payment_method_id']],
+            {'lazy': False}
+        )
+        for l in lignes:
+            sess = l.get('session_id')
+            sid = sess[0] if isinstance(sess, list) else sess
+            if sid not in par_session:
+                continue
+            methode = l.get('payment_method_id')
+            par_session[sid].append({
+                'payment_method_id': methode[0] if isinstance(methode, list) else methode,
+                'payment_method': methode[1] if isinstance(methode, list) else None,
+                'amount': round(float(l.get('amount') or 0), 2),
+                'count': int(l.get('__count') or 0),
+            })
+        for sid in par_session:
+            par_session[sid].sort(key=lambda p: p['amount'], reverse=True)
+    except Exception as e:
+        logger.warning(f"Répartition par moyen de paiement illisible: {e}")
+    return par_session
+
+
+def _produits_vendus_session(client, session_id: int) -> list:
+    """
+    Quantités et montants par produit sur une session.
+
+    `pos.order.line` ne porte pas la session : le regroupement se fait donc
+    session par session, ce qui coûte un appel chacune. C'est la raison pour
+    laquelle le détail produit n'est calculé que sur demande.
+    """
+    try:
+        lignes = client.execute_kw(
+            'pos.order.line', 'read_group',
+            [[('order_id.session_id', '=', session_id),
+              ('order_id.state', 'in', _ETATS_VENTE_ABOUTIE)],
+             ['qty', 'price_subtotal_incl'],
+             ['product_id']],
+            {'lazy': False}
+        )
+    except Exception as e:
+        logger.warning(f"Produits vendus de la session {session_id} illisibles: {e}")
+        return []
+
+    produits = []
+    for l in lignes:
+        prod = l.get('product_id')
+        produits.append({
+            'product_id': prod[0] if isinstance(prod, list) else prod,
+            'product_name': prod[1] if isinstance(prod, list) else None,
+            'quantity_sold': round(float(l.get('qty') or 0), 3),
+            'amount_sold': round(float(l.get('price_subtotal_incl') or 0), 2),
+            'lines_count': int(l.get('__count') or 0),
+        })
+    produits.sort(key=lambda p: p['amount_sold'], reverse=True)
+    return produits
+
+
+@router.get("/{pos_id}/sessions/recent", response_model=ApiResponse)
+async def get_recent_sessions_sales(
+    pos_id: int = Path(..., description="ID du point de vente"),
+    limit: int = Query(6, ge=1, le=50, description="Nombre de sessions à remonter"),
+    include_open: bool = Query(
+        True, description="Inclure la session en cours si elle existe"
+    ),
+    before_session_id: Optional[int] = Query(
+        None,
+        description=(
+            "Ne remonter que les sessions antérieures à celle-ci. Permet de "
+            "paginer vers le passé sans manipuler de dates."
+        )
+    ),
+    include_products: bool = Query(
+        False,
+        description=(
+            "Ajouter le détail par produit. Un appel Odoo par session : à "
+            "réserver à un écran de consultation, pas à un rafraîchissement."
+        )
+    ),
+    current_user: dict = Depends(require_scope("pos"))
+):
+    """
+    Ventes des dernières sessions d'un point de vente.
+
+    Répond au besoin du gérant qui veut comparer sa journée aux précédentes
+    sans ouvrir Odoo. Les sessions sont rendues de la plus récente à la plus
+    ancienne, chacune avec son nombre de commandes, ses montants et la
+    répartition par moyen de paiement.
+
+    Seules les commandes abouties sont comptées — un panier resté ouvert ou
+    une vente annulée ne gonfle pas le chiffre.
+
+    `include_products=true` ajoute le détail par produit, au prix d'un appel
+    Odoo par session.
+
+    Pour remonter plus loin, rappeler la route avec `before_session_id` égal à
+    l'identifiant de la plus ancienne session reçue.
+    """
+    try:
+        client = get_odoo_client(current_user)
+
+        config = client.execute_kw(
+            'pos.config', 'search_read', [[('id', '=', pos_id)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        if not config:
+            raise HTTPException(status_code=404, detail=f"Point de vente {pos_id} non trouvé")
+        pos_name = config[0].get('name')
+
+        domaine = [('config_id', '=', pos_id)]
+        if not include_open:
+            domaine.append(('state', '=', 'closed'))
+        if before_session_id:
+            domaine.append(('id', '<', before_session_id))
+
+        sessions = client.execute_kw(
+            'pos.session', 'search_read', [domaine],
+            {'fields': ['id', 'name', 'state', 'start_at', 'stop_at', 'user_id',
+                        'cash_register_balance_start', 'cash_register_balance_end_real'],
+             'limit': limit, 'order': 'id desc'}
+        )
+        if not sessions:
+            return ApiResponse(
+                success=True,
+                data={'pos_id': pos_id, 'pos_name': pos_name, 'sessions': [],
+                      'totals': {'sessions_count': 0, 'orders_count': 0,
+                                 'amount_total': 0.0}},
+                count=0,
+                message=f"Aucune session pour le point de vente '{pos_name}'"
+            )
+
+        session_ids = [s['id'] for s in sessions]
+        ventes = _ventes_par_session(client, session_ids)
+        paiements = _paiements_par_session(client, session_ids)
+
+        lignes = []
+        for s in sessions:
+            sid = s['id']
+            cumul = ventes.get(sid, {})
+            vendeur = s.get('user_id')
+            ligne = {
+                'session_id': sid,
+                'name': s.get('name'),
+                'state': s.get('state'),
+                'start_at': s.get('start_at'),
+                'stop_at': s.get('stop_at') or None,
+                'user': vendeur[1] if isinstance(vendeur, list) else None,
+                'orders_count': cumul.get('orders_count', 0),
+                'amount_total': cumul.get('amount_total', 0.0),
+                'amount_paid': cumul.get('amount_paid', 0.0),
+                'amount_return': cumul.get('amount_return', 0.0),
+                'cash_start': round(float(s.get('cash_register_balance_start') or 0), 2),
+                'cash_end': round(float(s.get('cash_register_balance_end_real') or 0), 2),
+                'payments': paiements.get(sid, []),
+            }
+            if include_products:
+                ligne['products'] = _produits_vendus_session(client, sid)
+            lignes.append(ligne)
+
+        total_commandes = sum(l['orders_count'] for l in lignes)
+        total_montant = round(sum(l['amount_total'] for l in lignes), 2)
+
+        logger.info(
+            f"Historique sessions PDV {pos_id} ({pos_name}) : {len(lignes)} session(s), "
+            f"{total_commandes} commande(s), {total_montant}"
+        )
+
+        return ApiResponse(
+            success=True,
+            data={
+                'pos_id': pos_id,
+                'pos_name': pos_name,
+                'sessions': lignes,
+                'totals': {
+                    'sessions_count': len(lignes),
+                    'orders_count': total_commandes,
+                    'amount_total': total_montant,
+                },
+                # À repasser en `before_session_id` pour la page suivante.
+                'oldest_session_id': lignes[-1]['session_id'] if lignes else None,
+            },
+            count=len(lignes),
+            message=(
+                f"{len(lignes)} session(s) — {total_commandes} commande(s), "
+                f"{total_montant} au total"
+            )
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur historique sessions PDV {pos_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des sessions: {str(e)}"
+        )
+
+
 # ===== ÉVOLUTION DES STOCKS PAR SESSION =====
 
 @router.get("/sessions/{session_id}/stock-evolution", response_model=ApiResponse)
