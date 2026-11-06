@@ -35,15 +35,11 @@ try:
 except AttributeError:
     pass
 
-LARGEUR = 92
-RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Valeurs de repli, identiques a celles de core/config.py.
-DEFAUTS = {
-    'ODOO_DB1_URL': 'https://holdingithiel-dagbehami-statging-012026-40829916.dev.odoo.com/',
-    'ODOO_DB1_NAME': 'holdingithiel-dagbehami-statging-012026-40829916',
-    'ODOO_DB1_USERNAME': 'api@jnpgroupe.com',
-}
+from _odoo_direct import connexion  # noqa: E402
+
+LARGEUR = 92
 
 
 def titre(t):
@@ -53,44 +49,11 @@ def titre(t):
     print("=" * LARGEUR)
 
 
-def lire_env():
-    """Charge le .env sans dependre de python-dotenv."""
-    valeurs = {}
-    chemin = os.path.join(RACINE, '.env')
-    if os.path.exists(chemin):
-        with open(chemin, encoding='utf-8', errors='replace') as f:
-            for ligne in f:
-                ligne = ligne.strip()
-                if not ligne or ligne.startswith('#') or '=' not in ligne:
-                    continue
-                cle, valeur = ligne.split('=', 1)
-                valeurs[cle.strip()] = valeur.strip().strip('"').strip("'")
-    else:
-        print(f"  (.env introuvable dans {RACINE} — repli sur les defauts)")
-
-    def lire(cle):
-        return os.getenv(cle) or valeurs.get(cle) or DEFAUTS.get(cle, '')
-
-    return (lire('ODOO_DB1_URL').rstrip('/'), lire('ODOO_DB1_NAME'),
-            lire('ODOO_DB1_USERNAME'), lire('ODOO_DB1_API_KEY'))
-
 
 def main():
     partner_id = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 35683
 
-    url, db, user, cle = lire_env()
-    if not cle:
-        raise SystemExit("ODOO_DB1_API_KEY absente du .env et de l'environnement.")
-
-    print(f"Connexion a {db}...")
-    commun = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
-    uid = commun.authenticate(db, user, cle, {})
-    if not uid:
-        raise SystemExit("Authentification refusee.")
-    modeles = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
-
-    def appel(modele, methode, args, kwargs=None):
-        return modeles.execute_kw(db, uid, cle, modele, methode, args, kwargs or {})
+    appel = connexion()
 
     # ------------------------------------------------------------------
     # 1. Champs de credit disponibles

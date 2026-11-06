@@ -98,6 +98,69 @@ def find_tvpass_product(client: OdooClient, product_id: Optional[int] = None) ->
     return None
 
 
+# Résolue une fois par processus : la condition de paiement ne change pas en
+# cours d'exécution.
+_cache_condition_immediate: dict = {}
+
+
+def condition_paiement_immediate(client: OdooClient):
+    """
+    Condition de paiement « immédiat », ou None si la base n'en a pas.
+
+    Un rechargement est réglé avant d'être livré : il n'y a pas de délai de
+    paiement à accorder. Odoo laisse pourtant ce champ vide quand le client
+    n'en porte pas, et la configuration de JNP le rend obligatoire — le bon
+    de commande devient alors inéditable, avec « Champs invalides :
+    Conditions de paiement », ce qui empêche d'atteindre la facture.
+
+    `ACCOUNTING_PAYMENT_TERM_ID` permet d'imposer une autre condition.
+    """
+    if 'id' in _cache_condition_immediate:
+        return _cache_condition_immediate['id']
+
+    fixe = os.getenv("ACCOUNTING_PAYMENT_TERM_ID", "").strip()
+    if fixe.isdigit():
+        _cache_condition_immediate['id'] = int(fixe)
+        return int(fixe)
+
+    terme_id = None
+
+    # L'identifiant externe d'Odoo est le plus fiable : il ne dépend ni de
+    # la langue de la base ni du libellé choisi par l'exploitant.
+    try:
+        donnees = client.execute_kw(
+            'ir.model.data', 'search_read',
+            [[('module', '=', 'account'),
+              ('name', '=', 'account_payment_term_immediate')]],
+            {'fields': ['res_id'], 'limit': 1}
+        )
+        if donnees:
+            terme_id = donnees[0]['res_id']
+    except Exception as e:
+        logger.debug(f"Identifiant externe de la condition immédiate illisible: {e}")
+
+    # Repli par libellé, pour une base où l'enregistrement a été recréé.
+    if not terme_id:
+        for libelle in ('Paiement immédiat', 'Immediate Payment', 'Comptant'):
+            try:
+                trouve = client.execute_kw(
+                    'account.payment.term', 'search',
+                    [[('name', '=ilike', libelle)]], {'limit': 1}
+                )
+                if trouve:
+                    terme_id = trouve[0]
+                    break
+            except Exception as e:
+                logger.debug(f"Recherche de la condition « {libelle} » échouée: {e}")
+
+    _cache_condition_immediate['id'] = terme_id
+    logger.info(
+        f"Condition de paiement des rechargements : "
+        f"{terme_id or 'aucune trouvée — champ laissé vide'}"
+    )
+    return terme_id
+
+
 def create_sale_order(client: OdooClient, partner_id: int, product: dict,
                       amount: float, reference: str, date: str,
                       description: str) -> int:
@@ -141,6 +204,13 @@ def create_sale_order(client: OdooClient, partner_id: int, product: dict,
         'client_order_ref': reference,
         'order_line': [(0, 0, order_line_vals)],
     }
+
+    # Le rechargement est payé d'avance : la condition de paiement est
+    # immédiate. Sans elle, le bon de commande reste en « champ invalide »
+    # et la facture devient inaccessible depuis l'interface.
+    terme = condition_paiement_immediate(client)
+    if terme:
+        order_vals['payment_term_id'] = terme
 
     logger.info(f"📝 Création commande de vente: partner={partner_id}, produit={product['name']}, montant={amount}")
     order_id = client.execute_kw('sale.order', 'create', [order_vals])
@@ -209,6 +279,13 @@ def create_invoice_from_order(client: OdooClient, order_id: int) -> int:
         'ref': order.get('client_order_ref') or order['name'],
         'invoice_line_ids': invoice_lines,
     }
+
+    # Même condition de paiement que la commande dont elle découle : sans
+    # elle, la facture porte une échéance héritée du client et son état de
+    # règlement devient incohérent avec un rechargement payé d'avance.
+    terme = condition_paiement_immediate(client)
+    if terme:
+        invoice_vals['invoice_payment_term_id'] = terme
 
     logger.info(f"📝 Création facture pour commande {order['name']}...")
     invoice_id = client.execute_kw('account.move', 'create', [invoice_vals])
