@@ -2,12 +2,17 @@
 """
 Rattache des moyens de paiement a un point de vente.
 
-L'interface Odoo verrouille ce champ tant qu'une session est ouverte. La
-restriction est portee par la vue, pas par le modele : un ecriture XML-RPC
-passe donc sans avoir a fermer la caisse.
+ATTENTION : Odoo refuse de modifier les moyens de paiement d'un PdV tant
+qu'une session y est ouverte. La contrainte est portee par le MODELE, pas
+par la vue — XML-RPC ne la contourne pas. Il faut donc fermer la caisse,
+rattacher, puis la rouvrir :
+
+    POST /pos/{pos_id}/close-session
+    python3 scripts/ajouter_moyens_paiement.py 32 "carte jnp pass" --appliquer
+    POST /pos/{pos_id}/open-session
 
 Usage :
-    cd ~/odoo_api
+    cd ~/Documents/projects/odoo_api
     python3 scripts/ajouter_moyens_paiement.py 32                    # inventaire
     python3 scripts/ajouter_moyens_paiement.py 32 kkiapay token      # simulation
     python3 scripts/ajouter_moyens_paiement.py 32 kkiapay token --appliquer
@@ -151,9 +156,21 @@ def main():
         )
     except Exception as e:
         print(f"\n  Echec de l'ecriture : {e}")
-        print("""
-  Si le message evoque une session ouverte, il faudra la fermer : la
-  contrainte est alors portee par le modele et non par la vue.
+        if 'session' in str(e).lower():
+            nom_session = (session[1] if isinstance(session, list)
+                           else 'inconnue')
+            print(f"""
+  Une session est ouverte sur ce PdV : {nom_session}
+
+  Odoo porte cette contrainte sur le modele, pas sur la vue : XML-RPC ne la
+  contourne pas. Fermer la caisse, rattacher, rouvrir :
+
+      curl -X POST "$API/pos/{pos_id}/close-session" -H "Authorization: Bearer $TOKEN" \\
+           -H "Content-Type: application/json" -d '{{"ending_balance": 0}}'
+
+      python3 scripts/ajouter_moyens_paiement.py {pos_id} {' '.join(recherches)} --appliquer
+
+  Puis rouvrir la session depuis l'application.
 """)
         sys.exit(1)
 

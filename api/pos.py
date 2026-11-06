@@ -8695,18 +8695,17 @@ async def add_payment_to_order(
 
         if is_complete:
             client.execute_kw('pos.order', 'write', [[order_id], {
-                'state': 'paid',
                 'amount_return': amount_return,
             }])
             payment_status = 'paid'
             logger.info(f"Commande {order_id} soldée — payé: {new_paid}, rendu: {amount_return}")
 
-            # Déclencher le mouvement de stock (diminue les quantités en solde)
-            try:
-                client.execute_kw('pos.order', 'action_pos_order_picking', [[order_id]])
-                logger.info(f"Mouvement de stock créé pour commande {order_id}")
-            except Exception as stock_err:
-                logger.warning(f"Mouvement de stock non créé pour commande {order_id}: {stock_err}")
+            # Solder et déstocker en une seule opération.
+            if not _solder_commande(client, order_id):
+                logger.warning(
+                    f"⚠️ Commande {order_id} encaissée sans déstockage. "
+                    f"Le stock de la station ne reflète pas cette vente."
+                )
 
             # Facturer si le règlement sort du périmètre token / carte.
             # L'échec de la facturation ne remet pas en cause l'encaissement :
@@ -8791,6 +8790,59 @@ def _moyens_paiement_commande(client, order_id: int) -> list:
         if isinstance(methode, list) and len(methode) > 1:
             libelles.append(methode[1])
     return libelles
+
+
+def _solder_commande(client, order_id: int) -> bool:
+    """
+    Passe une commande en « payé » et déclenche son mouvement de stock.
+
+    `action_pos_order_paid` est le point d'entrée officiel : il vérifie que
+    le règlement couvre bien le total, bascule l'état, **et** crée le
+    picking. Écrire `state = 'paid'` à la main saute cette dernière étape,
+    et la vente ne déstocke jamais.
+
+    Le code appelait auparavant `action_pos_order_picking`, une méthode qui
+    n'existe pas sur `pos.order` : l'appel échouait à chaque vente, et
+    l'erreur étant avalée par un `except`, personne ne l'a vu pendant des
+    mois. La méthode qui crée réellement le picking, `_create_order_picking`,
+    est privée et donc inaccessible en XML-RPC — d'où le passage par
+    l'action publique.
+
+    Retourne True si le déstockage a bien eu lieu.
+    """
+    try:
+        client.execute_kw('pos.order', 'action_pos_order_paid', [[order_id]])
+    except Exception as e:
+        logger.warning(
+            f"action_pos_order_paid refusée pour la commande {order_id}: {e} "
+            f"— bascule en 'paid' sans déstockage"
+        )
+        try:
+            client.execute_kw('pos.order', 'write', [[order_id], {'state': 'paid'}])
+        except Exception as err:
+            logger.error(f"Commande {order_id} non soldée: {err}")
+        return False
+
+    # Vérifier que le picking existe réellement : l'action peut aboutir sans
+    # rien créer si le point de vente n'a pas de type d'opération configuré.
+    try:
+        pickings = client.execute_kw(
+            'stock.picking', 'search_count', [[('pos_order_id', '=', order_id)]]
+        )
+        if pickings:
+            logger.info(
+                f"Commande {order_id} soldée et déstockée ({pickings} transfert(s))"
+            )
+            return True
+        logger.warning(
+            f"Commande {order_id} soldée mais aucun transfert de stock créé — "
+            f"vérifier le type d'opération du point de vente"
+        )
+    except Exception as e:
+        logger.debug(f"Vérification du picking impossible pour {order_id}: {e}")
+        return True  # l'action est passée, on ne crie pas sur un doute de lecture
+
+    return False
 
 
 def _doit_facturer(client, order_id: int) -> tuple:
