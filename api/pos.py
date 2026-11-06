@@ -8711,17 +8711,18 @@ async def add_payment_to_order(
             # L'échec de la facturation ne remet pas en cause l'encaissement :
             # la vente est faite, la facture pourra être régénérée à la demande.
             try:
-                a_facturer, moyens = _doit_facturer(client, order_id)
+                a_facturer, motif = _doit_facturer(client, order_id)
                 if a_facturer:
                     invoice_id = _assurer_facture(client, order_id)
                     logger.info(
-                        f"Commande {order_id} facturée ({', '.join(moyens)}) "
-                        f"→ facture {invoice_id}"
+                        f"Commande {order_id} facturée — {motif} → facture {invoice_id}"
                     )
                 else:
+                    # Sans facture, la vente est reprise dans l'écriture
+                    # récapitulative du journal POS à la clôture de session.
                     logger.info(
-                        f"Commande {order_id} non facturée — "
-                        f"règlement {', '.join(moyens) or 'inconnu'}"
+                        f"Commande {order_id} non facturée — {motif} "
+                        f"(comptabilisée à la clôture, journal du point de vente)"
                     )
             except Exception as fact_err:
                 logger.warning(
@@ -8761,10 +8762,30 @@ async def add_payment_to_order(
 
 
 # ===== FACTURATION DES VENTES POS =====
+#
+# Une vente comptoir n'est pas facturée par défaut, et ce n'est pas un oubli :
+# c'est le fonctionnement natif d'Odoo, et celui que demande la comptabilité
+# de JNP. À la clôture de session, Odoo poste une écriture récapitulative dans
+# le journal du point de vente — débit caisse, crédit ventes — sans créer la
+# moindre créance.
+#
+# Facturer chaque plein produisait l'inverse : une facture par vente dans le
+# journal des ventes, une créance sur le client collectif « Comptant » que
+# personne ne lettrait, et à terme le blocage de la limite de crédit qui a
+# empêché toute facturation en novembre 2026. Une commande facturée est en
+# outre exclue de l'écriture de session, ce qui vidait la comptabilité POS.
+#
+# La facture reste émise quand le client la demande à son nom : l'application
+# transmet alors son identité, et c'est cette identité qui déclenche
+# l'émission — pas le moyen de paiement.
 
-# Moyens de paiement qui ne donnent pas lieu à facture : le règlement par token
-# ou par carte est déjà tracé côté back-office, la facture ferait doublon.
-# La liste se règle sans redéploiement, les libellés sont comparés sans casse.
+# Comportement de facturation automatique :
+#   "client_nomme" (défaut) — facture uniquement si un vrai client est rattaché
+#   "toujours"              — ancien comportement, hors moyens exclus ci-dessous
+#   "jamais"                — aucune facture automatique, même client nommé
+_FACTURATION_AUTO = os.getenv("POS_AUTO_INVOICE", "client_nomme").strip().lower()
+
+# Utilisé seulement en mode "toujours" : moyens déjà tracés côté back-office.
 _PAIEMENTS_SANS_FACTURE = [
     m.strip().upper()
     for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE", "TOKEN,CARTE,CARD").split(",")
@@ -8849,23 +8870,52 @@ def _doit_facturer(client, order_id: int) -> tuple:
     """
     Une commande doit-elle donner lieu à une facture ?
 
-    Règle métier : toute vente réglée autrement que par token ou par carte.
-    Une commande à plusieurs moyens de paiement est facturée dès lors qu'au moins
-    un règlement sort du périmètre exclu — sinon un paiement mixte permettrait
-    d'échapper à la facturation.
+    Le moyen de paiement n'entre pas dans la décision : une vente comptoir va
+    au journal du point de vente, qu'elle soit réglée en espèces, par carte ou
+    par token. Ce qui déclenche la facture, c'est la demande du client — donc
+    la présence d'un vrai partenaire sur la commande, par opposition au compte
+    collectif des ventes anonymes.
 
-    Retourne (doit_facturer, libellés des moyens utilisés).
+    Retourne (doit_facturer, motif).
     """
-    libelles = _moyens_paiement_commande(client, order_id)
-    if not libelles:
-        return False, []
+    if _FACTURATION_AUTO == "jamais":
+        return False, "facturation automatique désactivée"
 
-    for libelle in libelles:
-        majuscule = (libelle or '').upper()
-        if not any(exclu in majuscule for exclu in _PAIEMENTS_SANS_FACTURE):
-            return True, libelles
+    if _FACTURATION_AUTO == "toujours":
+        # Ancien comportement, conservé pour pouvoir revenir en arrière sans
+        # redéploiement si la comptabilité change d'avis.
+        libelles = _moyens_paiement_commande(client, order_id)
+        if not libelles:
+            return False, "aucun règlement enregistré"
+        for libelle in libelles:
+            if not any(exclu in (libelle or '').upper()
+                       for exclu in _PAIEMENTS_SANS_FACTURE):
+                return True, f"règlement {', '.join(libelles)}"
+        return False, f"règlement exclu ({', '.join(libelles)})"
 
-    return False, libelles
+    # Mode par défaut : la facture suit le client, pas le paiement.
+    try:
+        commande = client.execute_kw(
+            'pos.order', 'read', [order_id], {'fields': ['partner_id']}
+        )
+    except Exception as e:
+        logger.warning(f"Client de la commande {order_id} illisible: {e}")
+        return False, "client illisible"
+
+    if not commande:
+        return False, "commande introuvable"
+
+    partenaire = commande[0].get('partner_id')
+    if not partenaire:
+        return False, "vente anonyme"
+
+    partenaire_id = partenaire[0] if isinstance(partenaire, list) else partenaire
+    nom_partenaire = partenaire[1] if isinstance(partenaire, list) else str(partenaire_id)
+
+    if partenaire_id == _partenaire_comptant(client) or est_client_generique(nom_partenaire):
+        return False, "vente anonyme (compte collectif)"
+
+    return True, f"client nommé « {nom_partenaire} »"
 
 
 # Libellés cherchés pour le client générique des ventes anonymes, dans l'ordre.
@@ -9446,10 +9496,60 @@ async def get_pos_order_invoice(
         raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération: {str(e)}")
 
 
+def _ticket_sans_facture(client, pos_id: int, commande: dict) -> dict:
+    """
+    Données d'en-tête d'un ticket pour une vente non facturée.
+
+    Reprend la forme d'un `account.move` pour que la composition du ticket
+    reste identique dans les deux cas, mais les valeurs viennent de la
+    commande elle-même. Les champs propres à une facture — numéro, échéance,
+    mentions DGI — restent vides : il n'y a pas de facture, et le ticket ne
+    doit pas laisser croire le contraire.
+    """
+    config = client.execute_kw(
+        'pos.config', 'read', [[pos_id]], {'fields': ['company_id', 'currency_id']}
+    )
+    config = config[0] if config else {}
+
+    total = float(commande.get('amount_total') or 0)
+    taxes = float(commande.get('amount_tax') or 0)
+
+    return {
+        'name': None,
+        'ref': commande.get('pos_reference'),
+        'invoice_date': (commande.get('date_order') or '')[:10] or None,
+        'invoice_date_due': None,
+        'state': 'no_invoice',
+        'payment_state': 'paid',
+        'amount_untaxed': round(total - taxes, 2),
+        'amount_tax': round(taxes, 2),
+        'amount_total': round(total, 2),
+        'amount_residual': 0.0,
+        'partner_id': commande.get('partner_id'),
+        'company_id': config.get('company_id'),
+        'currency_id': config.get('currency_id'),
+        'is_normalized': False,
+        'secu_codemecefdgi': None,
+        'secu_nim': None,
+        'secu_qrcode': None,
+        'normalization_date': None,
+        'normalizer_id': None,
+    }
+
+
 @router.get("/{pos_id}/orders/{order_id}/invoice/details", response_model=ApiResponse)
 async def get_pos_order_invoice_details(
     pos_id: int = Path(..., description="ID du point de vente"),
     order_id: int = Path(..., description="ID de la commande POS"),
+    create_invoice: bool = Query(
+        False,
+        description=(
+            "Émettre la facture si elle n'existe pas encore. À laisser à "
+            "false pour imprimer un simple ticket : une vente comptoir est "
+            "comptabilisée dans le journal du point de vente à la clôture, "
+            "pas par une facture."
+        )
+    ),
     current_user: dict = Depends(require_scope("pos"))
 ):
     """
@@ -9521,23 +9621,34 @@ async def get_pos_order_invoice_details(
                 }
             )
 
-        facture_id = _assurer_facture(client, order_id, commande['name'])
-        if not facture_id:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Facture non disponible pour la commande {commande['name']}"
-            )
+        # La facture n'est plus créée d'office. Une vente comptoir va au
+        # journal du point de vente ; seule une vente à un client nommé donne
+        # lieu à facture. Le ticket doit donc pouvoir s'imprimer sans elle —
+        # c'est le cas le plus fréquent.
+        move = commande.get('account_move')
+        facture_id = move[0] if isinstance(move, list) else move
 
-        facture = client.execute_kw(
-            'account.move', 'read', [facture_id],
-            {'fields': ['name', 'invoice_date', 'invoice_date_due', 'state',
-                        'amount_untaxed', 'amount_tax', 'amount_total',
-                        'amount_residual', 'partner_id', 'company_id',
-                        'currency_id', 'ref', 'payment_state',
-                        # Facture normalisée DGI, posés par norma_for_sales_odoo
-                        'is_normalized', 'secu_codemecefdgi', 'secu_nim',
-                        'secu_qrcode', 'normalization_date', 'normalizer_id']}
-        )[0]
+        if not facture_id and create_invoice:
+            facture_id = _assurer_facture(client, order_id, commande['name'])
+            if not facture_id:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Facture non émise pour la commande {commande['name']}"
+                )
+
+        if facture_id:
+            facture = client.execute_kw(
+                'account.move', 'read', [facture_id],
+                {'fields': ['name', 'invoice_date', 'invoice_date_due', 'state',
+                            'amount_untaxed', 'amount_tax', 'amount_total',
+                            'amount_residual', 'partner_id', 'company_id',
+                            'currency_id', 'ref', 'payment_state',
+                            # Facture normalisée DGI, posés par norma_for_sales_odoo
+                            'is_normalized', 'secu_codemecefdgi', 'secu_nim',
+                            'secu_qrcode', 'normalization_date', 'normalizer_id']}
+            )[0]
+        else:
+            facture = _ticket_sans_facture(client, pos_id, commande)
 
         # --- Émetteur ---
         societe_id = facture['company_id'][0] if isinstance(facture['company_id'], list) else facture['company_id']
@@ -9657,19 +9768,29 @@ async def get_pos_order_invoice_details(
             'qrcode_format': 'png',
         }
         if not normalisee:
-            fiscal['message'] = (
-                "Facture non encore normalisée auprès de la DGI. Le code MECeF "
-                "et le QR code ne sont pas disponibles. La normalisation se fait "
-                "depuis la facture dans Odoo."
-            )
-            logger.warning(
-                f"Facture {facture.get('name')} non normalisée — "
-                f"impression fiscale impossible"
-            )
+            if facture_id:
+                fiscal['message'] = (
+                    "Facture non encore normalisée auprès de la DGI. Le code MECeF "
+                    "et le QR code ne sont pas disponibles. La normalisation se fait "
+                    "depuis la facture dans Odoo."
+                )
+                logger.warning(
+                    f"Facture {facture.get('name')} non normalisée — "
+                    f"impression fiscale impossible"
+                )
+            else:
+                fiscal['message'] = (
+                    "Vente non facturée : elle est comptabilisée dans le journal "
+                    "du point de vente à la clôture de session. Ce document est "
+                    "un ticket de caisse, pas une facture normalisée. Pour obtenir "
+                    "une facture au nom du client, renseigner son identité puis "
+                    "rappeler cet endpoint avec create_invoice=true."
+                )
 
         logger.info(
-            f"🧾 Facture {facture.get('name')} servie pour la commande "
-            f"{commande['name']} — {facture.get('amount_total')} {devise_nom}"
+            f"🧾 {'Facture ' + str(facture.get('name')) if facture_id else 'Ticket (sans facture)'} "
+            f"servi pour la commande {commande['name']} — "
+            f"{facture.get('amount_total')} {devise_nom}"
         )
 
         return ApiResponse(
@@ -9686,6 +9807,10 @@ async def get_pos_order_invoice_details(
                     'amount_paid': round(float(commande.get('amount_paid') or 0), 2),
                     'amount_return': round(float(commande.get('amount_return') or 0), 2),
                 },
+                # `invoiced: false` = ticket de caisse, pas facture. Les
+                # montants restent renseignés dans les deux cas : c'est
+                # l'existence du document fiscal qui change, pas la vente.
+                'invoiced': bool(facture_id),
                 'invoice': {
                     'id': facture_id,
                     'number': facture.get('name'),
@@ -9729,7 +9854,12 @@ async def get_pos_order_invoice_details(
                 'lines': lignes,
                 'payments': reglements,
                 'fiscal': fiscal,
-                'pdf_url': f"/pos/{pos_id}/orders/{order_id}/invoice",
+                # Null sans facture : l'URL du PDF échouerait, et proposer un
+                # bouton « télécharger la facture » sur une vente qui n'en a
+                # pas serait trompeur pour le pompiste.
+                'pdf_url': (
+                    f"/pos/{pos_id}/orders/{order_id}/invoice" if facture_id else None
+                ),
             },
             message=f"Facture {facture.get('name')} — {facture.get('amount_total')} {devise_nom}"
         )
