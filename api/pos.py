@@ -8881,17 +8881,24 @@ def _doit_facturer(client, order_id: int) -> tuple:
     if _FACTURATION_AUTO == "jamais":
         return False, "facturation automatique désactivée"
 
+    libelles = _moyens_paiement_commande(client, order_id)
+    if not libelles:
+        return False, "aucun règlement enregistré"
+
+    # Un règlement prépayé — token, carte JNP PASS — a déjà donné lieu à une
+    # facture au moment de la recharge. Refacturer la consommation
+    # compterait le chiffre d'affaires deux fois. Ce verrou prime sur tout le
+    # reste, y compris sur la présence d'un client nommé : le client peut
+    # légitimement vouloir son nom sur le ticket sans qu'une seconde facture
+    # soit due.
+    if all(any(exclu in (libelle or '').upper() for exclu in _PAIEMENTS_SANS_FACTURE)
+           for libelle in libelles):
+        return False, f"règlement prépayé, déjà facturé à la recharge ({', '.join(libelles)})"
+
     if _FACTURATION_AUTO == "toujours":
         # Ancien comportement, conservé pour pouvoir revenir en arrière sans
         # redéploiement si la comptabilité change d'avis.
-        libelles = _moyens_paiement_commande(client, order_id)
-        if not libelles:
-            return False, "aucun règlement enregistré"
-        for libelle in libelles:
-            if not any(exclu in (libelle or '').upper()
-                       for exclu in _PAIEMENTS_SANS_FACTURE):
-                return True, f"règlement {', '.join(libelles)}"
-        return False, f"règlement exclu ({', '.join(libelles)})"
+        return True, f"règlement {', '.join(libelles)}"
 
     # Mode par défaut : la facture suit le client, pas le paiement.
     try:

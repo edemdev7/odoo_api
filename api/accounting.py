@@ -5,8 +5,9 @@ Crée une commande de vente → facture → (paiement si kkiapay).
 Les écritures comptables sont générées automatiquement par Odoo.
 """
 
-from fastapi import APIRouter, HTTPException, Request, Header, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Request, Header, BackgroundTasks, Depends
 from fastapi.responses import Response
+from core.security import require_scope
 from typing import Optional
 from datetime import datetime
 import logging
@@ -1426,12 +1427,19 @@ async def read_invoice_details(invoice_id: int):
 
 
 @router.get("/invoice/{invoice_id}/pdf")
-async def download_invoice_pdf(invoice_id: int):
+async def download_invoice_pdf(
+    invoice_id: int,
+    current_user: dict = Depends(require_scope("pos"))
+):
     """
     Télécharger le PDF d'une facture par son ID.
 
     Utilise le wizard account.move.send d'Odoo 17 pour générer le PDF
     (même mécanisme que le bouton "Envoyer & Imprimer" de l'interface).
+
+    **Authentification requise.** Cette route était ouverte : les
+    identifiants de facture étant séquentiels, n'importe qui pouvait
+    parcourir la facturation de l'entreprise en incrémentant un nombre.
 
     **Paramètres:**
     - **invoice_id**: ID de la facture (account.move)
