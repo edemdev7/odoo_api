@@ -7851,50 +7851,55 @@ async def close_pos_session(
         except Exception as e:
             logger.warning(f"Impossible d'annuler les commandes brouillon: {e}")
 
-        # Stratégie 1 : écrire 'closing_control' directement pour bypasser
-        # _check_pos_session_balance() d'Odoo, puis appeler action_pos_session_close.
+        # Préparer la clôture via l'action Odoo afin de conserver ses contrôles
+        # et le contexte nécessaire à la génération de l'écriture de session.
         try:
+            client.execute_kw(
+                'pos.session',
+                'action_pos_session_closing_control',
+                [[session_id]]
+            )
+            logger.info(f"action_pos_session_closing_control réussie pour {session_id}")
+        except Exception as e:
+            if not request.forced:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Odoo refuse la préparation de la clôture: {e}"
+                )
+            logger.warning(
+                f"action_pos_session_closing_control a échoué ({e}) — "
+                "mode forcé, passage explicite en closing_control"
+            )
             client.execute_kw('pos.session', 'write', [[session_id], {
                 'state': 'closing_control',
                 'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }])
-            logger.info(f"Session {session_id} → closing_control (write direct)")
-        except Exception as e:
-            logger.warning(f"write closing_control a échoué ({e}) — essai méthode officielle")
-            try:
-                client.execute_kw('pos.session', 'action_pos_session_closing_control', [[session_id]])
-                logger.info(f"action_pos_session_closing_control réussie")
-            except Exception as e2:
-                logger.warning(f"action_pos_session_closing_control a échoué: {e2}")
 
-        # Stratégie 2 : fermeture officielle (comptabilité, écritures, etc.)
+        # Fermeture officielle : cette action génère les écritures POS.
+        close_result = None
         try:
             logger.info(f"Appel action_pos_session_close pour session {session_id}")
-            client.execute_kw('pos.session', 'action_pos_session_close', [[session_id]])
+            close_result = client.execute_kw(
+                'pos.session', 'action_pos_session_close', [[session_id]]
+            )
             logger.info(f"action_pos_session_close réussie")
         except Exception as e:
             close_error_msg = str(e)
             logger.error(f"action_pos_session_close a échoué: {close_error_msg}")
 
-        # Stratégie 3 (fallback systématique) : vérifier l'état immédiatement après
-        # l'appel. Odoo peut retourner sans exception mais renvoyer un dict wizard
-        # (action) au lieu de fermer réellement — dans ce cas l'état reste closing_control.
+        # Vérifier l'état immédiatement après l'action. Ne jamais écrire
+        # state=closed en contournant Odoo : cela créerait une session fermée
+        # sans garantir la génération de son écriture comptable.
         try:
             interim = client.execute_kw('pos.session', 'read', [[session_id]], {'fields': ['state']})
             interim_state = interim[0]['state'] if interim else 'unknown'
             if interim_state != 'closed':
                 logger.warning(
-                    f"État après action_pos_session_close: {interim_state} "
-                    f"— write direct state=closed (fallback)"
+                    f"État après action_pos_session_close: {interim_state}; "
+                    f"résultat Odoo: {close_result}"
                 )
-                client.execute_kw('pos.session', 'write', [[session_id], {
-                    'state': 'closed',
-                    'stop_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                }])
-                logger.info(f"Session {session_id} fermée via write direct (fallback)")
-                close_error_msg = None
         except Exception as e_fb:
-            logger.error(f"Fallback write state=closed a échoué: {e_fb}")
+            logger.error(f"Vérification de la clôture échouée: {e_fb}")
 
         # Relire l'état réel : on ne fait jamais confiance aux appels pour confirmer la clôture.
         final_session = client.execute_kw('pos.session', 'read', [session_id], {'fields': ['state']})
@@ -7909,7 +7914,10 @@ async def close_pos_session(
             if close_error_msg:
                 detail_msg += f" Erreur Odoo: {close_error_msg}"
             else:
-                detail_msg += " Vérifiez les commandes non payées ou les écarts de caisse côté Odoo."
+                detail_msg += (
+                    " Odoo a peut-être retourné un assistant de clôture : "
+                    "vérifiez les écarts de caisse et terminez la clôture depuis Odoo."
+                )
             raise HTTPException(status_code=500, detail=detail_msg)
 
         # S'assurer que stop_at est bien renseigné. Sans cela, Odoo plante
@@ -8702,9 +8710,13 @@ async def add_payment_to_order(
 
             # Solder et déstocker en une seule opération.
             if not _solder_commande(client, order_id):
-                logger.warning(
-                    f"⚠️ Commande {order_id} encaissée sans déstockage. "
-                    f"Le stock de la station ne reflète pas cette vente."
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Paiement enregistré mais Odoo n'a pas pu valider "
+                        f"la commande POS {order_id}. La session ne doit pas "
+                        "être clôturée avant correction."
+                    )
                 )
 
             # Facturer si le règlement sort du périmètre token / carte.
@@ -8836,12 +8848,8 @@ def _solder_commande(client, order_id: int) -> bool:
     except Exception as e:
         logger.warning(
             f"action_pos_order_paid refusée pour la commande {order_id}: {e} "
-            f"— bascule en 'paid' sans déstockage"
+            f"— la commande reste dans son état Odoo"
         )
-        try:
-            client.execute_kw('pos.order', 'write', [[order_id], {'state': 'paid'}])
-        except Exception as err:
-            logger.error(f"Commande {order_id} non soldée: {err}")
         return False
 
     # Vérifier que le picking existe réellement : l'action peut aboutir sans
@@ -10116,14 +10124,30 @@ async def create_complete_pos_order(
                 logger.warning(f"Impossible de créer le paiement automatiquement: {e}")
         
         logger.info(f"💰 Total paiements créés: {len(payment_ids)}/{len(payments_list)}")
+        if len(payment_ids) != len(payments_list):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Un ou plusieurs paiements POS n'ont pas été créés dans Odoo. "
+                    "La commande n'est pas validée afin d'éviter une vente "
+                    "incomplètement comptabilisée."
+                )
+            )
         
-        # Marquer la commande comme payée et fermée
+        # Utiliser l'action POS officielle : un simple write(state=paid) ne
+        # déclenche pas les traitements Odoo liés à la vente et au stock.
         try:
-            client.execute_kw('pos.order', 'write', [[order_id], {'state': 'paid'}])
-            logger.info(f"✅ Commande {order_id} marquée comme payée")
+            client.execute_kw('pos.order', 'action_pos_order_paid', [[order_id]])
+            logger.info(f"✅ Commande {order_id} validée par l'action POS officielle")
         except Exception as e:
             logger.error(f"❌ Erreur changement d'état: {e}")
-            logger.warning(f"Impossible de marquer automatiquement comme payée: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Paiement enregistré mais Odoo n'a pas pu valider la commande "
+                    f"POS {order_id}: {e}"
+                )
+            )
         
         # Vérifier que la commande a bien été créée avec les lignes
         try:
