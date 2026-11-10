@@ -8678,20 +8678,30 @@ async def add_payment_to_order(
         payments_added = []
         total_this_call = 0.0
 
-        for p in request.payments:
-            payment_id = client.execute_kw('pos.payment', 'create', [{
-                'pos_order_id': order_id,
-                'payment_method_id': p.payment_method_id,
-                'amount': p.amount,
-                'payment_date': payment_date,
-            }])
-            payments_added.append({
-                'payment_id': payment_id,
-                'payment_method_id': p.payment_method_id,
-                'amount': p.amount,
-            })
-            total_this_call += p.amount
-            logger.info(f"Paiement {payment_id} créé — Commande {order_id}: {p.amount} (méthode {p.payment_method_id})")
+        # Une requête peut être rejouée après un timeout ou une erreur Odoo.
+        # Les paiements XML-RPC déjà créés restent en base : ne pas les recréer
+        # si la commande est déjà couverte, sinon chaque retry augmente le
+        # montant payé et empêche le traitement normal de la commande.
+        if current_paid >= amount_total:
+            logger.info(
+                f"Commande {order_id} déjà couverte par ses paiements existants "
+                f"({current_paid} >= {amount_total}) — tentative de finalisation idempotente"
+            )
+        else:
+            for p in request.payments:
+                payment_id = client.execute_kw('pos.payment', 'create', [{
+                    'pos_order_id': order_id,
+                    'payment_method_id': p.payment_method_id,
+                    'amount': p.amount,
+                    'payment_date': payment_date,
+                }])
+                payments_added.append({
+                    'payment_id': payment_id,
+                    'payment_method_id': p.payment_method_id,
+                    'amount': p.amount,
+                })
+                total_this_call += p.amount
+                logger.info(f"Paiement {payment_id} créé — Commande {order_id}: {p.amount} (méthode {p.payment_method_id})")
 
         # Recalculer les montants
         new_paid = current_paid + total_this_call
@@ -8703,6 +8713,10 @@ async def add_payment_to_order(
 
         if is_complete:
             client.execute_kw('pos.order', 'write', [[order_id], {
+                # La création XML-RPC de pos.payment ne recalcule pas toujours
+                # amount_paid avant l'appel de l'action POS. Odoo contrôle ce
+                # champ dans action_pos_order_paid.
+                'amount_paid': new_paid,
                 'amount_return': amount_return,
             }])
             payment_status = 'paid'
