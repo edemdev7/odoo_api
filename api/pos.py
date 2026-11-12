@@ -8622,6 +8622,13 @@ async def add_payment_to_order(
     - `amount_return` : monnaie rendue si surpaiement
     - `payment_status` : `unpaid` | `partial` | `paid`
     - `is_complete` : `true` si la commande est soldée
+    - `already_paid` : `true` si la commande était déjà soldée avant l'appel
+    - `stock` : déstockage de la vente — `statut` vaut `destocke`, `en_attente`
+      (transfert créé mais pas validé, voir `message`), `non_concerne` ou `echec`
+
+    **Relance :** rejouer l'appel sur une commande déjà soldée ne crée aucun
+    paiement. La réponse est 200 avec l'état actuel, et le déstockage ou la
+    facture sont retentés s'ils manquaient.
 
     **Requires:** Authentification JWT avec scope 'pos'
     """
@@ -8647,9 +8654,12 @@ async def add_payment_to_order(
         if not session_data or session_data[0]['config_id'][0] != pos_id:
             raise HTTPException(status_code=400, detail="La commande n'appartient pas à ce point de vente")
 
-        # Vérifier l'état de la commande
-        if order['state'] in ('paid', 'done', 'invoiced'):
-            raise HTTPException(status_code=400, detail=f"La commande est déjà soldée (état: {order['state']})")
+        # Vérifier l'état de la commande.
+        #
+        # Une commande déjà soldée n'est pas une erreur : c'est le cas d'un
+        # appel rejoué après un timeout ou un 5xx, alors qu'Odoo avait tout
+        # enregistré. On répond avec l'état actuel, sans créer de paiement.
+        deja_soldee = order['state'] in _ETATS_SOLDES
         if order['state'] == 'cancel':
             raise HTTPException(status_code=400, detail="La commande est annulée")
 
@@ -8669,7 +8679,16 @@ async def add_payment_to_order(
         # automatique déclenchée plus bas : la facture sort au bon nom du
         # premier coup, sans repasser par un brouillon.
         client_nomme = None
-        if getattr(request, 'customer', None):
+        if deja_soldee and current_paid + 1e-6 < float(order['amount_total']):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"La commande est soldée dans Odoo (état: {order['state']}) mais "
+                    f"ses paiements ({current_paid}) ne couvrent pas son total "
+                    f"({order['amount_total']}). Vérification manuelle nécessaire."
+                )
+            )
+        if getattr(request, 'customer', None) and not deja_soldee:
             client_nomme, _ = _resoudre_client(client, request.customer)
             client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': client_nomme}])
             logger.info(f"Commande {order_id} rattachée au client {client_nomme} avant facturation")
@@ -8682,7 +8701,7 @@ async def add_payment_to_order(
         # Les paiements XML-RPC déjà créés restent en base : ne pas les recréer
         # si la commande est déjà couverte, sinon chaque retry augmente le
         # montant payé et empêche le traitement normal de la commande.
-        if current_paid >= amount_total:
+        if deja_soldee or current_paid >= amount_total:
             logger.info(
                 f"Commande {order_id} déjà couverte par ses paiements existants "
                 f"({current_paid} >= {amount_total}) — tentative de finalisation idempotente"
@@ -8710,8 +8729,9 @@ async def add_payment_to_order(
         is_complete = new_paid >= amount_total
 
         invoice_id = None
+        stock = None
 
-        if is_complete:
+        if is_complete and not deja_soldee:
             client.execute_kw('pos.order', 'write', [[order_id], {
                 # La création XML-RPC de pos.payment ne recalcule pas toujours
                 # amount_paid avant l'appel de l'action POS. Odoo contrôle ce
@@ -8722,7 +8742,7 @@ async def add_payment_to_order(
             payment_status = 'paid'
             logger.info(f"Commande {order_id} soldée — payé: {new_paid}, rendu: {amount_return}")
 
-            # Solder et déstocker en une seule opération.
+            # Le seul vrai échec : Odoo refuse de solder la commande.
             if not _solder_commande(client, order_id):
                 raise HTTPException(
                     status_code=502,
@@ -8732,6 +8752,13 @@ async def add_payment_to_order(
                         "être clôturée avant correction."
                     )
                 )
+        elif is_complete:
+            payment_status = 'paid'
+
+        if is_complete:
+            # Sortie de stock. Un échec ne remet pas en cause l'encaissement :
+            # il est signalé dans la réponse et retenté au prochain appel.
+            stock = _destocker_commande(client, order_id, pos_id)
 
             # Facturer si le règlement sort du périmètre token / carte.
             # L'échec de la facturation ne remet pas en cause l'encaissement :
@@ -8773,9 +8800,16 @@ async def add_payment_to_order(
                 # peut enchaîner directement sur l'impression sans second appel.
                 'invoice_id': invoice_id,
                 'partner_id': client_nomme,
+                'already_paid': deja_soldee,
+                'stock': stock,
             },
             message=(
-                f"Commande soldée — Rendu: {amount_return}" if is_complete
+                (
+                    ("Commande déjà soldée" if deja_soldee
+                     else f"Commande soldée — Rendu: {amount_return}")
+                    + (f" — stock non mis à jour : {stock.get('message')}"
+                       if stock and stock.get('statut') in ('en_attente', 'echec') else "")
+                ) if is_complete
                 else f"{len(payments_added)} paiement(s) enregistré(s) — Reste à payer: {amount_due}"
             )
         )
@@ -8841,51 +8875,334 @@ def _moyens_paiement_commande(client, order_id: int) -> list:
 
 def _solder_commande(client, order_id: int) -> bool:
     """
-    Passe une commande en « payé » et déclenche son mouvement de stock.
+    Passe une commande en « payé » via `action_pos_order_paid`.
 
-    `action_pos_order_paid` est le point d'entrée officiel : il vérifie que
-    le règlement couvre bien le total, bascule l'état, **et** crée le
-    picking. Écrire `state = 'paid'` à la main saute cette dernière étape,
-    et la vente ne déstocke jamais.
+    Cette action vérifie que le règlement couvre le total et bascule l'état.
+    En Odoo 17, elle ne crée **aucun** transfert de stock : le transfert d'une
+    vente naît dans `_create_order_picking`, que seul le circuit de la caisse
+    Odoo (`create_from_ui`) appelle, et qui est privée, donc hors de portée en
+    XML-RPC. Le déstockage est fait à part, par `_destocker_commande`.
 
-    Le code appelait auparavant `action_pos_order_picking`, une méthode qui
-    n'existe pas sur `pos.order` : l'appel échouait à chaque vente, et
-    l'erreur étant avalée par un `except`, personne ne l'a vu pendant des
-    mois. La méthode qui crée réellement le picking, `_create_order_picking`,
-    est privée et donc inaccessible en XML-RPC — d'où le passage par
-    l'action publique.
+    Le code vérifiait autrefois la présence d'un transfert juste après cette
+    action et concluait à l'échec en son absence : chaque paiement complet
+    répondait 502 alors qu'Odoo avait bien soldé la commande.
 
-    Retourne True si le déstockage a bien eu lieu.
+    Retourne True si la commande est soldée côté Odoo.
     """
     try:
         client.execute_kw('pos.order', 'action_pos_order_paid', [[order_id]])
+        return True
     except Exception as e:
+        # Une relance peut tomber sur une commande déjà soldée : l'action
+        # échoue alors sans qu'il y ait rien à corriger.
+        try:
+            lu = client.execute_kw(
+                'pos.order', 'read', [[order_id]], {'fields': ['state']}
+            )
+            if lu and lu[0].get('state') in ('paid', 'done', 'invoiced'):
+                return True
+        except Exception:
+            pass
         logger.warning(
             f"action_pos_order_paid refusée pour la commande {order_id}: {e} "
             f"— la commande reste dans son état Odoo"
         )
         return False
 
-    # Vérifier que le picking existe réellement : l'action peut aboutir sans
-    # rien créer si le point de vente n'a pas de type d'opération configuré.
-    try:
-        pickings = client.execute_kw(
-            'stock.picking', 'search_count', [[('pos_order_id', '=', order_id)]]
-        )
-        if pickings:
-            logger.info(
-                f"Commande {order_id} soldée et déstockée ({pickings} transfert(s))"
-            )
-            return True
-        logger.warning(
-            f"Commande {order_id} soldée mais aucun transfert de stock créé — "
-            f"vérifier le type d'opération du point de vente"
-        )
-    except Exception as e:
-        logger.debug(f"Vérification du picking impossible pour {order_id}: {e}")
-        return True  # l'action est passée, on ne crie pas sur un doute de lecture
 
-    return False
+# ===== DÉSTOCKAGE DES VENTES =====
+#
+# Le stock est mis à jour « en temps réel » chez JNP SA : Odoo attend un
+# transfert par vente et ne rattrape rien à la clôture de session. La caisse
+# Odoo crée ce transfert elle-même ; une vente passée par l'API, non. Jusqu'ici
+# les ventes de l'API ne sortaient donc jamais du stock — seize commandes du
+# seul PDV 32 en novembre 2026, carburant compris.
+#
+# On reproduit ce que fait Odoo pour une vente de caisse : un transfert depuis
+# l'emplacement de la station vers les clients, rattaché à la commande et à la
+# session, validé aussitôt. Les lignes négatives (remboursement) font le trajet
+# inverse, avec le type d'opération de retour.
+#
+# Le transfert part du même emplacement que celui du contrôle de stock avant
+# vente (`_resolve_pos_stock_location`). Ce contrôle retranche les ventes de la
+# session *non encore déstockées*, en se fondant sur les sorties de cet
+# emplacement : déstocker ailleurs ferait compter la vente deux fois.
+#
+# Un échec ici ne remet jamais en cause l'encaissement — la vente est faite et
+# l'argent reçu. Le résultat remonte dans la réponse, et un nouvel appel au
+# paiement retente le déstockage sans rien dupliquer.
+
+_ETATS_SOLDES = ('paid', 'done', 'invoiced')
+
+# Champs de stock.move qui varient selon la version d'Odoo, résolus une fois.
+_cache_champs_move: dict = {}
+
+
+def _m2o_id(valeur):
+    return valeur[0] if isinstance(valeur, list) and valeur else (valeur or None)
+
+
+def _champs_stock_move(client) -> set:
+    if 'champs' not in _cache_champs_move:
+        try:
+            _cache_champs_move['champs'] = set(client.execute_kw(
+                'stock.move', 'fields_get', [], {'attributes': ['type']}
+            ))
+        except Exception as e:
+            logger.warning(f"Champs de stock.move illisibles: {e}")
+            _cache_champs_move['champs'] = {'quantity', 'picked'}
+    return _cache_champs_move['champs']
+
+
+def _lignes_a_destocker(client, order_id: int) -> dict:
+    """
+    Quantités à déplacer, regroupées par sens puis par produit.
+
+    Retourne {1: {product_id: (qte, uom_id, libelle)}, -1: {...}} — 1 pour les
+    ventes, -1 pour les remboursements. Les services n'ont pas de stock et sont
+    écartés ; les consommables suivent, comme pour une vente de caisse Odoo.
+    """
+    lignes = client.execute_kw(
+        'pos.order.line', 'search_read', [[('order_id', '=', order_id)]],
+        {'fields': ['product_id', 'qty']}
+    )
+    pids = list({_m2o_id(l.get('product_id')) for l in lignes if l.get('product_id')})
+    if not pids:
+        return {}
+    produits = {
+        p['id']: p for p in client.execute_kw(
+            'product.product', 'read', [pids],
+            {'fields': ['type', 'uom_id', 'display_name']}
+        )
+    }
+
+    groupes = {1: {}, -1: {}}
+    for l in lignes:
+        pid = _m2o_id(l.get('product_id'))
+        qte = float(l.get('qty') or 0)
+        prod = produits.get(pid)
+        if not prod or prod.get('type') == 'service' or abs(qte) < 1e-9:
+            continue
+        sens = 1 if qte > 0 else -1
+        cumul, uom, libelle = groupes[sens].get(
+            pid, (0.0, _m2o_id(prod.get('uom_id')), prod.get('display_name') or str(pid))
+        )
+        groupes[sens][pid] = (cumul + abs(qte), uom, libelle)
+    return {s: g for s, g in groupes.items() if g}
+
+
+def _emplacement_clients(client, type_operation: dict, partner_id) -> Optional[int]:
+    """Emplacement client : celui du partenaire, sinon celui du type d'opération."""
+    if partner_id:
+        try:
+            p = client.execute_kw(
+                'res.partner', 'read', [[partner_id]],
+                {'fields': ['property_stock_customer']}
+            )
+            loc = _m2o_id(p[0].get('property_stock_customer')) if p else None
+            if loc:
+                return loc
+        except Exception as e:
+            logger.debug(f"Emplacement client du partenaire {partner_id} illisible: {e}")
+    loc = _m2o_id(type_operation.get('default_location_dest_id'))
+    if loc:
+        return loc
+    ids = client.execute_kw(
+        'stock.location', 'search', [[('usage', '=', 'customer')]], {'limit': 1}
+    )
+    return ids[0] if ids else None
+
+
+def _valider_transfert(client, picking_id: int) -> tuple:
+    """
+    Confirme, réserve, fixe les quantités et valide un transfert.
+
+    Retourne (etat_final, motif) — motif vaut None quand le transfert est fait.
+    Les exceptions Odoo remontent à l'appelant, qui en fait le motif.
+    """
+    def etat():
+        lu = client.execute_kw(
+            'stock.picking', 'read', [[picking_id]], {'fields': ['state']}
+        )
+        return lu[0]['state'] if lu else '?'
+
+    courant = etat()
+    if courant == 'done':
+        return 'done', None
+    if courant == 'cancel':
+        return 'cancel', "transfert annulé"
+    if courant == 'draft':
+        client.execute_kw('stock.picking', 'action_confirm', [[picking_id]])
+
+    # La réservation va chercher le stock dans les sous-emplacements (cuves).
+    # Si elle est partielle, la quantité forcée plus bas complète depuis
+    # l'emplacement de la station, comme le fait Odoo pour une vente de caisse.
+    try:
+        client.execute_kw('stock.picking', 'action_assign', [[picking_id]])
+    except Exception as e:
+        logger.info(f"Réservation incomplète sur le transfert {picking_id}: {e}")
+
+    champs = _champs_stock_move(client)
+    mouvements = client.execute_kw(
+        'stock.move', 'search_read',
+        [[('picking_id', '=', picking_id), ('state', 'not in', ('done', 'cancel'))]],
+        {'fields': ['id', 'product_uom_qty']}
+    )
+    for m in mouvements:
+        vals = {}
+        if 'quantity' in champs:
+            vals['quantity'] = m['product_uom_qty']
+        if 'picked' in champs:
+            vals['picked'] = True
+        if vals:
+            client.execute_kw('stock.move', 'write', [[m['id']], vals])
+
+    retour = client.execute_kw(
+        'stock.picking', 'button_validate', [[picking_id]],
+        {'context': {'skip_backorder': True, 'skip_immediate': True,
+                     'skip_sms': True, 'skip_expired': True}}
+    )
+    final = etat()
+    if final == 'done':
+        return 'done', None
+    if isinstance(retour, dict) and retour.get('res_model'):
+        return final, f"Odoo demande une confirmation ({retour.get('res_model')})"
+    return final, f"transfert resté en état « {final} » après validation"
+
+
+def _destocker_commande(client, order_id: int, pos_id: int) -> dict:
+    """
+    Crée et valide le transfert de stock d'une commande soldée.
+
+    Idempotent : un transfert déjà rattaché à la commande est réutilisé, et
+    seulement validé s'il ne l'est pas encore.
+
+    Retourne {'statut', 'transferts', 'message'} où statut vaut :
+      - 'destocke'     : tous les transferts sont validés
+      - 'en_attente'   : transfert créé mais pas validé (stock, traçabilité…)
+      - 'non_concerne' : aucun produit stocké sur la commande
+      - 'echec'        : rien n'a pu être créé
+    Ne lève jamais d'exception.
+    """
+    resultat = {'statut': 'non_concerne', 'transferts': [], 'message': None}
+    try:
+        lu = client.execute_kw(
+            'pos.order', 'read', [[order_id]],
+            {'fields': ['name', 'state', 'session_id', 'partner_id']}
+        )
+        if not lu:
+            resultat.update(statut='echec', message="commande introuvable")
+            return resultat
+        commande = lu[0]
+        if commande.get('state') not in _ETATS_SOLDES:
+            resultat.update(statut='echec',
+                            message=f"commande non soldée (état {commande.get('state')})")
+            return resultat
+
+        nom = commande.get('name') or str(order_id)
+        partner_id = _m2o_id(commande.get('partner_id'))
+        session_id = _m2o_id(commande.get('session_id'))
+
+        transferts = client.execute_kw(
+            'stock.picking', 'search_read',
+            [[('pos_order_id', '=', order_id), ('state', '!=', 'cancel')]],
+            {'fields': ['id', 'name', 'state']}
+        )
+
+        if not transferts:
+            groupes = _lignes_a_destocker(client, order_id)
+            if not groupes:
+                resultat['message'] = "aucun produit stocké sur la commande"
+                return resultat
+
+            config = client.execute_kw(
+                'pos.config', 'read', [[pos_id]], {'fields': ['picking_type_id']}
+            )
+            type_id = _m2o_id(config[0].get('picking_type_id')) if config else None
+            if not type_id:
+                resultat.update(statut='echec',
+                                message="aucun type d'opération sur le point de vente")
+                return resultat
+            type_op = client.execute_kw(
+                'stock.picking.type', 'read', [[type_id]],
+                {'fields': ['default_location_src_id', 'default_location_dest_id',
+                            'return_picking_type_id']}
+            )[0]
+
+            station_id, station_nom, fiable = _resolve_pos_stock_location(client, pos_id)
+            source = station_id if fiable else (
+                _m2o_id(type_op.get('default_location_src_id')) or station_id)
+            clients_id = _emplacement_clients(client, type_op, partner_id)
+            if not clients_id:
+                resultat.update(statut='echec', message="emplacement client introuvable")
+                return resultat
+
+            for sens, produits in groupes.items():
+                if sens > 0:
+                    type_utilise, src, dst = type_id, source, clients_id
+                else:
+                    type_utilise = _m2o_id(type_op.get('return_picking_type_id')) or type_id
+                    src, dst = clients_id, source
+                picking_id = client.execute_kw('stock.picking', 'create', [{
+                    'picking_type_id': type_utilise,
+                    'location_id': src,
+                    'location_dest_id': dst,
+                    'origin': nom,
+                    'partner_id': partner_id or False,
+                    'pos_order_id': order_id,
+                    'pos_session_id': session_id or False,
+                    'move_ids': [(0, 0, {
+                        'name': libelle,
+                        'product_id': pid,
+                        'product_uom': uom,
+                        'product_uom_qty': qte,
+                        'location_id': src,
+                        'location_dest_id': dst,
+                        'origin': nom,
+                    }) for pid, (qte, uom, libelle) in produits.items()],
+                }])
+                transferts.append({'id': picking_id, 'name': None, 'state': 'draft'})
+                logger.info(
+                    f"Transfert {picking_id} créé pour {nom} "
+                    f"({'vente' if sens > 0 else 'retour'}, {len(produits)} produit(s), "
+                    f"{'depuis' if sens > 0 else 'vers'} emplacement "
+                    f"{station_nom if source == station_id else source})"
+                )
+
+        motifs = []
+        for t in transferts:
+            try:
+                etat_final, motif = _valider_transfert(client, t['id'])
+            except Exception as e:
+                etat_final, motif = None, str(e)
+            if motif:
+                motifs.append(motif)
+            t['state'] = etat_final or t.get('state')
+
+        # Noms et états définitifs, tels qu'Odoo les a enregistrés.
+        relus = client.execute_kw(
+            'stock.picking', 'read', [[t['id'] for t in transferts]],
+            {'fields': ['id', 'name', 'state']}
+        )
+        resultat['transferts'] = [
+            {'id': r['id'], 'name': r['name'], 'state': r['state']} for r in relus
+        ]
+        if all(r['state'] == 'done' for r in relus):
+            resultat['statut'] = 'destocke'
+            logger.info(
+                f"Commande {nom} déstockée — "
+                f"{', '.join(r['name'] for r in relus)}"
+            )
+        else:
+            resultat['statut'] = 'en_attente'
+            resultat['message'] = '; '.join(motifs) or "transfert non validé"
+            logger.warning(
+                f"Commande {nom} : transfert créé mais non validé — {resultat['message']}"
+            )
+    except Exception as e:
+        resultat.update(statut='echec', message=str(e))
+        logger.error(f"Déstockage de la commande {order_id} impossible: {e}")
+    return resultat
 
 
 def _doit_facturer(client, order_id: int) -> tuple:
@@ -10148,8 +10465,9 @@ async def create_complete_pos_order(
                 )
             )
         
-        # Utiliser l'action POS officielle : un simple write(state=paid) ne
-        # déclenche pas les traitements Odoo liés à la vente et au stock.
+        # Utiliser l'action POS officielle : un simple write(state=paid) saute
+        # les contrôles d'Odoo. Elle ne crée en revanche aucun transfert de
+        # stock — voir _solder_commande — d'où le déstockage qui suit.
         try:
             client.execute_kw('pos.order', 'action_pos_order_paid', [[order_id]])
             logger.info(f"✅ Commande {order_id} validée par l'action POS officielle")
@@ -10178,7 +10496,10 @@ async def create_complete_pos_order(
                 logger.info(f"   État: {created_order[0].get('state')}")
         except Exception as e:
             logger.warning(f"Impossible de vérifier la commande créée: {e}")
-        
+
+        # Sortie de stock — un échec est signalé, pas bloquant.
+        stock = _destocker_commande(client, order_id, pos_id)
+
         return ApiResponse(
             success=True,
             data={
@@ -10187,9 +10508,13 @@ async def create_complete_pos_order(
                 'amount_total': total_amount,
                 'amount_paid': total_paid,
                 'lines_count': len(order_lines),
-                'payments_count': len(payment_ids)
+                'payments_count': len(payment_ids),
+                'stock': stock,
             },
-            message="Commande POS créée avec succès"
+            message="Commande POS créée avec succès" + (
+                f" — stock non mis à jour : {stock.get('message')}"
+                if stock.get('statut') in ('en_attente', 'echec') else ""
+            )
         )
         
     except HTTPException:
