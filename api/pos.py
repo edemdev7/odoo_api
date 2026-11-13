@@ -8625,6 +8625,8 @@ async def add_payment_to_order(
     - `already_paid` : `true` si la commande était déjà soldée avant l'appel
     - `stock` : déstockage de la vente — `statut` vaut `destocke`, `en_attente`
       (transfert créé mais pas validé, voir `message`), `non_concerne` ou `echec`
+    - `facture` : facturation selon POS_AUTO_INVOICE — `statut` vaut `facturee`,
+      `non_requise` ou `echec` (voir `motif`)
 
     **Relance :** rejouer l'appel sur une commande déjà soldée ne crée aucun
     paiement. La réponse est 200 avec l'état actuel, et le déstockage ou la
@@ -8730,6 +8732,7 @@ async def add_payment_to_order(
 
         invoice_id = None
         stock = None
+        facture = None
 
         if is_complete and not deja_soldee:
             client.execute_kw('pos.order', 'write', [[order_id], {
@@ -8760,27 +8763,10 @@ async def add_payment_to_order(
             # il est signalé dans la réponse et retenté au prochain appel.
             stock = _destocker_commande(client, order_id, pos_id)
 
-            # Facturer si le règlement sort du périmètre token / carte.
-            # L'échec de la facturation ne remet pas en cause l'encaissement :
-            # la vente est faite, la facture pourra être régénérée à la demande.
-            try:
-                a_facturer, motif = _doit_facturer(client, order_id)
-                if a_facturer:
-                    invoice_id = _assurer_facture(client, order_id)
-                    logger.info(
-                        f"Commande {order_id} facturée — {motif} → facture {invoice_id}"
-                    )
-                else:
-                    # Sans facture, la vente est reprise dans l'écriture
-                    # récapitulative du journal POS à la clôture de session.
-                    logger.info(
-                        f"Commande {order_id} non facturée — {motif} "
-                        f"(comptabilisée à la clôture, journal du point de vente)"
-                    )
-            except Exception as fact_err:
-                logger.warning(
-                    f"Facturation automatique échouée pour la commande {order_id}: {fact_err}"
-                )
+            # Facture selon la politique POS_AUTO_INVOICE. Un échec est
+            # signalé dans la réponse, pas bloquant : l'argent est encaissé.
+            facture = _facturer_apres_vente(client, order_id)
+            invoice_id = facture.get('invoice_id')
         else:
             payment_status = 'partial'
 
@@ -8802,6 +8788,7 @@ async def add_payment_to_order(
                 'partner_id': client_nomme,
                 'already_paid': deja_soldee,
                 'stock': stock,
+                'facture': facture,
             },
             message=(
                 (
@@ -8809,6 +8796,8 @@ async def add_payment_to_order(
                      else f"Commande soldée — Rendu: {amount_return}")
                     + (f" — stock non mis à jour : {stock.get('message')}"
                        if stock and stock.get('statut') in ('en_attente', 'echec') else "")
+                    + (f" — facture non émise : {facture.get('motif')}"
+                       if facture and facture.get('statut') == 'echec' else "")
                 ) if is_complete
                 else f"{len(payments_added)} paiement(s) enregistré(s) — Reste à payer: {amount_due}"
             )
@@ -8845,12 +8834,26 @@ async def add_payment_to_order(
 #   "jamais"                — aucune facture automatique, même client nommé
 _FACTURATION_AUTO = os.getenv("POS_AUTO_INVOICE", "client_nomme").strip().lower()
 
-# Utilisé seulement en mode "toujours" : moyens déjà tracés côté back-office.
-_PAIEMENTS_SANS_FACTURE = [
-    m.strip().upper()
-    for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE", "TOKEN,CARTE,CARD").split(",")
-    if m.strip()
-]
+# Moyens de paiement prépayés : la recharge a déjà été facturée, refacturer la
+# consommation compterait le chiffre d'affaires deux fois. Le verrou vaut dans
+# tous les modes, client nommé compris (voir _doit_facturer).
+#
+# La comparaison porte sur le libellé du pos.payment.method : un mot de la liste
+# doit y figurer. « JNP PASS » n'y figurait pas — ni TOKEN, ni CARTE, ni CARD
+# dans son libellé — et des ventes réglées par carte JNP PASS ont été facturées
+# une seconde fois en novembre 2026 (JO019/0024 et 0025).
+#
+# JNP PASS est donc toujours ajouté à la liste, quelle que soit la valeur du
+# .env : une variable recopiée de l'ancien .env.example ne doit pas suffire à
+# réintroduire la double facturation.
+_PAIEMENTS_PREPAYES_TOUJOURS = ('JNP PASS',)
+_PAIEMENTS_SANS_FACTURE = list(dict.fromkeys(
+    [m.strip().upper()
+     for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE",
+                        "TOKEN,CARTE,CARD,JNP PASS").split(",")
+     if m.strip()]
+    + list(_PAIEMENTS_PREPAYES_TOUJOURS)
+))
 
 
 def _moyens_paiement_commande(client, order_id: int) -> list:
@@ -9205,6 +9208,46 @@ def _destocker_commande(client, order_id: int, pos_id: int) -> dict:
     return resultat
 
 
+def _facturer_apres_vente(client, order_id: int) -> dict:
+    """
+    Émet la facture d'une vente soldée si la politique de facturation le
+    demande (voir `_doit_facturer` et POS_AUTO_INVOICE).
+
+    Retourne {'statut', 'invoice_id', 'motif'} où statut vaut :
+      - 'facturee'    : facture émise (ou déjà existante)
+      - 'non_requise' : la politique ne demande pas de facture
+      - 'echec'       : une facture était due mais n'a pas pu être émise
+
+    Un échec ne remet pas en cause l'encaissement, mais il ne doit plus passer
+    inaperçu : la vente resterait sans écriture jusqu'à la clôture. Il remonte
+    donc dans la réponse, et un nouvel appel au paiement retente la facture.
+    Ne lève jamais d'exception.
+    """
+    try:
+        a_facturer, motif = _doit_facturer(client, order_id)
+        if not a_facturer:
+            logger.info(
+                f"Commande {order_id} non facturée — {motif} "
+                f"(comptabilisée à la clôture, journal du point de vente)"
+            )
+            return {'statut': 'non_requise', 'invoice_id': None, 'motif': motif}
+        invoice_id = _assurer_facture(client, order_id)
+        if invoice_id:
+            logger.info(f"Commande {order_id} facturée — {motif} → facture {invoice_id}")
+            return {'statut': 'facturee', 'invoice_id': invoice_id, 'motif': motif}
+        logger.error(f"Facture attendue pour la commande {order_id} ({motif}) mais non créée")
+        return {'statut': 'echec', 'invoice_id': None, 'motif': "facture non créée par Odoo"}
+    except HTTPException as e:
+        detail = e.detail
+        texte = detail.get('message') if isinstance(detail, dict) else str(detail)
+        logger.error(f"Facturation de la commande {order_id} impossible: {texte}")
+        return {'statut': 'echec', 'invoice_id': None, 'motif': texte,
+                'erreur': detail.get('error') if isinstance(detail, dict) else None}
+    except Exception as e:
+        logger.error(f"Facturation de la commande {order_id} impossible: {e}")
+        return {'statut': 'echec', 'invoice_id': None, 'motif': str(e)}
+
+
 def _doit_facturer(client, order_id: int) -> tuple:
     """
     Une commande doit-elle donner lieu à une facture ?
@@ -9546,6 +9589,51 @@ def _client_depuis_requete(client, request, order_id: Optional[int] = None) -> O
     return partner_id
 
 
+# Odoo peut refuser une facture tant que le compte bancaire qu'elle porte
+# n'est pas « fiable » (allow_out_payment). Le code levait ce blocage en
+# passant TOUS les comptes bancaires de la base à fiable, avant chaque
+# facture : ceux de la société, mais aussi ceux des fournisseurs et des
+# clients. Or c'est précisément ce marquage qui empêche de payer un IBAN non
+# vérifié — la parade d'Odoo contre la fraude au changement de RIB. Le lever
+# en masse, et à chaque vente, revenait à désactiver ce contrôle.
+#
+# La confiance accordée à un compte bancaire est une décision humaine, prise
+# une fois, dans Odoo, sur les seuls comptes de la société. L'API se contente
+# désormais de dire clairement quand ce réglage manque.
+_MOTS_COMPTE_NON_FIABLE = ('allow_out_payment', 'trusted', 'fiable')
+
+
+def _facturer_dans_odoo(client, order_id: int, nom: str) -> None:
+    """
+    Appelle `action_pos_order_invoice`, et traduit le refus lié à un compte
+    bancaire non fiable en erreur explicite plutôt qu'en message Odoo obscur.
+    """
+    try:
+        client.execute_kw('pos.order', 'action_pos_order_invoice', [[order_id]])
+    except Exception as e:
+        texte = str(e)
+        if any(mot in texte.lower() for mot in _MOTS_COMPTE_NON_FIABLE):
+            logger.error(
+                f"Facture de {nom} refusée : compte bancaire non fiable dans Odoo — {texte}"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "untrusted_bank_account",
+                    "message": (
+                        "Odoo refuse la facture : le compte bancaire de la société "
+                        "porté par la facture n'est pas marqué fiable. Un "
+                        "administrateur doit le marquer fiable dans Odoo "
+                        "(Contacts › la société › Comptes bancaires). L'API ne le "
+                        "fait plus automatiquement."
+                    ),
+                    "order_id": order_id,
+                    "odoo_message": texte[:500],
+                }
+            )
+        raise
+
+
 def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[int]:
     """
     Facture d'une commande POS, créée si elle n'existe pas encore.
@@ -9600,21 +9688,7 @@ def _assurer_facture(client, order_id: int, order_name: str = '') -> Optional[in
         client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': comptant_id}])
         logger.info(f"Vente anonyme {nom} rattachée au client comptant {comptant_id}")
 
-    # Odoo refuse d'émettre une facture tant qu'un compte bancaire de la société
-    # est marqué non fiable. On lève ce blocage, sans quoi la facturation échoue
-    # sur un message sans rapport avec la vente.
-    try:
-        comptes = client.execute_kw(
-            'res.partner.bank', 'search', [[('allow_out_payment', '=', False)]]
-        )
-        if comptes:
-            client.execute_kw(
-                'res.partner.bank', 'write', [comptes, {'allow_out_payment': True}]
-            )
-    except Exception as e:
-        logger.debug(f"Comptes bancaires non modifiés: {e}")
-
-    client.execute_kw('pos.order', 'action_pos_order_invoice', [[order_id]])
+    _facturer_dans_odoo(client, order_id, nom)
 
     relu = client.execute_kw('pos.order', 'read', [order_id], {'fields': ['account_move']})
     move = relu[0].get('account_move') if relu else None
@@ -9782,16 +9856,7 @@ async def get_pos_order_invoice(
                 )
             logger.info(f"Génération de la facture pour la commande {order['name']} (ID: {order_id})")
 
-            # Marquer tous les comptes bancaires non fiables de l'entreprise comme fiables
-            untrusted_bank_ids = client.execute_kw(
-                'res.partner.bank', 'search',
-                [[['allow_out_payment', '=', False]]],
-            )
-            if untrusted_bank_ids:
-                client.execute_kw('res.partner.bank', 'write', [untrusted_bank_ids, {'allow_out_payment': True}])
-                logger.info(f"Comptes bancaires marqués fiables : {untrusted_bank_ids}")
-
-            client.execute_kw('pos.order', 'action_pos_order_invoice', [[order_id]])
+            _facturer_dans_odoo(client, order_id, order['name'])
 
             # Relire la commande pour récupérer l'account_move créé
             refreshed = client.execute_kw(
@@ -10497,8 +10562,9 @@ async def create_complete_pos_order(
         except Exception as e:
             logger.warning(f"Impossible de vérifier la commande créée: {e}")
 
-        # Sortie de stock — un échec est signalé, pas bloquant.
+        # Sortie de stock puis facture — échecs signalés, pas bloquants.
         stock = _destocker_commande(client, order_id, pos_id)
+        facture = _facturer_apres_vente(client, order_id)
 
         return ApiResponse(
             success=True,
@@ -10510,10 +10576,15 @@ async def create_complete_pos_order(
                 'lines_count': len(order_lines),
                 'payments_count': len(payment_ids),
                 'stock': stock,
+                'facture': facture,
+                'invoice_id': facture.get('invoice_id'),
             },
             message="Commande POS créée avec succès" + (
                 f" — stock non mis à jour : {stock.get('message')}"
                 if stock.get('statut') in ('en_attente', 'echec') else ""
+            ) + (
+                f" — facture non émise : {facture.get('motif')}"
+                if facture.get('statut') == 'echec' else ""
             )
         )
         
