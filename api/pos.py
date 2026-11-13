@@ -2052,6 +2052,150 @@ def _resoudre_ligne_vente(line, decimales: int = 2) -> tuple:
     return qty, montant, None
 
 
+# ===== TAXES DES VENTES =====
+#
+# L'API créait ses lignes de vente sans aucune taxe : `tax_ids` vide,
+# `amount_tax` à zéro, prix TTC porté tel quel en hors taxe. La caisse Odoo,
+# elle, applique les taxes du produit. Résultat constaté en novembre 2026 :
+# pour une vente API, Odoo comptabilisait le montant entier en chiffre
+# d'affaires, sans TVA ni ASAS — à la facture comme à la clôture de session.
+#
+# Les ventes portent désormais les taxes du produit, comme à la caisse. Le prix
+# affiché à la pompe est TTC et les taxes carburant y sont incluses : le total
+# payé ne change pas, il est seulement ventilé entre hors taxe et taxes. Odoo
+# recalcule lui-même les taxes à la clôture et à la facture à partir de
+# `tax_ids` et du prix ; les montants posés ici servent au ticket et au total.
+#
+# Garde-fou : si le TTC recalculé par Odoo ne retombe pas sur le montant payé,
+# c'est qu'une taxe du produit n'est pas incluse dans le prix. Appliquer les
+# taxes changerait alors le prix demandé au client : la ligne part sans taxe,
+# comme avant, et l'anomalie est signalée en erreur et dans la réponse.
+
+# Société et position fiscale par point de vente, résolues une fois par processus.
+_cache_fiscalite_pdv: dict = {}
+
+
+def _fiscalite_pdv(client, pos_id: int) -> dict:
+    """
+    {'company_id', 'fiscal_position_id', 'correspondances'} du point de vente.
+
+    `correspondances` : {taxe_source: [taxes_destination]} de la position
+    fiscale par défaut ; une liste vide signifie que la taxe est retirée.
+    """
+    if pos_id in _cache_fiscalite_pdv:
+        return _cache_fiscalite_pdv[pos_id]
+    cfg = client.execute_kw(
+        'pos.config', 'read', [[pos_id]],
+        {'fields': ['company_id', 'default_fiscal_position_id']}
+    )
+    if not cfg:
+        raise ValueError(f"point de vente {pos_id} introuvable")
+    position = _m2o_id(cfg[0].get('default_fiscal_position_id'))
+    correspondances = {}
+    if position:
+        for l in client.execute_kw(
+            'account.fiscal.position.tax', 'search_read',
+            [[('position_id', '=', position)]],
+            {'fields': ['tax_src_id', 'tax_dest_id'], 'limit': 500}
+        ):
+            dest = _m2o_id(l.get('tax_dest_id'))
+            correspondances.setdefault(_m2o_id(l.get('tax_src_id')), [])
+            if dest:
+                correspondances[_m2o_id(l.get('tax_src_id'))].append(dest)
+    fiscalite = {
+        'company_id': _m2o_id(cfg[0].get('company_id')),
+        'fiscal_position_id': position,
+        'correspondances': correspondances,
+    }
+    _cache_fiscalite_pdv[pos_id] = fiscalite
+    logger.info(
+        f"PDV {pos_id} : société {fiscalite['company_id']}, position fiscale "
+        f"{position or 'aucune'} ({len(correspondances)} correspondance(s) de taxe)"
+    )
+    return fiscalite
+
+
+def _taxes_ligne(client, pos_id: int, product_id: int, price_unit: float,
+                 qty: float, discount: float, montant_ttc: float,
+                 decimales: int) -> dict:
+    """
+    Taxes d'une ligne de vente, calculées par Odoo.
+
+    Retourne {'tax_ids', 'ht', 'taxes', 'statut', 'motif'} :
+      - tax_ids : taxes du produit pour la société du PDV, AVANT position
+        fiscale (Odoo applique la position fiscale de la commande lui-même) ;
+      - statut  : 'ok', 'sans_taxe' (le produit n'en porte pas) ou 'echec'
+        (la ligne part sans taxe, voir `motif`).
+    Ne lève jamais d'exception.
+    """
+    resultat = {'tax_ids': [], 'ht': montant_ttc, 'taxes': 0.0,
+                'statut': 'sans_taxe', 'motif': None}
+    try:
+        fiscalite = _fiscalite_pdv(client, pos_id)
+        produit = client.execute_kw(
+            'product.product', 'read', [[product_id]], {'fields': ['taxes_id']}
+        )
+        tax_ids = (produit[0].get('taxes_id') or []) if produit else []
+        if tax_ids:
+            # Un produit peut porter les taxes de plusieurs sociétés du groupe :
+            # seules celles de la société du point de vente s'appliquent.
+            tax_ids = [
+                t['id'] for t in client.execute_kw(
+                    'account.tax', 'read', [tax_ids], {'fields': ['company_id']}
+                )
+                if _m2o_id(t.get('company_id')) == fiscalite['company_id']
+            ]
+        if not tax_ids:
+            resultat['motif'] = "aucune taxe sur le produit pour la société du PDV"
+            return resultat
+
+        appliquees = []
+        for t in tax_ids:
+            appliquees += fiscalite['correspondances'].get(t, [t])
+        appliquees = list(dict.fromkeys(appliquees))
+        resultat['tax_ids'] = tax_ids
+        if not appliquees:
+            # La position fiscale retire toutes les taxes : vente exonérée.
+            resultat.update(statut='ok', motif="exonérée par la position fiscale")
+            return resultat
+
+        prix_net = price_unit * (1 - (discount or 0) / 100)
+        calcul = client.execute_kw(
+            'account.tax', 'compute_all', [appliquees, prix_net], {'quantity': qty}
+        )
+        ttc = float(calcul.get('total_included') or 0)
+        ht = float(calcul.get('total_excluded') or 0)
+
+        if abs(ttc - montant_ttc) > 10 ** -decimales + 1e-9:
+            motif = (
+                f"taxes non comprises dans le prix : TTC recalculé {ttc:g} "
+                f"au lieu de {montant_ttc:g} — ligne enregistrée sans taxe"
+            )
+            logger.error(f"Produit {product_id}, PDV {pos_id} : {motif}")
+            resultat.update(tax_ids=[], statut='echec', motif=motif)
+            return resultat
+
+        ht = round(ht, decimales)
+        resultat.update(ht=ht, taxes=round(montant_ttc - ht, decimales), statut='ok')
+    except Exception as e:
+        logger.error(f"Taxes du produit {product_id} (PDV {pos_id}) non calculées: {e}")
+        resultat.update(tax_ids=[], ht=montant_ttc, taxes=0.0, statut='echec',
+                        motif=f"calcul des taxes impossible : {e}")
+    return resultat
+
+
+def _bilan_taxes(lignes_taxes: list) -> dict:
+    """Résumé des taxes d'une commande pour la réponse de l'API."""
+    echecs = [t for t in lignes_taxes if t['statut'] == 'echec']
+    return {
+        'statut': 'echec' if echecs else 'ok',
+        'montant_taxes': sum(t['taxes'] for t in lignes_taxes),
+        'lignes_sans_taxe': [
+            {'product_id': t.get('product_id'), 'motif': t['motif']} for t in echecs
+        ],
+    }
+
+
 def _check_pos_sale_stock(client, pos_id: int, session_id: int,
                           session_start: str, lines: list) -> list:
     """
@@ -8475,6 +8619,8 @@ async def create_pos_order_only(
         # Valider les produits et préparer les lignes
         order_lines = []
         amount_total = 0.0
+        lignes_taxes = []
+        decimales = _precision_devise(client, pos_id)
 
         for line in request.lines:
             product = client.execute_kw(
@@ -8487,9 +8633,17 @@ async def create_pos_order_only(
 
             product_info = product[0]
             qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(
-                line, _precision_devise(client, pos_id)
+                line, decimales
             )
             amount_total += line_total
+
+            # Taxes du produit, comme à la caisse Odoo (voir _taxes_ligne).
+            taxes_l = _taxes_ligne(
+                client, pos_id, line.product_id, line.price_unit,
+                qty_reelle, line.discount or 0.0, line_total, decimales
+            )
+            taxes_l['product_id'] = line.product_id
+            lignes_taxes.append(taxes_l)
 
             if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
                 logger.info(
@@ -8503,8 +8657,9 @@ async def create_pos_order_only(
                 'qty': qty_reelle,
                 'price_unit': line.price_unit,
                 'discount': line.discount or 0.0,
-                'price_subtotal': line_total,
+                'price_subtotal': taxes_l['ht'],
                 'price_subtotal_incl': line_total,
+                'tax_ids': [(6, 0, taxes_l['tax_ids'])],
                 'full_product_name': product_info['name'],
             }
 
@@ -8536,7 +8691,7 @@ async def create_pos_order_only(
             'amount_total': amount_total,
             'amount_paid': 0.0,
             'amount_return': 0.0,
-            'amount_tax': 0.0,
+            'amount_tax': _bilan_taxes(lignes_taxes)['montant_taxes'],
             'state': 'draft',
             'date_order': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
@@ -8550,6 +8705,12 @@ async def create_pos_order_only(
             order_vals['employee_id'] = current_user['employee_id']
         if request.note:
             order_vals['note'] = request.note
+
+        # Même position fiscale que celle du calcul des taxes : Odoo la
+        # réapplique à la clôture et à la facture.
+        _fiscalite = _cache_fiscalite_pdv.get(pos_id) or {}
+        if _fiscalite.get('fiscal_position_id'):
+            order_vals['fiscal_position_id'] = _fiscalite['fiscal_position_id']
 
         order_id = client.execute_kw('pos.order', 'create', [order_vals])
         logger.info(f"Commande {order_id} créée (draft) - PDV {pos_id} - Montant: {amount_total}")
@@ -8567,7 +8728,9 @@ async def create_pos_order_only(
                 'amount_return': 0.0,
                 'payment_status': 'unpaid',
                 'lines_count': len(request.lines),
-                'state': 'draft'
+                'state': 'draft',
+                'amount_tax': _bilan_taxes(lignes_taxes)['montant_taxes'],
+                'taxes': _bilan_taxes(lignes_taxes),
             },
             message=f"Commande créée — Montant à payer: {amount_total}"
         )
@@ -8834,26 +8997,25 @@ async def add_payment_to_order(
 #   "jamais"                — aucune facture automatique, même client nommé
 _FACTURATION_AUTO = os.getenv("POS_AUTO_INVOICE", "client_nomme").strip().lower()
 
-# Moyens de paiement prépayés : la recharge a déjà été facturée, refacturer la
-# consommation compterait le chiffre d'affaires deux fois. Le verrou vaut dans
-# tous les modes, client nommé compris (voir _doit_facturer).
+# Moyens de paiement dont la vente ne donne pas lieu à facture automatique
+# (comparaison sans casse : un mot de la liste doit figurer dans le libellé du
+# pos.payment.method). Le verrou vaut dans tous les modes (voir _doit_facturer).
 #
-# La comparaison porte sur le libellé du pos.payment.method : un mot de la liste
-# doit y figurer. « JNP PASS » n'y figurait pas — ni TOKEN, ni CARTE, ni CARD
-# dans son libellé — et des ventes réglées par carte JNP PASS ont été facturées
-# une seconde fois en novembre 2026 (JO019/0024 et 0025).
+# Ce que montrent les écritures (novembre 2026) : une recharge JNP PASS est
+# facturée en AVANCE — débit 411100, crédit 419101 pour le hors taxe comme
+# pour la TVA, la TS et l'ASAS — sans aucun chiffre d'affaires. Le chiffre
+# d'affaires et les taxes d'une vente JNP PASS naissent donc à la
+# consommation : facturer cette consommation ne compte rien deux fois, et sans
+# facture la vente est de toute façon comptabilisée à la clôture de session.
 #
-# JNP PASS est donc toujours ajouté à la liste, quelle que soit la valeur du
-# .env : une variable recopiée de l'ancien .env.example ne doit pas suffire à
-# réintroduire la double facturation.
-_PAIEMENTS_PREPAYES_TOUJOURS = ('JNP PASS',)
-_PAIEMENTS_SANS_FACTURE = list(dict.fromkeys(
-    [m.strip().upper()
-     for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE",
-                        "TOKEN,CARTE,CARD,JNP PASS").split(",")
-     if m.strip()]
-    + list(_PAIEMENTS_PREPAYES_TOUJOURS)
-))
+# Faut-il une facture (normalisée DGI) pour chaque consommation JNP PASS ?
+# C'est une décision fiscale, pas technique : elle se règle par la variable
+# POS_PAYMENT_METHODS_SANS_FACTURE, sans exception codée en dur.
+_PAIEMENTS_SANS_FACTURE = [
+    m.strip().upper()
+    for m in os.getenv("POS_PAYMENT_METHODS_SANS_FACTURE", "TOKEN,CARTE,CARD").split(",")
+    if m.strip()
+]
 
 
 def _moyens_paiement_commande(client, order_id: int) -> list:
@@ -9267,15 +9429,11 @@ def _doit_facturer(client, order_id: int) -> tuple:
     if not libelles:
         return False, "aucun règlement enregistré"
 
-    # Un règlement prépayé — token, carte JNP PASS — a déjà donné lieu à une
-    # facture au moment de la recharge. Refacturer la consommation
-    # compterait le chiffre d'affaires deux fois. Ce verrou prime sur tout le
-    # reste, y compris sur la présence d'un client nommé : le client peut
-    # légitimement vouloir son nom sur le ticket sans qu'une seconde facture
-    # soit due.
+    # Moyens exclus de la facturation (POS_PAYMENT_METHODS_SANS_FACTURE). Ce
+    # verrou prime sur tout le reste, y compris sur un client nommé.
     if all(any(exclu in (libelle or '').upper() for exclu in _PAIEMENTS_SANS_FACTURE)
            for libelle in libelles):
-        return False, f"règlement prépayé, déjà facturé à la recharge ({', '.join(libelles)})"
+        return False, f"moyen de paiement exclu de la facturation ({', '.join(libelles)})"
 
     if _FACTURATION_AUTO == "toujours":
         # Ancien comportement, conservé pour pouvoir revenir en arrière sans
@@ -10368,6 +10526,8 @@ async def create_complete_pos_order(
         # Préparer les lignes de commande
         order_lines = []
         total_amount = 0.0
+        lignes_taxes = []
+        decimales = _precision_devise(client, pos_id)
         
         for line in request.lines:
             # VALIDATION: Vérifier que le produit existe dans Odoo
@@ -10388,9 +10548,17 @@ async def create_complete_pos_order(
             logger.info(f"✅ Produit validé: ID={product_info['id']}, Nom={product_info['name']}, Type={product_info['type']}")
             
             qty_reelle, line_total, montant_demande = _resoudre_ligne_vente(
-                line, _precision_devise(client, pos_id)
+                line, decimales
             )
             total_amount += line_total
+
+            # Taxes du produit, comme à la caisse Odoo (voir _taxes_ligne).
+            taxes_l = _taxes_ligne(
+                client, pos_id, line.product_id, line.price_unit,
+                qty_reelle, line.discount or 0.0, line_total, decimales
+            )
+            taxes_l['product_id'] = line.product_id
+            lignes_taxes.append(taxes_l)
 
             if montant_demande is not None and abs(qty_reelle - line.qty) > 0.0001:
                 logger.info(
@@ -10404,8 +10572,9 @@ async def create_complete_pos_order(
                 'qty': qty_reelle,
                 'price_unit': line.price_unit,
                 'discount': line.discount or 0.0,
-                'price_subtotal': line_total,
-                'price_subtotal_incl': line_total,  # À ajuster selon les taxes
+                'price_subtotal': taxes_l['ht'],
+                'price_subtotal_incl': line_total,
+                'tax_ids': [(6, 0, taxes_l['tax_ids'])],
                 'full_product_name': product_info['name'],  # ✨ Nom complet du produit
             }
 
@@ -10465,7 +10634,7 @@ async def create_complete_pos_order(
             'amount_total': total_amount,
             'amount_paid': total_paid,
             'amount_return': request.amount_return or 0.0,
-            'amount_tax': 0.0,  # À calculer selon les taxes
+            'amount_tax': _bilan_taxes(lignes_taxes)['montant_taxes'],
             'state': 'draft',
             'date_order': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
@@ -10488,6 +10657,12 @@ async def create_complete_pos_order(
         logger.info(f"📝 Création de la commande POS avec {len(order_lines)} ligne(s)")
         logger.info(f"   Session: {request.pos_session_id}, Montant total: {total_amount}")
         
+        # Même position fiscale que celle du calcul des taxes : Odoo la
+        # réapplique à la clôture et à la facture.
+        _fiscalite = _cache_fiscalite_pdv.get(pos_id) or {}
+        if _fiscalite.get('fiscal_position_id'):
+            order_vals['fiscal_position_id'] = _fiscalite['fiscal_position_id']
+
         # Créer la commande
         try:
             order_id = client.execute_kw('pos.order', 'create', [order_vals])
@@ -10575,6 +10750,8 @@ async def create_complete_pos_order(
                 'amount_paid': total_paid,
                 'lines_count': len(order_lines),
                 'payments_count': len(payment_ids),
+                'amount_tax': _bilan_taxes(lignes_taxes)['montant_taxes'],
+                'taxes': _bilan_taxes(lignes_taxes),
                 'stock': stock,
                 'facture': facture,
                 'invoice_id': facture.get('invoice_id'),

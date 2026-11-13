@@ -115,10 +115,7 @@ def lire_args(argv):
 def section_politique():
     titre("1. POLITIQUE DE FACTURATION (environnement de CE poste)")
     mode = variable('POS_AUTO_INVOICE', 'client_nomme').strip().lower() or 'client_nomme'
-    exclus = variable('POS_PAYMENT_METHODS_SANS_FACTURE', 'TOKEN,CARTE,CARD,JNP PASS')
-    # Comme l'API : JNP PASS est toujours considere comme prepaye.
-    if 'JNP PASS' not in exclus.upper():
-        exclus += ',JNP PASS'
+    exclus = variable('POS_PAYMENT_METHODS_SANS_FACTURE', 'TOKEN,CARTE,CARD')
     print(f"  POS_AUTO_INVOICE                  : {mode}")
     print(f"  POS_PAYMENT_METHODS_SANS_FACTURE  : {exclus}")
     print(f"  POS_DEFAULT_PARTNER_ID            : {variable('POS_DEFAULT_PARTNER_ID') or '(vide)'}")
@@ -161,14 +158,14 @@ def section_ventes(appel, opts, exclus):
               f"{(c.get('date_order') or '')[:16]}  {float(c.get('amount_total') or 0):,.0f}")
         print(f"    client    : {m2o_nom(c.get('partner_id'))}")
         print(f"    paiements : {', '.join(moyens) or 'aucun'}"
-              + ("  (prepaye : pas de facture attendue)" if prepaye else ""))
+              + ("  (moyen exclu de la facturation)" if prepaye else ""))
 
         fac_id = m2o_id(c.get('account_move'))
         verdict = None
         if not fac_id:
             verdict = 'prepaye' if prepaye else 'sans_facture'
             print("    facture   : aucune — " + (
-                "normal, deja facture a la recharge" if prepaye
+                "normal, moyen exclu de la facturation" if prepaye
                 else "la vente attend l'ecriture de cloture"))
         else:
             f = appel('account.move', 'read', [[fac_id]], {'fields': champs_fac})[0]
