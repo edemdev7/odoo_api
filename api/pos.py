@@ -8858,6 +8858,9 @@ async def add_payment_to_order(
             client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': client_nomme}])
             logger.info(f"Commande {order_id} rattachée au client {client_nomme} avant facturation")
 
+        if not deja_soldee:
+            _refuser_melange_prepaye(client, order_id, existing_payments, request.payments)
+
         # Créer chaque paiement dans Odoo
         payments_added = []
         total_this_call = 0.0
@@ -9408,6 +9411,79 @@ def _facturer_apres_vente(client, order_id: int) -> dict:
     except Exception as e:
         logger.error(f"Facturation de la commande {order_id} impossible: {e}")
         return {'statut': 'echec', 'invoice_id': None, 'motif': str(e)}
+
+
+def _est_prepaye(libelle: str) -> bool:
+    """Le libellé d'un moyen de paiement désigne-t-il un règlement prépayé ?"""
+    majuscule = (libelle or '').upper()
+    return any(exclu in majuscule for exclu in _PAIEMENTS_SANS_FACTURE)
+
+
+def _refuser_melange_prepaye(client, order_id: int, existants: list, demandes: list):
+    """
+    Refuse qu'une même vente soit réglée en partie par un moyen prépayé et en
+    partie autrement.
+
+    Les deux parts n'ont pas la même comptabilisation : le prépayé solde une
+    avance déjà facturée à la recharge (compte 419101), le reste génère une
+    créance client ordinaire à encaisser. Mêlées sur une seule commande, elles
+    ne peuvent être ni facturées ni lettrées correctement — le comptable de
+    JNP demande une facturation « selon chaque mode de paiement ».
+
+    Le mobile ne propose pas ce cas aujourd'hui. Ce garde-fou n'est donc
+    jamais censé se déclencher : il existe pour que, le jour où il le
+    proposerait, on s'en aperçoive à l'encaissement plutôt que trois mois plus
+    tard dans un rapprochement comptable.
+
+    `POS_ALLOW_MIXED_PREPAID=1` le lève si la comptabilité change d'avis.
+    """
+    if os.getenv("POS_ALLOW_MIXED_PREPAID", "").strip() == "1":
+        return
+
+    libelles = []
+    for p in existants or []:
+        methode = p.get('payment_method_id')
+        if isinstance(methode, list) and len(methode) > 1:
+            libelles.append(methode[1])
+
+    ids_demandes = [p.payment_method_id for p in (demandes or [])]
+    if ids_demandes:
+        try:
+            for m in client.execute_kw(
+                'pos.payment.method', 'read', [ids_demandes], {'fields': ['name']}
+            ):
+                libelles.append(m.get('name'))
+        except Exception as e:
+            logger.warning(f"Moyens de paiement {ids_demandes} illisibles: {e}")
+            return  # dans le doute, on ne bloque pas un encaissement
+
+    if len(libelles) < 2:
+        return
+
+    prepayes = sorted({l for l in libelles if _est_prepaye(l)})
+    autres = sorted({l for l in libelles if not _est_prepaye(l)})
+    if not prepayes or not autres:
+        return
+
+    logger.warning(
+        f"🚫 Commande {order_id} : règlement mixte refusé — "
+        f"prépayé ({', '.join(prepayes)}) et {', '.join(autres)}"
+    )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "mixed_prepaid_payment",
+            "message": (
+                "Une vente ne peut pas être réglée à la fois par un moyen "
+                "prépayé et par un autre moyen : les deux parts suivent des "
+                "écritures comptables différentes. Enregistrez deux ventes "
+                "distinctes, une par mode de paiement."
+            ),
+            "order_id": order_id,
+            "prepaid_methods": prepayes,
+            "other_methods": autres,
+        }
+    )
 
 
 def _doit_facturer(client, order_id: int) -> tuple:
