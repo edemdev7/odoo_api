@@ -46,15 +46,25 @@ LARGEUR = 96
 # Schema du comptable, tel que transmis. A corriger ici s'il evolue.
 # ------------------------------------------------------------------------
 
+# Le schema d'origine a ete amende par les reponses du comptable JNP
+# (novembre 2026). Les comptes qu'il a ecartes ne sont plus verifies : les
+# laisser faisait remonter quatre « INTROUVABLE » a chaque audit, au milieu
+# desquels les vrais ecarts passaient inapercus.
+#
+#   4111000 -> ecarte. « Le 411300 est utilise par defaut lorsque le client
+#              n'est pas precise. En cas de precision du client, le compte
+#              411100 est automatiquement utilise par Odoo. »
+#   4431000 -> ecarte au profit de 4431, deja en place.
+#   4431200 -> ecarte. « La TVA generee lors de la consommation doit etre
+#              logee dans le compte 4431. »
 COMPTES_SCHEMA = {
-    '4111000': "Clients",
     '419101':  "Clients, avances et acomptes recus / Carburant",
     '4191300': "Clients, avances et acomptes recus Promoteurs",
-    '4431000': "TVA facturee sur ventes",
-    '4431200': "TVA facturee sur avance sur consommation",
+    '4431':    "TVA facturee sur ventes",
     '4478209': "Taxe ASAS",
     '5731101': "Caisse stations FCFA",
-    '5522101': "Monnaie electronique - compte KKiaPay",
+    '5522101': "Monnaie electronique - compte KKiaPay (station)",
+    '5522102': "Monnaie electronique - compte KKiaPay (recharges)",
     '7011101': "Vente Gasoil dedouane",
     '7011201': "Vente Super / Essence dedouane",
     '7011501': "Vente Butane dedouane (recharge)",
@@ -63,7 +73,10 @@ COMPTES_SCHEMA = {
     '7011505': "Vente d'accessoires de gaz",
 }
 
-TVA, ASAS = '4431000', '4478209'
+# Comptes clients admis : Odoo choisit seul entre les deux.
+COMPTES_CLIENT_ADMIS = ('411300', '411100')
+
+TVA, ASAS = '4431', '4478209'
 
 # Familles de produits, testees dans cet ordre sur « nom + reference +
 # categorie ». La famille est DEVINEE : elle est affichee pour controle.
@@ -87,7 +100,9 @@ MOYENS = [
     ('kkiapay',  ('KKIAPAY',),                        '5522101'),
     ('jnp pass', ('PASS', 'CARTE', 'CARD', 'TOKEN'),  '419101'),
 ]
-COMPTE_CLIENT = '4111000'
+def client_admis(code):
+    """Odoo arbitre seul entre 411300 (client non precise) et 411100."""
+    return any(code_conforme(code, c) for c in COMPTES_CLIENT_ADMIS)
 
 
 # ------------------------------------------------------------------ outils
@@ -337,10 +352,11 @@ def section_moyens(o, pos_id, ecarts):
                       {'fields': ['account_default_pos_receivable_account_id']})
         defaut_client = m2o_id(soc[0].get('account_default_pos_receivable_account_id')) if soc else None
         code, nom = o.compte(defaut_client)
-        etat = 'OK' if code_conforme(code, COMPTE_CLIENT) else f"ECART (attendu {COMPTE_CLIENT})"
+        etat = 'OK' if client_admis(code) else f"ECART (attendu {' ou '.join(COMPTES_CLIENT_ADMIS)})"
         print(f"  Compte client POS par defaut de la societe : {code or 'aucun'} {nom[:40]}  {etat}")
-        if not code_conforme(code, COMPTE_CLIENT):
-            ecarts.append(f"Compte client POS par defaut {code or 'aucun'}, schema {COMPTE_CLIENT}")
+        if not client_admis(code):
+            ecarts.append(f"Compte client POS par defaut {code or 'aucun'}, "
+                          f"attendu {' ou '.join(COMPTES_CLIENT_ADMIS)}")
 
     ids = cfg.get('payment_method_ids') or []
     if not ids:
@@ -355,12 +371,12 @@ def section_moyens(o, pos_id, ecarts):
 
         recv = m2o_id(m.get('receivable_account_id')) or defaut_client
         code_r, nom_r = o.compte(recv)
-        etat_r = 'OK' if code_conforme(code_r, COMPTE_CLIENT) else f"ECART (attendu {COMPTE_CLIENT})"
+        etat_r = 'OK' if client_admis(code_r) else f"ECART (attendu {' ou '.join(COMPTES_CLIENT_ADMIS)})"
         print(f"    compte client          : {code_r or 'aucun'} {nom_r[:40]}  {etat_r}"
               + ("" if m.get('receivable_account_id') else "  (defaut societe)"))
-        if not code_conforme(code_r, COMPTE_CLIENT):
+        if not client_admis(code_r):
             ecarts.append(f"{m.get('name')} : compte client {code_r or 'aucun'}, "
-                          f"schema {COMPTE_CLIENT}")
+                          f"attendu {' ou '.join(COMPTES_CLIENT_ADMIS)}")
 
         jid = m2o_id(m.get('journal_id'))
         if not jid:

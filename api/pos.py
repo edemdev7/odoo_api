@@ -8005,14 +8005,30 @@ async def close_pos_session(
             )
             logger.info(f"action_pos_session_closing_control réussie pour {session_id}")
         except Exception as e:
+            # Journalisé avant d'être levé : sans cette ligne, le motif du
+            # refus ne part que dans la réponse HTTP et l'exploitant qui
+            # regarde les logs ne voit qu'un 409 sans explication.
+            logger.error(
+                f"❌ Préparation de la clôture refusée pour la session {session_id} "
+                f"(PDV {pos_id}) : {e}"
+            )
             if not request.forced:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Odoo refuse la préparation de la clôture: {e}"
+                    detail={
+                        "error": "closing_control_refused",
+                        "message": (
+                            "Odoo refuse la préparation de la clôture. "
+                            "Corrigez la cause ci-dessous, ou relancez avec "
+                            "forced=true pour passer outre."
+                        ),
+                        "session_id": session_id,
+                        "odoo_error": str(e),
+                    }
                 )
             logger.warning(
-                f"action_pos_session_closing_control a échoué ({e}) — "
-                "mode forcé, passage explicite en closing_control"
+                f"Mode forcé — passage explicite en closing_control "
+                f"malgré le refus d'Odoo"
             )
             client.execute_kw('pos.session', 'write', [[session_id], {
                 'state': 'closing_control',
