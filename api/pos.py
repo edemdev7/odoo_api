@@ -8869,13 +8869,25 @@ async def add_payment_to_order(
                     f"({order['amount_total']}). Vérification manuelle nécessaire."
                 )
             )
-        if getattr(request, 'customer', None) and not deja_soldee:
-            client_nomme, _ = _resoudre_client(client, request.customer)
-            client.execute_kw('pos.order', 'write', [[order_id], {'partner_id': client_nomme}])
-            logger.info(f"Commande {order_id} rattachée au client {client_nomme} avant facturation")
+        # `partner_id` prime sur `customer` : un porteur de carte existe déjà
+        # dans Odoo, le désigner par son identifiant évite de créer un doublon
+        # et d'imputer son avance au mauvais tiers.
+        if not deja_soldee:
+            if getattr(request, 'partner_id', None):
+                client_nomme = request.partner_id
+                client.execute_kw('pos.order', 'write',
+                                  [[order_id], {'partner_id': client_nomme}])
+                logger.info(f"Commande {order_id} rattachée au client {client_nomme}")
+            elif getattr(request, 'customer', None):
+                client_nomme, _ = _resoudre_client(client, request.customer)
+                client.execute_kw('pos.order', 'write',
+                                  [[order_id], {'partner_id': client_nomme}])
+                logger.info(
+                    f"Commande {order_id} rattachée au client {client_nomme} avant facturation")
 
         if not deja_soldee:
             _refuser_melange_prepaye(client, order_id, existing_payments, request.payments)
+            _exiger_client_identifie(client, order_id, request.payments, client_nomme)
 
         # Créer chaque paiement dans Odoo
         payments_added = []
@@ -9427,6 +9439,86 @@ def _facturer_apres_vente(client, order_id: int) -> dict:
     except Exception as e:
         logger.error(f"Facturation de la commande {order_id} impossible: {e}")
         return {'statut': 'echec', 'invoice_id': None, 'motif': str(e)}
+
+
+def _exiger_client_identifie(client, order_id: int, demandes: list, client_nomme):
+    """
+    Refuse un règlement par un moyen qui exige un client, sans client.
+
+    Odoo porte déjà cette règle, via l'option « Identifier le client »
+    (`split_transactions`) du moyen de paiement. Elle a du sens : un
+    règlement par carte JNP PASS ou par TV solde une avance au crédit du
+    compte 419101, et une avance appartient à quelqu'un — on ne peut pas
+    la consommer sans savoir de qui.
+
+    Mais Odoo ne la vérifie qu'à la **clôture de session**. Le 25 novembre
+    2026, la caisse de JO19 est restée bloquée en fin de journée à cause
+    d'une vente encaissée le matin : « la commande JO019/0046 ne contient
+    pas de client ». Le pompiste était parti, le client aussi, et il a
+    fallu rattacher un partenaire à la main.
+
+    On applique donc la même règle à l'encaissement, pendant que le client
+    est encore au comptoir. L'identité se transmet par le bloc `customer`
+    de la requête de paiement.
+    """
+    ids = [p.payment_method_id for p in (demandes or [])]
+    if not ids:
+        return
+
+    try:
+        methodes = client.execute_kw(
+            'pos.payment.method', 'read', [ids],
+            {'fields': ['name', 'split_transactions']}
+        )
+    except Exception as e:
+        logger.warning(f"Moyens de paiement {ids} illisibles: {e}")
+        return  # dans le doute, on laisse Odoo trancher à la clôture
+
+    exigeants = [m for m in methodes if m.get('split_transactions')]
+    if not exigeants:
+        return
+
+    partenaire_id = client_nomme
+    if not partenaire_id:
+        try:
+            lu = client.execute_kw('pos.order', 'read', [[order_id]],
+                                   {'fields': ['partner_id']})
+            if lu:
+                partenaire_id = _m2o_id(lu[0].get('partner_id'))
+        except Exception as e:
+            logger.warning(f"Client de la commande {order_id} illisible: {e}")
+            return
+
+    libelles = ', '.join(m['name'] for m in exigeants)
+
+    if not partenaire_id:
+        logger.warning(
+            f"🚫 Commande {order_id} : règlement par « {libelles} » refusé — "
+            f"aucun client identifié"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "customer_required",
+                "message": (
+                    f"Le moyen de paiement « {libelles} » exige un client "
+                    f"identifié : il solde une avance, qui appartient à "
+                    f"quelqu'un. Transmettez l'identité du porteur dans le "
+                    f"bloc « customer » de cette requête."
+                ),
+                "order_id": order_id,
+                "payment_methods": [m['name'] for m in exigeants],
+            }
+        )
+
+    # Un client générique satisfait Odoo mais pas la comptabilité : l'avance
+    # serait prélevée sur un compte collectif au lieu du porteur de la carte.
+    if partenaire_id == _partenaire_comptant(client):
+        logger.warning(
+            f"⚠️ Commande {order_id} réglée par « {libelles} » au nom du client "
+            f"comptant : l'avance du compte 419101 sera imputée au compte "
+            f"collectif et non au porteur réel."
+        )
 
 
 def _est_prepaye(libelle: str) -> bool:

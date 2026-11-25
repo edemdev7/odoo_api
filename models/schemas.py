@@ -287,6 +287,15 @@ class PosOrderCreateSimpleRequest(BaseModel):
 class PosAddPaymentRequest(BaseModel):
     """Ajouter un ou plusieurs paiements à une commande existante"""
     payments: List[PosPayment] = Field(..., min_length=1, description="Liste des paiements (un ou plusieurs modes)")
+    partner_id: Optional[int] = Field(
+        None,
+        description=(
+            "Identifiant du client dans Odoo. C'est la valeur à transmettre "
+            "pour un règlement par carte JNP PASS ou par TV : le porteur "
+            "existe déjà, c'est le partenaire dont le compte a été rechargé. "
+            "Prioritaire sur « customer », qui créerait un doublon."
+        )
+    )
     customer: Optional[PosCustomerRequest] = Field(
         None,
         description=(
