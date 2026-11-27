@@ -2115,6 +2115,128 @@ def _fiscalite_pdv(client, pos_id: int) -> dict:
     return fiscalite
 
 
+def _ventiler_taxes(client, tax_ids: list, prix_net: float, qty: float,
+                    decimales: int) -> tuple:
+    """
+    Sépare le hors taxe des taxes dans un prix TTC. Retourne (ht, motif).
+
+    `motif` est None quand la ventilation a abouti ; sinon il décrit
+    pourquoi la ligne doit partir sans taxe.
+
+    **Pourquoi ne pas demander le calcul à Odoo.** `account.tax.compute_all`
+    est la méthode prévue pour cela, mais elle est inutilisable en XML-RPC :
+    sa réponse contient des enregistrements et des `None`, qu'un serveur
+    Odoo sérialisant avec `allow_none=False` refuse de transmettre. Les deux
+    erreurs se sont succédé en novembre 2026 :
+
+        TypeError: cannot marshal <class 'odoo.api.account.tax'> objects
+        TypeError: cannot marshal None unless allow_none is enabled
+
+    **Portée de ce calcul.** Il ne sert qu'à deux choses : vérifier que les
+    taxes sont bien comprises dans le prix affiché à la pompe, et renseigner
+    le hors taxe du ticket. Les écritures comptables, elles, restent
+    calculées par Odoo à partir de `tax_ids` et du prix — c'est lui qui fait
+    foi.
+
+    **Limites assumées.** Seuls les montants fixes et les pourcentages sont
+    traités, toutes taxes comprises dans le prix. Une taxe hors prix, ou un
+    mode de calcul exotique (`division`, taxes en cascade), fait échouer la
+    ventilation plutôt que produire un chiffre faux : appliquer une taxe non
+    comprise dans le prix reviendrait à changer la somme demandée au client.
+    """
+    ttc = prix_net * qty
+    if not tax_ids:
+        return round(ttc, decimales), None
+
+    try:
+        taxes = client.execute_kw(
+            'account.tax', 'read', [tax_ids],
+            {'fields': ['name', 'amount', 'amount_type', 'price_include']}
+        )
+    except Exception as e:
+        return ttc, f"taxes {tax_ids} illisibles : {e}"
+
+    hors_prix = [t['name'] for t in taxes if not t.get('price_include')]
+    if hors_prix:
+        return ttc, (
+            f"taxe(s) non comprise(s) dans le prix : {', '.join(hors_prix)} — "
+            f"les appliquer changerait le montant demandé au client, "
+            f"ligne enregistrée sans taxe"
+        )
+
+    inconnues = [t['name'] for t in taxes
+                 if t.get('amount_type') not in ('fixed', 'percent')]
+    if inconnues:
+        return ttc, (
+            f"mode de calcul non pris en charge sur {', '.join(inconnues)} — "
+            f"ligne enregistrée sans taxe"
+        )
+
+    fixes = sum(float(t.get('amount') or 0) for t in taxes
+                if t['amount_type'] == 'fixed') * qty
+    pourcents = sum(float(t.get('amount') or 0) for t in taxes
+                    if t['amount_type'] == 'percent')
+
+    base = ttc - fixes
+    if base < 0:
+        return ttc, (
+            f"les taxes fixes ({fixes:g}) dépassent le montant payé "
+            f"({ttc:g}) — ligne enregistrée sans taxe"
+        )
+
+    ht = base / (1 + pourcents / 100) if pourcents else base
+    return round(ht, decimales), None
+
+
+# Groupes de taxes deja developpes, resolus une fois par processus.
+_cache_feuilles_taxe: dict = {}
+
+
+def _feuilles_de_taxe(client, tax_ids: list) -> list:
+    """
+    Remplace les taxes de type « groupe » par les taxes qu'elles contiennent.
+
+    `account.tax.compute_all` est inutilisable en XML-RPC sur une taxe de
+    groupe : Odoo place le groupe parent, sous forme d'enregistrement, dans
+    chaque ligne de sa réponse, et XML-RPC ne sait pas sérialiser un
+    enregistrement. L'appel échoue alors sur
+
+        TypeError: cannot marshal <class 'odoo.api.account.tax'> objects
+
+    L'exception était avalée par le `except` général de `_taxes_ligne`, et
+    toutes les ventes de carburant partaient sans taxe — les carburants
+    étant précisément ceux dont les taxes sont regroupées (TVA spécifique,
+    TS et ASAS sous « TAXES GAS-OIL » ou « TAXES ESSENCE »).
+
+    Développer le groupe donne le même calcul : un groupe ne prélève rien
+    par lui-même. On continue en revanche d'enregistrer le groupe sur la
+    ligne de vente, comme le fait la caisse Odoo.
+    """
+    feuilles = []
+    a_lire = [t for t in tax_ids if t not in _cache_feuilles_taxe]
+    if a_lire:
+        try:
+            for t in client.execute_kw(
+                'account.tax', 'read', [a_lire],
+                {'fields': ['amount_type', 'children_tax_ids']}
+            ):
+                _cache_feuilles_taxe[t['id']] = (
+                    t.get('children_tax_ids') or []
+                    if t.get('amount_type') == 'group' else None
+                )
+        except Exception as e:
+            logger.warning(f"Composition des taxes {a_lire} illisible: {e}")
+            return list(tax_ids)
+
+    for t in tax_ids:
+        enfants = _cache_feuilles_taxe.get(t)
+        if enfants:
+            feuilles += _feuilles_de_taxe(client, enfants)
+        else:
+            feuilles.append(t)
+    return list(dict.fromkeys(feuilles))
+
+
 def _taxes_ligne(client, pos_id: int, product_id: int, price_unit: float,
                  qty: float, discount: float, montant_ttc: float,
                  decimales: int) -> dict:
@@ -2160,22 +2282,15 @@ def _taxes_ligne(client, pos_id: int, product_id: int, price_unit: float,
             return resultat
 
         prix_net = price_unit * (1 - (discount or 0) / 100)
-        calcul = client.execute_kw(
-            'account.tax', 'compute_all', [appliquees, prix_net], {'quantity': qty}
+        ht, motif = _ventiler_taxes(
+            client, _feuilles_de_taxe(client, appliquees), prix_net, qty, decimales
         )
-        ttc = float(calcul.get('total_included') or 0)
-        ht = float(calcul.get('total_excluded') or 0)
 
-        if abs(ttc - montant_ttc) > 10 ** -decimales + 1e-9:
-            motif = (
-                f"taxes non comprises dans le prix : TTC recalculé {ttc:g} "
-                f"au lieu de {montant_ttc:g} — ligne enregistrée sans taxe"
-            )
+        if motif:
             logger.error(f"Produit {product_id}, PDV {pos_id} : {motif}")
             resultat.update(tax_ids=[], statut='echec', motif=motif)
             return resultat
 
-        ht = round(ht, decimales)
         resultat.update(ht=ht, taxes=round(montant_ttc - ht, decimales), statut='ok')
     except Exception as e:
         logger.error(f"Taxes du produit {product_id} (PDV {pos_id}) non calculées: {e}")
