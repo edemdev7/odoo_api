@@ -7785,6 +7785,97 @@ async def record_pump_sale(
         logger.error(f"Erreur lors de l'enregistrement de la vente: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'enregistrement: {str(e)}")
 
+def _motif_assistant_cloture(client, resultat) -> Optional[str]:
+    """
+    Motif porté par l'assistant de clôture qu'Odoo a renvoyé, s'il y en a un.
+
+    Quand une session présente un déséquilibre comptable, `action_pos_session_close`
+    ne lève aucune erreur : elle retourne une action ouvrant l'assistant
+    « Forcer la fermeture de la session ». Vue de XML-RPC, la session reste
+    simplement ouverte, sans explication — c'est ce qui a fait tourner en rond
+    la clôture de JO19 le 27 novembre 2026.
+
+    Cet assistant porte le motif en clair, ainsi que le montant à équilibrer.
+    On le lit pour le remonter à l'application et dans les logs.
+    """
+    if not isinstance(resultat, dict):
+        return None
+    if resultat.get('res_model') != 'pos.close.session.wizard':
+        return None
+
+    wizard_id = resultat.get('res_id')
+    if not wizard_id:
+        return resultat.get('name') or "Odoo demande une confirmation de clôture"
+
+    try:
+        lu = client.execute_kw(
+            'pos.close.session.wizard', 'read', [[wizard_id]],
+            {'fields': ['message', 'amount_to_balance', 'account_id']}
+        )
+    except Exception as e:
+        logger.warning(f"Assistant de clôture {wizard_id} illisible: {e}")
+        return resultat.get('name') or "Odoo demande une confirmation de clôture"
+
+    if not lu:
+        return resultat.get('name')
+
+    w = lu[0]
+    morceaux = [(w.get('message') or '').strip()]
+    montant = w.get('amount_to_balance')
+    if montant:
+        compte = w.get('account_id')
+        morceaux.append(
+            f"Montant à équilibrer : {montant}"
+            + (f" sur le compte {compte[1]}" if isinstance(compte, list) else "")
+        )
+    return " — ".join(m for m in morceaux if m) or "Déséquilibre de session"
+
+
+def _valider_assistant_cloture(client, resultat, session_id: int) -> bool:
+    """
+    Valide l'assistant « Forcer la fermeture de la session ».
+
+    C'est ce que fait le gérant quand il clique sur le bouton de l'assistant
+    dans Odoo : le déséquilibre est imputé au compte proposé, et la session
+    se ferme en produisant son écriture comptable.
+
+    Réservé au mode `forced`. Une clôture ordinaire doit continuer d'échouer
+    avec le motif, pour que l'écart soit arbitré et non absorbé en silence.
+
+    Retourne True si la session est effectivement fermée après coup.
+    """
+    wizard_id = (resultat or {}).get('res_id')
+    if not wizard_id:
+        return False
+
+    try:
+        client.execute_kw(
+            'pos.close.session.wizard', 'close_session', [[wizard_id]],
+            {'context': {'active_ids': [session_id], 'active_model': 'pos.session'}}
+        )
+    except Exception as e:
+        logger.error(
+            f"Validation de l'assistant {wizard_id} refusée pour la session "
+            f"{session_id} : {e}"
+        )
+        return False
+
+    try:
+        lu = client.execute_kw('pos.session', 'read', [[session_id]], {'fields': ['state']})
+        ferme = bool(lu) and lu[0].get('state') == 'closed'
+    except Exception as e:
+        logger.warning(f"État de la session {session_id} illisible après validation: {e}")
+        return False
+
+    if ferme:
+        logger.warning(
+            f"Session {session_id} fermée en mode forcé : le déséquilibre a été "
+            f"imputé au compte d'équilibrage proposé par Odoo. À vérifier par "
+            f"la comptabilité."
+        )
+    return ferme
+
+
 @router.post("/{pos_id}/close-session", response_model=PosSessionResponse)
 async def close_pos_session(
     pos_id: int = Path(..., description="ID du point de vente"),
@@ -8161,6 +8252,27 @@ async def close_pos_session(
         except Exception as e:
             close_error_msg = str(e)
             logger.error(f"action_pos_session_close a échoué: {close_error_msg}")
+
+        # Odoo ne lève pas d'erreur quand la session est déséquilibrée : il
+        # renvoie l'assistant « Forcer la fermeture de la session », qui porte
+        # le motif exact. Sans le lire, on ne voyait qu'une session restée
+        # ouverte sans explication.
+        motif_assistant = _motif_assistant_cloture(client, close_result)
+        if motif_assistant:
+            close_error_msg = motif_assistant
+            logger.error(
+                f"Clôture de la session {session_id} suspendue par Odoo : "
+                f"{motif_assistant}"
+            )
+            # `forced` ne servait à rien face à cet assistant : la session
+            # restait ouverte quoi qu'on demande. On le valide désormais,
+            # comme le ferait le gérant depuis Odoo — le déséquilibre est
+            # alors imputé au compte que l'assistant propose, et la session
+            # produit bien son écriture comptable.
+            if request.forced and _valider_assistant_cloture(
+                client, close_result, session_id
+            ):
+                close_error_msg = None
 
         # Vérifier l'état immédiatement après l'action. Ne jamais écrire
         # state=closed en contournant Odoo : cela créerait une session fermée

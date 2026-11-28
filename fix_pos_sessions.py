@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
+"""
+Reprise des sessions POS fermées restées incohérentes.
+
+La configuration vient de l'environnement, du .env ou de core/config.py —
+plus de la tête du fichier. Elle y était codée en dur, avec le mot de passe
+du compte Odoo en clair, et pointait vers une base de staging supprimée
+depuis : le script ne résolvait même plus son nom de domaine.
+"""
+
+import os
+import sys
 import xmlrpc.client
 from datetime import datetime
 
-# Configuration
-url = "https://holdingithiel-dagbehami-statging-012026-32870733.dev.odoo.com"
-db = "holdingithiel-dagbehami-statging-012026-32870733"
-username = "api@jnpgroupe.com"
-password = "zBfMQyOlYVkg8WB"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts'))
+
+from _odoo_direct import configuration  # noqa: E402
+
+url, db, username, password = configuration('DB1')
 
 print("Connexion à Odoo...")
 common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common')
