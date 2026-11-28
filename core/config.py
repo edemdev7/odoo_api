@@ -24,27 +24,43 @@ REVOKED_TOKENS = set()
 ACTIVE_SESSIONS = {}
 
 # Configuration Odoo - Multi-base de données
-# DB1: Base Test JNP Directe (Transferts internes)
-ODOO_DB1_CONFIG = {
-    "name": "jnp_directe",
-    "url": os.getenv("ODOO_DB1_URL", "https://holdingithiel-dagbehami-statging-012026-40829916.dev.odoo.com/"),
-    "db": os.getenv("ODOO_DB1_NAME", "holdingithiel-dagbehami-statging-012026-40829916"),
-    "username": os.getenv("ODOO_DB1_USERNAME", "api@jnpgroupe.com"),
-    "api_key": os.getenv("ODOO_DB1_API_KEY", "c7d95a9f1bbf62fd67917715a269dfa518f10e69"),
-    "transfer_type": "internal",  # Transferts internes
-    "transfer_type_code": "internal"
-}
+#
+# Aucune valeur par défaut : identifiants et clés viennent exclusivement du
+# `.env`, dont le modèle est `.env.example`. Les valeurs étaient autrefois
+# écrites ici, ce qui les exposait à quiconque lisait le dépôt — et les
+# laissait dans l'historique Git même après correction.
+#
+# Une variable manquante fait échouer le démarrage, avec le nom de la
+# variable en cause : mieux vaut un refus net qu'une connexion silencieuse
+# à la mauvaise base.
 
-# DB2: Base Test Franchise (Transferts réceptions)
-ODOO_DB2_CONFIG = {
-    "name": "franchise",
-    "url": os.getenv("ODOO_DB2_URL", "https://staging-app.perfect-erp.com"),
-    "db": os.getenv("ODOO_DB2_NAME", "staging-app.perfect-erp.com"),
-    "username": os.getenv("ODOO_DB2_USERNAME", "api-rest.odoo.com"),
-    "api_key": os.getenv("ODOO_DB2_API_KEY", "d3b50d6b6694cecb785a8a87ee8dd388ff0c325e"),
-    "transfer_type": "reception",  # Transferts réceptions
-    "transfer_type_code": "incoming"
-}
+def _config_odoo(prefixe: str, nom: str, transfer_type: str,
+                 transfer_type_code: str) -> dict:
+    valeurs = {
+        "url": os.getenv(f"{prefixe}_URL", ""),
+        "db": os.getenv(f"{prefixe}_NAME", ""),
+        "username": os.getenv(f"{prefixe}_USERNAME", ""),
+        "api_key": os.getenv(f"{prefixe}_API_KEY", ""),
+    }
+    manquantes = [f"{prefixe}_{suffixe}" for suffixe, valeur in
+                  (("URL", valeurs["url"]), ("NAME", valeurs["db"]),
+                   ("USERNAME", valeurs["username"]), ("API_KEY", valeurs["api_key"]))
+                  if not valeur.strip()]
+    if manquantes:
+        raise RuntimeError(
+            f"Configuration Odoo « {nom} » incomplète : "
+            f"{', '.join(manquantes)} absente(s) du .env."
+        )
+    return {"name": nom, **valeurs,
+            "transfer_type": transfer_type,
+            "transfer_type_code": transfer_type_code}
+
+
+# DB1: JNP Directe (transferts internes)
+ODOO_DB1_CONFIG = _config_odoo("ODOO_DB1", "jnp_directe", "internal", "internal")
+
+# DB2: Franchise (transferts réceptions)
+ODOO_DB2_CONFIG = _config_odoo("ODOO_DB2", "franchise", "reception", "incoming")
 
 # Normalisation des identifiants de connexion.
 #

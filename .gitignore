@@ -9,3 +9,13 @@ audit*.txt
 __pycache__/
 *.pyc
 pump_data.db
+
+# Clés de signature des webhooks. Elles étaient suivies par Git : elles sont
+# donc à régénérer, l'historique du dépôt d'origine les contient toujours.
+*.pem
+
+# Sauvegardes et environnement local
+*.bak
+/env
+.env.*
+!.env.example
